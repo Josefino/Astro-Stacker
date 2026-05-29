@@ -1,0 +1,321 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Astro Stacker 2.3 - uživatelský manuál</title>
+<style>
+@page { margin: 18mm 16mm; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  font-size: 10.5pt;
+  line-height: 1.42;
+  color: #1f2933;
+}
+h1 {
+  font-size: 24pt;
+  margin: 0 0 16pt;
+  padding-bottom: 8pt;
+  border-bottom: 1px solid #cbd5e1;
+}
+h2 {
+  font-size: 16pt;
+  margin: 20pt 0 8pt;
+  color: #0f172a;
+}
+h3 {
+  font-size: 12.5pt;
+  margin: 14pt 0 5pt;
+  color: #1e3a5f;
+}
+p { margin: 0 0 7pt; }
+ul, ol { margin: 0 0 8pt 20pt; padding: 0; }
+li { margin: 2pt 0; }
+code {
+  font-family: Menlo, Consolas, monospace;
+  font-size: 9.5pt;
+  background: #eef2f7;
+  padding: 1pt 3pt;
+  border-radius: 3pt;
+}
+strong { color: #111827; }
+</style>
+</head>
+<body>
+<h1>Astro Stacker 2.3 - uživatelský manuál</h1>
+<p>Astro Stacker slouží ke skládání astronomických snímků z DSLR, bezzrcadlovek, astronomických kamer a chytrých dalekohledů. Umí načíst sekvenci Light snímků, volitelně použít Flat/Bias/Dark kalibraci, zarovnat snímky podle hvězd nebo komety, složit výsledek a nabídnout základní úpravy náhledu pro kontrolu a export.</p>
+<p>Program pracuje tak, aby lineární FIT výstup zůstal vhodný pro další zpracování. Většina úprav v pravém panelu ovlivňuje hlavně náhled a export do obrazových formátů, ne původní lineární data.</p>
+<h2>1. Co program umí</h2>
+<ul>
+<li>Skládání Light snímků ze složky.</li>
+<li>Podpora FIT/FITS, běžných RAW formátů fotoaparátů a obrazových formátů.</li>
+<li>Volitelná kalibrace pomocí Flat, Bias a Dark snímků.</li>
+<li>Zarovnání posunem, ECC afinně, robustně podle hvězd přes RANSAC nebo podle komety.</li>
+<li>Automatický nebo ruční výběr referenčního snímku.</li>
+<li>Filtrování nejlepších snímků podle skóre kvality.</li>
+<li>Volitelná detekce snímků s dlouhou rovnou stopou družice nebo letadla.</li>
+<li>Diagnostická tabulka kvality snímků.</li>
+<li>Ruční kontrola snímků před skládáním a možnost vyřadit snímky mezerníkem.</li>
+<li>Mazání cache kvality snímků a cache zarovnaných snímků pro aktuální složku.</li>
+<li>Uložení a načtení profilů nastavení.</li>
+<li>Náhled s histogramem, křivkami, barvami, vyvážením pozadí a funkcí Balance.</li>
+<li>Export lineárního FIT nebo vizuálně upraveného PNG/TIFF.</li>
+<li>Spuštění wrapperu pro PixInsight.</li>
+</ul>
+<h2>2. Rychlý postup pro běžné skládání</h2>
+<ol>
+<li>Klikni na <strong>Choose folder / Vybrat složku</strong> a vyber složku s Light snímky.</li>
+<li>Pokud jsou ve stejné složce i JPG/PNG/BMP/TIFF náhledy, zapni <strong>RAW only / Pouze RAW</strong>.</li>
+<li>Pro běžnou deep-sky sekvenci nech nastaveno:</li>
+</ol>
+<ul>
+<li><strong>Alignment / Zarovnání:</strong> Star alignment - stars + RANSAC</li>
+<li><strong>Stacking / Skládání:</strong> Sigma-clipped mean</li>
+<li><strong>Auto reference / Automaticky vybrat nejlepší referenci:</strong> zapnuto</li>
+<li><strong>Use only best frames / Použít jen nejlepší snímky:</strong> podle potřeby zapnuto</li>
+</ul>
+<ol>
+<li>Klikni na <strong>Start stacking / Spustit skládání</strong>.</li>
+<li>Po dokončení zkontroluj náhled, diagnostickou tabulku a hlášení o počtu použitých/vyřazených snímků.</li>
+<li>Výsledek ulož přes <strong>File &gt; Save result as / Soubor &gt; Uložit výsledek jako</strong>.</li>
+</ol>
+<h2>3. Levý panel - skládání</h2>
+<h3>Výběr složky a náhledu</h3>
+<p><strong>Choose folder / Vybrat složku</strong> načte pracovní složku se snímky. Program v seznamu ukazuje Light, Flat, Bias a Dark snímky. Po stackování se v seznamu označí:</p>
+<ul>
+<li><code>*</code> referenční snímek,</li>
+<li><code>x</code> vyřazený snímek.</li>
+</ul>
+<p>Rozbalovací seznam slouží také k rychlé kontrole jednotlivých snímků.</p>
+<h3>RAW only / Pouze RAW</h3>
+<p>Tato volba při stackování ponechá FIT/FITS a foto RAW soubory, například ARW, CR2, CR3 apod. Vynechá JPG, PNG, BMP a TIFF. Hodí se, když chytrý dalekohled nebo fotoaparát ukládá do složky současně pracovní snímky i náhledy.</p>
+<h3>Zarovnání</h3>
+<p><strong>Translation / Pouze posun</strong></p>
+<p>Rychlé zarovnání pouze posunem. Vhodné pro malé drifty bez rotace.</p>
+<p><strong>Calibration/no alignment / Kalibrační snímky - bez zarovnání</strong></p>
+<p>Používá se pro skládání kalibračních snímků pixel na pixel.</p>
+<p><strong>ECC affine / Afinní ECC</strong></p>
+<p>Zarovnání posunem, rotací a změnou měřítka pomocí obrazové korelace. Může být pomalejší a u slabých objektů nemusí být ideální.</p>
+<p><strong>Star alignment + RANSAC</strong></p>
+<p>Hlavní doporučený režim. Program detekuje hvězdy, páruje je s referenčním snímkem a přes RANSAC odhadne transformaci. Novější robustnější verze zkouší více kandidátů posunu a rotace, takže má vyšší úspěšnost u EAA sekvencí, ditheringu a chytrých dalekohledů s větším skokovým posunem. Snímky bez platného zarovnání vyřadí.</p>
+<p><strong>Comet alignment</strong></p>
+<p>Skládá na kometu podle označené polohy komety.</p>
+<p><strong>Star + Comet</strong></p>
+<p>Vytvoří samostatný výstup pro hvězdy a kometu.</p>
+<h3>Automatická a ruční reference</h3>
+<p><strong>Automatically choose best reference / Automaticky vybrat nejlepší referenci</strong> vybere snímek s nejlepším skóre kvality. Skóre vychází hlavně z ostrosti a počtu detekovaných hvězd.</p>
+<p>Pokud automatická reference u některé sekvence nefunguje ideálně, vyber v seznamu vhodný snímek a klikni na <strong>Use current frame as reference / Použít aktuální snímek jako referenci</strong>. Tím se automatická reference vypne a program použije zvolený snímek.</p>
+<h3>Quality filter / Použít jen nejlepší snímky</h3>
+<p>Program spočítá skóre kvality pro každý Light snímek. Skóre kombinuje:</p>
+<ul>
+<li>ostrost snímku,</li>
+<li>počet detekovaných hvězd.</li>
+</ul>
+<p>Volba <strong>Keep / Ponechat</strong> určuje, kolik procent nejlepších snímků se použije. Například 80 % znamená, že nejhorších 20 % bude vyřazeno ještě před alignmentem.</p>
+<p>Důležité: snímek může projít filtrem kvality, ale později být vyřazen, pokud selže zarovnání.</p>
+<h3>Max. star drift / Max. drift hvězd</h3>
+<p>Určuje největší očekávaný posun hvězd vůči referenci. U běžných sekvencí stačí menší hodnota. U EAA, ditheringu nebo chytrých dalekohledů může být potřeba hodnotu zvýšit.</p>
+<h3>Ignore border / Ignorovat okraj</h3>
+<p>Program při hledání hvězd ignoruje okraje snímku. To pomáhá, pokud jsou na okraji větve, šum, vinětace, černé rohy po rotaci nebo jiné rušivé struktury.</p>
+<h3>Strict star filter / Přísný filtr hvězd</h3>
+<p>Přísnější kontrola tvaru hvězd. Pomáhá proti větvím, stopám a protáhlým artefaktům. Pokud program odmítá příliš mnoho použitelných snímků, může někdy pomoci tuto volbu vypnout.</p>
+<h3>Satellite trail / Satelitní stopa</h3>
+<p>Volba <strong>Satellite trail / Satelitní stopa</strong> přidá kontrolu dlouhých rovných stop družic nebo letadel. Při vyhodnocení kvality Astro Stacker analyzuje jednotlivé Light snímky a podezřelé snímky označí v tabulce Frame quality.</p>
+<p>Detektor je nastavený tak, aby dával přednost jasným dlouhým rovným stopám. Soubory nemaže automaticky. Nejlépe funguje společně s volbou <strong>Review frames before stacking / Zkontrolovat snímky před skládáním</strong>, kde lze podezřelé řádky vyřadit mezerníkem.</p>
+<h2>4. Diagnostická tabulka snímků</h2>
+<p>Ve spodní části je tabulka <strong>Frame quality / Vyhodnocení snímků</strong>. Slouží ke kontrole, proč byly snímky použity nebo vyřazeny.</p>
+<p>Sloupce:</p>
+<ul>
+<li><code>#</code> pořadí snímku,</li>
+<li><code>File / Soubor</code> název souboru,</li>
+<li><code>Score / Skóre</code> celkové skóre kvality,</li>
+<li><code>Stars / Hvězdy</code> počet detekovaných hvězd,</li>
+<li><code>Sharpness / Ostrost</code> ostrost podle Laplacian variance,</li>
+<li><code>Trail / Stopa</code> výsledek kontroly družicové nebo letecké stopy,</li>
+<li><code>Status / Stav</code> použití snímku,</li>
+<li><code>Ref</code> označení reference.</li>
+</ul>
+<p>Typické stavy:</p>
+<ul>
+<li><strong>Used / Použit</strong> - snímek byl složen.</li>
+<li><strong>Reference</strong> - referenční snímek.</li>
+<li><strong>Excluded by quality / Vyřazen kvalitou</strong> - snímek neprošel filtrem kvality.</li>
+<li><strong>Rejected alignment / Selhal alignment</strong> - snímek byl kvalitní dost, ale nepodařilo se ho zarovnat.</li>
+<li><strong>Skipped / Vynechán</strong> - snímek nebyl součástí stacku, například kalibrační nebo nepoužitý typ.</li>
+</ul>
+<p>Pokud je zapnutá volba <strong>Satellite trail / Satelitní stopa</strong>, sloupec <code>Trail / Stopa</code> zobrazí <strong>Suspect / Podezřelá</strong> u snímků, kde byla nalezena dlouhá rovná stopa. Je to upozornění pro kontrolu, ne automatické smazání souboru.</p>
+<p>Kliknutí na řádek tabulky přepne náhled na daný snímek.</p>
+<h3>Kontrola snímků před skládáním</h3>
+<p>Volba <strong>Review frames before stacking / Zkontrolovat snímky před skládáním</strong> vloží před samotné skládání ruční kontrolní krok.</p>
+<p>Postup:</p>
+<ol>
+<li>Zapni <strong>Zkontrolovat snímky před skládáním</strong>.</li>
+<li>Klikni na <strong>Spustit skládání</strong>.</li>
+<li>Program pouze spočítá kvalitu snímků, vybere referenci a naplní tabulku Frame Quality.</li>
+<li>V tabulce vyber snímek, který nechceš použít.</li>
+<li>Stiskni mezerník. Stav se změní na <strong>Vyřazený</strong> a řádek zčervená.</li>
+<li>Dalším stiskem mezerníku lze snímek znovu povolit.</li>
+<li>Klikni na <strong>Pokračovat ve skládání</strong>.</li>
+</ol>
+<p>Referenční snímek nelze mezerníkem vyřadit. Pokud chceš vyřadit referenci, nejprve vyber jiný referenční snímek.</p>
+<p>Ruční vyřazení má přednost před automatickým výběrem. Automatický quality filter stále určí první výběr, ale před finálním alignmentem můžeš ručně odebrat další snímky.</p>
+<h2>5. Kalibrace Flat, Bias a Dark</h2>
+<p>Program umí použít kalibrační snímky dvěma způsoby:</p>
+<ul>
+<li>automaticky, pokud jsou ve vhodně pojmenovaných složkách,</li>
+<li>ručně přes tlačítka <strong>Flat</strong>, <strong>Bias</strong> a <strong>Dark</strong> v pravém panelu.</li>
+</ul>
+<p>Kalibrace se aplikuje před zarovnáním a stackováním Light snímků.</p>
+<p>Při použití automatických kalibračních složek Astro Stacker uloží opakovaně použitelné master soubory přímo do těchto složek:</p>
+<ul>
+<li><code>MasterBias_AS.fit</code> a <code>MasterBias_AS.json</code></li>
+<li><code>MasterFlat_AS.fit</code> a <code>MasterFlat_AS.json</code></li>
+<li><code>MasterDark_AS.fit</code> a <code>MasterDark_AS.json</code></li>
+</ul>
+<p>Při dalším spuštění program uložený master znovu použije, pokud se nezměnil obsah složky, nastavení Bayer masky ani volba <strong>RAW only / Pouze RAW</strong>. Když se soubory přidají, smažou, upraví nebo se změní režim RAW only, master se automaticky vytvoří znovu.</p>
+<p><strong>RAW only / Pouze RAW</strong> platí i pro automatické složky Flat/Bias/Dark. JPG, PNG, BMP a TIFF náhledy v kalibračních složkách se při zapnuté volbě ignorují.</p>
+<p>Tlačítko <strong>Reset calibration / Reset kalibrace</strong> odstraní vybrané kalibrační snímky.</p>
+<h2>6. Skládání komety</h2>
+<p>Pro kometu je nejspolehlivější označit její polohu ve dvou snímcích.</p>
+<ol>
+<li>Vyber složku se sekvencí.</li>
+<li>Klikni na <strong>Comet First / Kometa první</strong>.</li>
+<li>Program načte první snímek. Klikni v náhledu na jádro komety.</li>
+<li>Klikni na <strong>Comet Last / Kometa poslední</strong>.</li>
+<li>Program načte poslední snímek. Klikni na jádro komety.</li>
+<li>Program zná pohyb komety mezi začátkem a koncem sekvence.</li>
+<li>Vyber režim <strong>Comet alignment</strong> nebo <strong>Star + Comet</strong>.</li>
+<li>Spusť skládání.</li>
+</ol>
+<p><strong>Comet Clear / Kometa smaž</strong> smaže uloženou první i poslední polohu komety.</p>
+<p>Volby pro kometu:</p>
+<ul>
+<li><strong>Max. comet motion / Max. pohyb komety</strong> - největší očekávaný pohyb komety.</li>
+<li><strong>Refine comet position / Jemně doladit kometu</strong> - dohledá jádro lokální korelací.</li>
+<li><strong>Comet template / Šablona komety</strong> - velikost šablony kolem jádra.</li>
+<li><strong>Comet search / Hledání komety</strong> - jak daleko od předpokládané polohy se smí jádro dohledat.</li>
+</ul>
+<h2>7. Předvolby a profily nastavení</h2>
+<p>Předvolby se ukládají jako JSON profil.</p>
+<p>Použij:</p>
+<ul>
+<li><strong>File &gt; Save settings profile / Soubor &gt; Uložit profil nastavení</strong></li>
+<li><strong>File &gt; Load settings profile / Soubor &gt; Načíst profil nastavení</strong></li>
+</ul>
+<p>Profil ukládá nastavení stackování, kalibrace, komety i pravého panelu. Hodí se například pro různé typy dat:</p>
+<ul>
+<li>DSLR RAW,</li>
+<li>Seestar/Vespera EAA,</li>
+<li>komety,</li>
+<li>kalibrační snímky,</li>
+<li>čistý lineární FIT workflow.</li>
+</ul>
+<h2>8. Pravý panel - náhled a úpravy</h2>
+<p>Pravý panel slouží ke kontrole a vizuálním úpravám výsledku. Tyto úpravy jsou určené hlavně pro náhled a export do PNG/TIFF. Lineární FIT výstup zůstává vhodný pro další zpracování.</p>
+<h3>Show stacked image / Zobraz složený obraz</h3>
+<p>Vrátí náhled na původní složený obraz bez ořezu, neutralizace a vizuálních úprav.</p>
+<h3>Clear cache quality frames / Smazat cache kvality snímků</h3>
+<p>Smaže uloženou cache kvality snímků a případnou cache zarovnaných snímků. Hodí se, když změníš nastavení, Bayer masku, referenci, verzi programu nebo když chceš vynutit nové vyhodnocení snímků.</p>
+<ul>
+<li><strong>Pouze aktuální složka</strong> smaže jen adresář <code>astro_stacker_cache</code> v aktuálně vybrané složce.</li>
+<li><strong>Celá cache v této složce</strong> projde aktuální složku rekurzivně a smaže jen adresáře pojmenované <code>astro_stacker_cache</code>.</li>
+</ul>
+<p>Program nemaže Light, Flat, Bias, Dark ani jiné obrazové soubory.</p>
+<h3>Balance</h3>
+<p>Tlačítko <strong>Balance</strong> automaticky nastaví rozumný náhled lineárního snímku:</p>
+<ul>
+<li>neutralizuje pozadí pro náhled,</li>
+<li>nastaví black point,</li>
+<li>nastaví gamma,</li>
+<li>snaží se zobrazit slabý lineární obraz čitelněji.</li>
+</ul>
+<p>Balance nemění lineární FIT data. Je to rychlá pomůcka pro náhled.</p>
+<h3>Black point, White point, Gamma</h3>
+<p>Základní křivky pro zobrazení:</p>
+<ul>
+<li><strong>Black point</strong> posouvá černý bod.</li>
+<li><strong>White point</strong> určuje světlý bod.</li>
+<li><strong>Gamma</strong> mění střední tóny.</li>
+</ul>
+<h3>Highlight compression / Komprese jasů</h3>
+<p>Potlačuje přepaly jasných hvězd a jader objektů. Hodí se pro náhled snímků s velmi jasnými hvězdami.</p>
+<h3>Vignette removal / Odstranění vinětace</h3>
+<p>Jemně zesvětlí okraje a rohy. Není to náhrada skutečného Flat snímku, ale může pomoci pro rychlý vizuální náhled.</p>
+<h3>Synthetic flat / Umělý flat</h3>
+<p>Odhadne hladké pozadí ze složeného obrazu a použije ho jako jemnou korekci. Používej opatrně, zvlášť u rozsáhlých mlhovin, kde může program část mlhoviny považovat za pozadí.</p>
+<h3>Color background correction / Korekce barevného pozadí</h3>
+<p>Potlačuje hladký barevný závoj pozadí po RGB kanálech. Je užitečná hlavně u velmi barevně nevyvážených snímků, například růžové nebo fialové pozadí z chytrých dalekohledů.</p>
+<h3>SCNR Green</h3>
+<p>Potlačuje zelený nádech. Používej jen tehdy, pokud je zelená opravdu rušivá.</p>
+<h3>Contrast, Saturation, RGB</h3>
+<ul>
+<li><strong>Contrast / Kontrast</strong> mění kontrast náhledu.</li>
+<li><strong>Saturation / Saturace</strong> mění barevnost.</li>
+<li><strong>Red, Green, Blue / Červená, Zelená, Modrá</strong> ručně upravují jednotlivé kanály.</li>
+</ul>
+<h3>Histogram</h3>
+<p>Histogram ukazuje jasový kanál a RGB kanály. Pomáhá kontrolovat, zda nejsou data příliš oříznutá v černé nebo bílé.</p>
+<h3>Crop edges / Oříznout okraje</h3>
+<p>Ořízne zadané procento z každého okraje aktuálního snímku. Hodí se po rotaci, ditheringu nebo EAA sekvencích s tmavými rohy.</p>
+<h3>Auto White Balance</h3>
+<p>Pokusí se automaticky vyvážit bílé/šedé oblasti. U některých astrofotografií může být vhodnější ruční úprava RGB nebo korekce barevného pozadí.</p>
+<h3>Neutralize background / Neutralizovat pozadí</h3>
+<p>Snaží se srovnat barvu pozadí. Nejlépe funguje, když je v obraze dost neutrálního pozadí bez mlhovin a bez špatných okrajů.</p>
+<h3>Flip horizontal / vertical</h3>
+<p>Překlopí náhled horizontálně nebo vertikálně.</p>
+<h3>Fit a 1:1</h3>
+<ul>
+<li><strong>Fit</strong> přizpůsobí snímek oknu.</li>
+<li><strong>1:1</strong> zobrazí skutečné pixely.</li>
+</ul>
+<h2>9. PixInsight wrapper</h2>
+<p>Tlačítko <strong>PixInsight</strong> otevře PixInsight a spustí AS_Stacker wrapper, pokud je správně dostupný. Wrapper umožňuje spustit CLI verzi stackeru přímo z PixInsightu a po dokončení otevřít výsledný FIT v PixInsightu.</p>
+<p>Pro wrapper je potřeba nastavit Python prostředí, ve kterém jsou nainstalované potřebné balíčky.</p>
+<h2>10. Doporučené postupy</h2>
+<h3>Běžná deep-sky sekvence</h3>
+<ul>
+<li>Star alignment + RANSAC</li>
+<li>Sigma-clipped mean</li>
+<li>Auto reference zapnuto</li>
+<li>Quality filter 80-100 %</li>
+<li>Strict star filter zapnuto</li>
+</ul>
+<h3>Sekvence s velkým driftem nebo ditheringem</h3>
+<ul>
+<li>Zvyš Max. star drift.</li>
+<li>Zkus ruční referenci ze středu sekvence.</li>
+<li>Sleduj diagnostickou tabulku, jestli snímky padají na kvalitě nebo alignmentu.</li>
+</ul>
+<h3>Chytré dalekohledy a EAA</h3>
+<ul>
+<li>Zapni RAW only, pokud jsou ve složce i náhledové obrázky.</li>
+<li>U rotace a tmavých rohů použij ořez.</li>
+<li>U růžového/fialového pozadí použij Color background correction.</li>
+</ul>
+<h3>Komety</h3>
+<ul>
+<li>Označ první i poslední polohu komety.</li>
+<li>Použij Comet alignment nebo Star + Comet.</li>
+<li>U slabého jádra nech zapnuté jemné doladění komety.</li>
+</ul>
+<h2>11. Co dělat při problémech</h2>
+<h3>Program vyřazuje mnoho snímků</h3>
+<p>Zkontroluj tabulku Frame quality:</p>
+<ul>
+<li>pokud jsou snímky <strong>Excluded by quality</strong>, sniž filtr kvality nebo zvyš Keep %;</li>
+<li>pokud jsou <strong>Rejected alignment</strong>, zvyš Max. star drift, změň referenci nebo zkus jiný režim zarovnání.</li>
+</ul>
+<h3>Snímek je barevně divný</h3>
+<p>Zkus postupně:</p>
+<ol>
+<li>Balance,</li>
+<li>Color background correction,</li>
+<li>Neutralize background,</li>
+<li>ruční RGB posuny,</li>
+<li>případně ořez okrajů a neutralizaci znovu.</li>
+</ol>
+<h3>Výsledek má tmavé rohy</h3>
+<p>Je to běžné u rotace, ditheringu nebo velkého driftu. Použij Crop edges nebo výsledek dále ořízni v externím editoru.</p>
+<h3>FIT výstup vypadá tmavě</h3>
+<p>To je normální. FIT je lineární a potřebuje stretch. Použij Balance pro náhled nebo výstup zpracuj v PixInsightu, Sirilu či jiném astrofoto editoru.</p>
+</body>
+</html>

@@ -1,0 +1,39 @@
+# macOS / Windows metadata
+.DS_Store
+Thumbs.db
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pycache_tmp/
+
+# Local GPU / package caches
+.cupy_cache/
+
+# Logs and diagnostics
+*.log
+astro_stacker_gpu.log
+trail_*_diagnostic.png
+
+# PyInstaller / build output
+build/
+dist/
+*.spec
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local generated output folders
+astro_stacker_output/
+astro_stacker_cache/
+
+# Old local development snapshots
+astro_stacker_app2.py
+astro_stacker_app3.py
+astro_stacker_app4.py
+astro_stacker_app5.py
+astro_stacker_app6.py
+
