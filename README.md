@@ -159,3 +159,6 @@ Full user manuals are included:
 
 Astro Stacker by **Josef Ladra**.
 
+<img width="1800" height="971" alt="AS23" src="https://github.com/user-attachments/assets/af08d9dc-7c84-4192-934d-a944d8ad5c2c" />
+
+
