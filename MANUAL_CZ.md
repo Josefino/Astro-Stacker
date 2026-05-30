@@ -1,4 +1,4 @@
-# Astro Stacker 2.3 - uživatelský manuál
+# Astro Stacker 2.4 - uživatelský manuál
 
 Astro Stacker slouží ke skládání astronomických snímků z DSLR, bezzrcadlovek, astronomických kamer a chytrých dalekohledů. Umí načíst sekvenci Light snímků, volitelně použít Flat/Bias/Dark kalibraci, zarovnat snímky podle hvězd nebo komety, složit výsledek a nabídnout základní úpravy náhledu pro kontrolu a export.
 

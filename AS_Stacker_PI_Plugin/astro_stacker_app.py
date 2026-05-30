@@ -266,8 +266,8 @@ FITS_EXTENSIONS = {".fits", ".fit"}
 RAW_STACK_EXTENSIONS = FITS_EXTENSIONS | RAW_EXTENSIONS
 
 LAST_STACK_SELECTION: Dict[str, Any] = {}
-ALIGNMENT_CACHE_VERSION = "aligned-v3-fast-affine"
-QUALITY_CACHE_VERSION = "quality-v13-trail-faint-line"
+ALIGNMENT_CACHE_VERSION = "aligned-v6-standard-flat-normalization"
+QUALITY_CACHE_VERSION = "quality-v14-trail-analysis-state"
 CALIBRATION_SIGNATURE_CACHE: Dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
 MP_WORKER_CONTEXT: Dict[str, Any] = {}
 
@@ -750,6 +750,38 @@ def debayer_fits_to_rgb_float(raw: np.ndarray, pattern: str) -> np.ndarray:
     return normalize_fits_linear_to_float(rgb16)
 
 
+def debayer_sensor_mosaic_to_rgb_float(raw: np.ndarray, pattern: str) -> np.ndarray:
+    """Debayer an already normalized 2D sensor mosaic without rescaling it."""
+    pattern = (pattern or "").upper()
+    code_map = {
+        "RGGB": cv2.COLOR_BayerRG2RGB,
+        "BGGR": cv2.COLOR_BayerBG2RGB,
+        "GRBG": cv2.COLOR_BayerGR2RGB,
+        "GBRG": cv2.COLOR_BayerGB2RGB,
+    }
+    if pattern not in code_map:
+        raise ValueError(f"Nepodporovaný Bayer pattern: {pattern}")
+    raw16 = (np.clip(np.asarray(raw, dtype=np.float32), 0, 1) * 65535.0).astype(np.uint16)
+    rgb16 = cv2.cvtColor(raw16, code_map[pattern])
+    rgb16 = rgb16[..., ::-1]
+    return np.ascontiguousarray((rgb16.astype(np.float32) / 65535.0).astype(np.float32))
+
+
+def normalize_sensor_mosaic_to_float(arr: np.ndarray) -> np.ndarray:
+    """Normalize raw sensor values linearly while preserving calibration ratios."""
+    original = np.asarray(arr)
+    if np.issubdtype(original.dtype, np.integer):
+        info = np.iinfo(original.dtype)
+        data = original.astype(np.float32)
+        return np.clip((data - float(info.min)) / max(1.0, float(info.max - info.min)), 0, 1).astype(np.float32)
+    data = np.nan_to_num(np.asarray(original, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    hi = float(np.max(data)) if data.size else 0.0
+    if hi <= 1.000001:
+        return np.clip(data, 0, 1).astype(np.float32)
+    scale = 65535.0 if hi <= 65535.0 else max(1.0, hi)
+    return np.clip(data / scale, 0, 1).astype(np.float32)
+
+
 def load_fits_as_float(path: Path) -> np.ndarray:
     if fits is None:
         raise RuntimeError("Pro FITS podporu nainstaluj: pip install astropy")
@@ -872,6 +904,52 @@ def rawpy_bayer_pattern(raw) -> Optional[str]:
         pass
 
     return None
+
+
+def load_raw_sensor_mosaic_as_float(path: Path) -> Tuple[np.ndarray, str]:
+    """Load DSLR/MILC RAW as an undebayered normalized sensor mosaic."""
+    if rawpy is None:
+        raise RuntimeError("RAW podpora vyžaduje rawpy. Nainstaluj: pip install rawpy")
+    with rawpy.imread(str(path)) as raw:
+        pattern = rawpy_bayer_pattern(raw) or "RGGB"
+        mosaic = np.asarray(raw.raw_image_visible, dtype=np.float32)
+        try:
+            white = float(raw.white_level)
+        except Exception:
+            white = float(np.max(mosaic))
+    return np.ascontiguousarray(np.clip(mosaic / max(1.0, white), 0, 1).astype(np.float32)), pattern
+
+
+def load_fits_sensor_mosaic_as_float(path: Path) -> Optional[Tuple[np.ndarray, str]]:
+    """Load a Bayer FIT/FITS frame as a 2D sensor mosaic when metadata allows it."""
+    if fits is None:
+        raise RuntimeError("Pro FITS podporu nainstaluj: pip install astropy")
+    with open_fits_safely(path, memmap=False) as hdul:
+        for hdu in hdul:
+            data = getattr(hdu, "data", None)
+            if data is None:
+                continue
+            pattern = effective_bayer_pattern_from_header(getattr(hdu, "header", None))
+            if not pattern:
+                return None
+            arr = np.asarray(data)
+            if arr.ndim == 3 and arr.shape[0] not in (3, 4) and arr.shape[-1] not in (3, 4):
+                arr = arr[0]
+            if arr.ndim != 2:
+                return None
+            return np.ascontiguousarray(normalize_sensor_mosaic_to_float(arr)), pattern
+    return None
+
+
+def load_sensor_mosaic_as_float(path: Path) -> Optional[Tuple[np.ndarray, str]]:
+    """Return an undebayered sensor mosaic for RAW/Bayer FIT, otherwise None."""
+    suffix = Path(path).suffix.lower()
+    if suffix in RAW_EXTENSIONS:
+        return load_raw_sensor_mosaic_as_float(path)
+    if suffix in FITS_EXTENSIONS:
+        return load_fits_sensor_mosaic_as_float(path)
+    return None
+
 
 def load_raw_bayer_manual_as_float(path: Path) -> np.ndarray:
     """Ruční načtení RAW Bayer dat a debayer přes OpenCV.
@@ -1052,6 +1130,68 @@ def calibrate_light_frame(
     return np.clip(calibrated, 0, 1).astype(np.float32)
 
 
+def prepare_sensor_calibration_frame(calib: np.ndarray, target_shape: Tuple[int, int]) -> Optional[np.ndarray]:
+    """Prepare a 2D calibration master for calibration before debayering."""
+    arr = np.asarray(calib, dtype=np.float32)
+    if arr.ndim != 2:
+        return None
+    h, w = target_shape
+    if arr.shape != (h, w):
+        arr = cv2.resize(arr, (w, h), interpolation=cv2.INTER_AREA)
+    return np.clip(arr.astype(np.float32), 0, 1)
+
+
+def calibrate_sensor_mosaic(
+    light: np.ndarray,
+    flat: Optional[np.ndarray] = None,
+    bias: Optional[np.ndarray] = None,
+    dark: Optional[np.ndarray] = None,
+) -> Optional[np.ndarray]:
+    """Calibrate a 2D Bayer mosaic before debayering; return None for RGB masters."""
+    light = np.asarray(light, dtype=np.float32)
+    if light.ndim != 2:
+        return None
+    h, w = light.shape
+
+    flat2 = prepare_sensor_calibration_frame(flat, (h, w)) if flat is not None else None
+    bias2 = prepare_sensor_calibration_frame(bias, (h, w)) if bias is not None else None
+    dark2 = prepare_sensor_calibration_frame(dark, (h, w)) if dark is not None else None
+    if (flat is not None and flat2 is None) or (bias is not None and bias2 is None) or (dark is not None and dark2 is None):
+        return None
+
+    numerator = light - (dark2 if dark2 is not None else bias2 if bias2 is not None else 0.0)
+    if flat2 is not None:
+        denominator = flat2 - (bias2 if bias2 is not None else 0.0)
+        denom_median = float(np.median(denominator))
+        if abs(denom_median) < 1e-8:
+            denom_median = float(np.mean(denominator))
+        if abs(denom_median) < 1e-8:
+            denom_median = 1.0
+        denominator = denominator / denom_median
+        eps = max(1e-6, float(np.percentile(np.abs(denominator), 5)) * 0.1)
+        denominator = np.where(np.abs(denominator) < eps, eps, denominator)
+        numerator = numerator / denominator
+    return np.clip(np.nan_to_num(numerator, nan=0.0, posinf=1.0, neginf=0.0), 0, 1).astype(np.float32)
+
+
+def load_calibrated_image_as_float(
+    path: Path,
+    flat: Optional[np.ndarray] = None,
+    bias: Optional[np.ndarray] = None,
+    dark: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Load and calibrate before debayering when raw sensor data are available."""
+    sensor = load_sensor_mosaic_as_float(path)
+    if sensor is not None:
+        mosaic, pattern = sensor
+        calibrated_mosaic = calibrate_sensor_mosaic(mosaic, flat, bias, dark)
+        if calibrated_mosaic is not None:
+            return debayer_sensor_mosaic_to_rgb_float(calibrated_mosaic, pattern)
+
+    img = load_image_as_float(path)
+    return calibrate_light_frame(img, flat, bias, dark)
+
+
 
 def find_calibration_subfolder(folder: Path, names: Tuple[str, ...]) -> Optional[Path]:
     """Najde podsložku kalibračních snímků bez ohledu na velikost písmen."""
@@ -1087,12 +1227,23 @@ def stack_calibration_folder(folder: Path, kind: str, settings: Optional[StackSe
     frames = []
     reference_shape = None
     total = len(paths)
+    sensor_frames = []
+    for path in paths:
+        try:
+            sensor = load_sensor_mosaic_as_float(path)
+        except Exception:
+            sensor = None
+        if sensor is None:
+            sensor_frames = []
+            break
+        sensor_frames.append(sensor[0])
+    use_sensor_mosaics = len(sensor_frames) == total
 
     for idx, path in enumerate(paths):
         if progress_callback:
             progress_callback(0, f"Skládám {kind} ({idx + 1}/{total}): {path.name}")
 
-        img = load_image_as_float(path)
+        img = sensor_frames[idx] if use_sensor_mosaics else load_image_as_float(path)
 
         if reference_shape is None:
             reference_shape = img.shape[:2]
@@ -2816,7 +2967,7 @@ def frame_quality_score_from_gray(gray: np.ndarray) -> float:
 
 def frame_quality_metrics(path: Path, detect_satellite_trails: bool = False) -> Dict[str, float]:
     cached = load_frame_quality_cache(path)
-    if cached is not None and (not detect_satellite_trails or "satellite_trail" in cached):
+    if cached is not None and (not detect_satellite_trails or cached.get("satellite_trail_checked", 0.0) >= 0.5):
         cached = dict(cached)
         cached["cached"] = 1.0
         return cached
@@ -2826,6 +2977,7 @@ def frame_quality_metrics(path: Path, detect_satellite_trails: bool = False) -> 
         metrics = dict(cached) if cached is not None else frame_quality_metrics_from_gray(gray)
         if detect_satellite_trails:
             metrics.update(detect_satellite_trail_from_gray(gray))
+            metrics["satellite_trail_checked"] = 1.0
         save_frame_quality_cache(path, metrics)
         return metrics
     except Exception:
@@ -2899,7 +3051,7 @@ def calibration_master_paths(folder: Path, kind: str) -> Tuple[Path, Path]:
 
 def calibration_master_signature(folder: Path, kind: str, settings: Optional[StackSettings], paths: List[Path]) -> Dict[str, Any]:
     return {
-        "version": "calibration-master-v1",
+        "version": "calibration-master-v2-predebayer",
         "kind": str(kind),
         "raw_only": bool(settings is not None and (getattr(settings, "raw_only", False) or getattr(settings, "fit_only", False))),
         "bayer_pattern": getattr(settings, "bayer_pattern", "auto") if settings is not None else "auto",
@@ -2907,7 +3059,7 @@ def calibration_master_signature(folder: Path, kind: str, settings: Optional[Sta
     }
 
 
-def load_calibration_master_fit(path: Path) -> np.ndarray:
+def load_calibration_master_fit(path: Path, preserve_mosaic: bool = True) -> np.ndarray:
     """Load cached calibration masters without any FITS auto-normalization.
 
     MasterBias/MasterFlat/MasterDark are calibration data, not display images.
@@ -2928,7 +3080,8 @@ def load_calibration_master_fit(path: Path) -> np.ndarray:
 
     arr = np.asarray(data)
     if arr.ndim == 2:
-        arr = np.repeat(arr[..., None], 3, axis=2)
+        if not preserve_mosaic:
+            arr = np.repeat(arr[..., None], 3, axis=2)
     elif arr.ndim == 3:
         if arr.shape[0] in (3, 4) and arr.shape[1] > 16 and arr.shape[2] > 16:
             arr = np.moveaxis(arr[:3], 0, -1)
@@ -3025,6 +3178,7 @@ def load_frame_quality_cache(path: Path) -> Optional[Dict[str, float]]:
                 "satellite_trail": float(data.get("satellite_trail", 0.0)),
                 "trail_score": float(data.get("trail_score", 0.0)),
                 "trail_count": float(data.get("trail_count", 0.0)),
+                "satellite_trail_checked": float(data.get("satellite_trail_checked", 0.0)),
             })
         return metrics
     except Exception as exc:
@@ -3042,10 +3196,14 @@ def save_frame_quality_cache(path: Path, metrics: Dict[str, float]) -> None:
             "score": float(metrics.get("score", -1.0)),
             "sharpness": float(metrics.get("sharpness", 0.0)),
             "star_count": float(metrics.get("star_count", 0.0)),
-            "satellite_trail": float(metrics.get("satellite_trail", 0.0)),
-            "trail_score": float(metrics.get("trail_score", 0.0)),
-            "trail_count": float(metrics.get("trail_count", 0.0)),
         }
+        if metrics.get("satellite_trail_checked", 0.0) >= 0.5:
+            data.update({
+                "satellite_trail": float(metrics.get("satellite_trail", 0.0)),
+                "trail_score": float(metrics.get("trail_score", 0.0)),
+                "trail_count": float(metrics.get("trail_count", 0.0)),
+                "satellite_trail_checked": 1.0,
+            })
         temp_path = cache_path.with_suffix(".tmp")
         temp_path.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
         try:
@@ -3578,8 +3736,7 @@ def stack_folder_star_with_comet_positions(folder: Path, settings: StackSettings
 
     report_bayer_conversion_if_needed(reference_path, progress_callback, 0)
     report_bayer_conversion_if_needed(reference_path, progress_callback, 0)
-    reference = load_image_as_float(reference_path)
-    reference = calibrate_light_frame(reference, flat_frame, bias_frame, dark_frame)
+    reference = load_calibrated_image_as_float(reference_path, flat_frame, bias_frame, dark_frame)
     h, w = reference.shape[:2]
     reference_gray = to_gray_float(reference)
     reference_median = np.median(reference.reshape(-1, 3), axis=0)
@@ -3591,8 +3748,7 @@ def stack_folder_star_with_comet_positions(folder: Path, settings: StackSettings
     for idx, path in enumerate(paths):
         report_bayer_conversion_if_needed(path, progress_callback, 10 + int((idx + 1) / total * 60))
         report_bayer_conversion_if_needed(path, progress_callback, 10 + int((idx + 1) / total * 60))
-        img = load_image_as_float(path)
-        img = calibrate_light_frame(img, flat_frame, bias_frame, dark_frame)
+        img = load_calibrated_image_as_float(path, flat_frame, bias_frame, dark_frame)
         if img.shape[:2] != (h, w):
             img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
 
@@ -3974,8 +4130,7 @@ def stack_folder_sequential_star(folder: Path, settings: StackSettings, progress
         ordered_paths.insert(0, reference_path)
     ref_idx = ordered_paths.index(reference_path)
 
-    reference = load_image_as_float(reference_path)
-    reference = calibrate_light_frame(reference, flat_frame, bias_frame, dark_frame)
+    reference = load_calibrated_image_as_float(reference_path, flat_frame, bias_frame, dark_frame)
     h, w = reference.shape[:2]
     reference_gray = to_gray_float(reference)
     reference_median = np.median(reference.reshape(-1, 3), axis=0)
@@ -3986,8 +4141,7 @@ def stack_folder_sequential_star(folder: Path, settings: StackSettings, progress
     total = len(ordered_paths)
 
     def load_calibrated(path: Path) -> np.ndarray:
-        img = load_image_as_float(path)
-        img = calibrate_light_frame(img, flat_frame, bias_frame, dark_frame)
+        img = load_calibrated_image_as_float(path, flat_frame, bias_frame, dark_frame)
         if img.shape[:2] != (h, w):
             img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
         return img
@@ -4058,8 +4212,7 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
 
     paths, reference_path, scores, sequence_paths = prepare_paths_for_alignment_mode(folder, settings, progress_callback)
 
-    reference = load_image_as_float(reference_path)
-    reference = calibrate_light_frame(reference, flat_frame, bias_frame, dark_frame)
+    reference = load_calibrated_image_as_float(reference_path, flat_frame, bias_frame, dark_frame)
     h, w = reference.shape[:2]
     reference_gray = to_gray_float(reference)
     reference_median = np.median(reference.reshape(-1, 3), axis=0)
@@ -4079,8 +4232,7 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
                     progress_callback(10 + int((idx + 1) / total * 60), f"Zarovnáno z cache ({idx + 1}/{total}): {path.name}")
                 continue
 
-        img = load_image_as_float(path)
-        img = calibrate_light_frame(img, flat_frame, bias_frame, dark_frame)
+        img = load_calibrated_image_as_float(path, flat_frame, bias_frame, dark_frame)
         if img.shape[:2] != (h, w):
             img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
 
@@ -4901,9 +5053,8 @@ def process_single_image_mp(args: Dict[str, Any]) -> Optional[Tuple[str, np.ndar
         if cached_warped is not None and cached_warped.shape[:2] == (h, w):
             return str(path), np.clip(cached_warped, 0, 1).astype(np.float32)
 
-    img = load_image_as_float(path)
-    img = calibrate_light_frame(
-        img,
+    img = load_calibrated_image_as_float(
+        path,
         args.get("flat_frame", context.get("flat_frame")),
         args.get("bias_frame", context.get("bias_frame")),
         args.get("dark_frame", context.get("dark_frame")),
@@ -4961,8 +5112,7 @@ def stack_folder_multiprocessing(folder: Path, settings: StackSettings, processe
     cv2.setNumThreads(1)
 
     report_bayer_conversion_if_needed(reference_path, progress_callback, 0)
-    reference = load_image_as_float(reference_path)
-    reference = calibrate_light_frame(reference, flat_frame, bias_frame, dark_frame)
+    reference = load_calibrated_image_as_float(reference_path, flat_frame, bias_frame, dark_frame)
     h, w = reference.shape[:2]
     reference_gray = to_gray_float(reference)
     reference_median = np.median(reference.reshape(-1, 3), axis=0)
@@ -5439,8 +5589,12 @@ class StackWorker(QThread):
     def _translate_progress_message(self, message: str) -> str:
         replacements = [
             ("Kvalita z cache", "Quality from cache"),
+            ("Hodnotím kvalitu paralelně", "Scoring quality in parallel"),
+            ("Hodnotim kvalitu paralelne", "Scoring quality in parallel"),
             ("Hodnotím kvalitu", "Scoring quality"),
             ("Hodnotim kvalitu", "Scoring quality"),
+            ("Zarovnáno z cache", "Aligned from cache"),
+            ("Zarovnano z cache", "Aligned from cache"),
             ("Zarovnávám paralelně", "Aligning in parallel"),
             ("Zarovnavam paralelne", "Aligning in parallel"),
             ("Dokoncuji paralelni alignment", "Finishing parallel alignment"),
@@ -5461,6 +5615,7 @@ class StackWorker(QThread):
             ("Nacitam MasterFlat z cache", "Loading MasterFlat from cache"),
             ("Nacitam MasterDark z cache", "Loading MasterDark from cache"),
             ("Skladam prumer na CPU po blocich RAM", "Stacking mean on CPU in RAM tiles"),
+            ("Skladam prumer prubezne", "Stacking mean incrementally"),
             ("CPU fallback skladam po castech", "CPU fallback stacking in tiles"),
             ("CPU alignment procesy", "CPU alignment processes"),
             ("CPU procesy omezeny kvuli RAM", "CPU processes limited because of RAM"),
@@ -5471,6 +5626,7 @@ class StackWorker(QThread):
             ("odhad", "estimated"),
             ("volne", "available"),
             ("radky", "rows"),
+            ("radku", "rows"),
             ("vlaken", "threads"),
             ("Časy", "Times"),
             ("debayering/načtení", "debayering/loading"),
@@ -5513,6 +5669,12 @@ class StackWorker(QThread):
             ("Žádný snímek neprošel zarovnáním. Zkontroluj, zda složka Light neobsahuje Dark/Bias snímky nebo zda jsou ve snímcích detekovatelné hvězdy.", "No frame passed alignment. Check whether the Light folder contains Dark/Bias frames or whether detectable stars are present."),
             ("Žádný snímek neprošel postupným zarovnáním.", "No frame passed sequential alignment."),
             ("Star + Comet výstupy vyžadují označení komety v prvním i posledním snímku.", "Star + Comet outputs require marking the comet in both the first and last frame."),
+            ("Ve složce nejsou žádné FIT/FITS ani RAW snímky. Vypni volbu Pouze RAW, pokud chceš skládat i PNG/JPG/TIFF/BMP.", "The folder contains no FIT/FITS or RAW frames. Disable RAW only if you also want to stack PNG/JPG/TIFF/BMP files."),
+            ("Ve složce nejsou žádné podporované obrázky. Podporované formáty zahrnují FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG a BMP.", "The folder contains no supported images. Supported formats include FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG and BMP."),
+            ("Ve složce nezbyly žádné light snímky. Zkontroluj, zda nejsou soubory označené jako Dark/Bias/Flat.", "No light frames remain in the folder. Check whether files are marked as Dark/Bias/Flat."),
+            ("Pro FITS podporu nainstaluj", "Install for FITS support"),
+            ("RAW podpora vyžaduje rawpy. Nainstaluj", "RAW support requires rawpy. Install"),
+            ("Prázdný obrazový soubor.", "Empty image file."),
         ]
         for src, dst in replacements:
             message = message.replace(src, dst)
@@ -5572,7 +5734,7 @@ class FrameAnalysisWorker(QThread):
 class AstroStackerWindow(QMainWindow):
     TRANSLATIONS = {
         "cz": {
-            "window_title": "Astro Stacker 2.3 - skládání astronomických snímků",
+            "window_title": "Astro Stacker 2.4 - skládání astronomických snímků",
             "settings": "Setup", "folder_none": "Složka: nevybrána", "choose_folder": "Vybrat složku",
             "open_image": "Otevřít obrázek/FIT", "language": "Jazyk", "align": "Zarovnání",
             "pixinsight": "PixInsight",
@@ -5710,7 +5872,7 @@ class AstroStackerWindow(QMainWindow):
             "awb_status": "AWB ({source}): R {r:.2f}×, G {g:.2f}×, B {b:.2f}×",
         },
         "en": {
-            "window_title": "Astro Stacker 2.3 - astronomical image stacking",
+            "window_title": "Astro Stacker 2.4 - astronomical image stacking",
             "settings": "Setup", "folder_none": "Folder: not selected", "choose_folder": "Choose folder",
             "open_image": "Open image/FIT", "language": "Language", "align": "Alignment",
             "pixinsight": "PixInsight",
@@ -8136,7 +8298,7 @@ class AstroStackerWindow(QMainWindow):
         version_label = "Version" if self.language == "en" else "Verze"
         text = (
             "<h2>Astro Stacker</h2>"
-            f"<p><b>{version_label}:</b> 2.3</p>"
+            f"<p><b>{version_label}:</b> 2.4</p>"
             f"<p><b>{author_label}:</b> Josef Ladra</p>"
         )
         QMessageBox.about(self, title, text)

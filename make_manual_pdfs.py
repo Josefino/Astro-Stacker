@@ -138,8 +138,8 @@ def convert_one(md_name: str, title: str) -> None:
 
 
 def main() -> None:
-    convert_one("MANUAL_CZ.md", "Astro Stacker 2.2 - uživatelský manuál")
-    convert_one("MANUAL_EN.md", "Astro Stacker 2.2 - User Manual")
+    convert_one("MANUAL_CZ.md", "Astro Stacker 2.4 - uživatelský manuál")
+    convert_one("MANUAL_EN.md", "Astro Stacker 2.4 - User Manual")
 
 
 if __name__ == "__main__":

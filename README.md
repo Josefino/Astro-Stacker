@@ -4,7 +4,7 @@ Astro Stacker is a desktop application for astronomical image stacking, calibrat
 
 The application focuses on a practical workflow: load a folder of light frames, optionally apply calibration frames, align the sequence, stack it, inspect rejected frames, and export either a linear FIT/FITS result or a stretched visual image.
 
-Current application version: **2.3**
+Current application version: **2.4**
 
 ## Main Features
 
@@ -158,4 +158,3 @@ Full user manuals are included:
 ## Author
 
 Astro Stacker by **Josef Ladra**.
-

@@ -1,4 +1,4 @@
-# Astro Stacker 2.3 - User Manual
+# Astro Stacker 2.4 - User Manual
 
 Astro Stacker is an application for stacking astronomical images from DSLR and mirrorless cameras, astronomy cameras, and smart telescopes. It loads a sequence of Light frames, optionally applies Flat/Bias/Dark calibration, aligns the frames on stars or a comet, stacks the result, and provides preview tools for inspection and export.
 
