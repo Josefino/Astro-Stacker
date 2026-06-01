@@ -9,6 +9,8 @@ import traceback
 import unicodedata
 from pathlib import Path
 
+CLI_VERSION = "2.5"
+
 
 def ascii_text(text: str) -> str:
     text = unicodedata.normalize("NFKD", str(text))
@@ -19,19 +21,37 @@ def ascii_text(text: str) -> str:
 def english_progress_message(message: str) -> str:
     replacements = [
         ("Kvalita z cache", "Quality from cache"),
+        ("Hodnotím kvalitu paralelně", "Scoring quality in parallel"),
+        ("Hodnotim kvalitu paralelne", "Scoring quality in parallel"),
         ("Hodnotím kvalitu", "Scoring quality"),
         ("Hodnotim kvalitu", "Scoring quality"),
         ("Vybírám referenční snímek", "Selecting reference frame"),
-        ("Hodnotím kvalitu paralelně", "Scoring quality in parallel"),
-        ("Hodnotim kvalitu paralelne", "Scoring quality in parallel"),
         ("Zarovnávám paralelně", "Aligning in parallel"),
+        ("Zarovnavam paralelne", "Aligning in parallel"),
+        ("Dokoncuji paralelni alignment", "Finishing parallel alignment"),
         ("Zarovnáno z cache", "Aligned from cache"),
         ("Zarovnano z cache", "Aligned from cache"),
         ("Zarovnávám hvězdy", "Aligning stars"),
         ("Zarovnávám", "Aligning"),
+        ("Zarovnavam", "Aligning"),
         ("CPU procesy omezeny kvuli RAM", "CPU processes limited by RAM"),
+        ("CPU alignment procesy", "CPU alignment processes"),
         ("Skládám snímky na GPU", "Stacking frames on GPU"),
         ("Skladam snimky na GPU", "Stacking frames on GPU"),
+        ("Skladam prumer na CPU po blocich RAM", "Stacking mean on CPU in RAM tiles"),
+        ("Skladam prumer prubezne", "Stacking mean incrementally"),
+        ("Skladam na CPU po blocich RAM", "Stacking on CPU in RAM tiles"),
+        ("Skladam Bias master na CPU po blocich RAM", "Stacking Bias master on CPU in RAM tiles"),
+        ("Skladam Flat master na CPU po blocich RAM", "Stacking Flat master on CPU in RAM tiles"),
+        ("Skladam Dark master na CPU po blocich RAM", "Stacking Dark master on CPU in RAM tiles"),
+        ("Skládám ručně vybranou složku", "Stacking manually selected folder"),
+        ("Nacitam MasterBias z cache", "Loading MasterBias from cache"),
+        ("Nacitam MasterFlat z cache", "Loading MasterFlat from cache"),
+        ("Nacitam MasterDark z cache", "Loading MasterDark from cache"),
+        ("Pripravuji stack v RAM", "Preparing stack in RAM"),
+        ("RAM ochrana", "RAM protection"),
+        ("nedostatek pameti pro cely stack", "not enough memory for the full stack"),
+        ("skladam po castech", "stacking in tiles"),
         ("Skládám snímky", "Stacking frames"),
         ("Skladam snimky", "Stacking frames"),
         ("Skládám hvězdy", "Stacking stars"),
@@ -53,7 +73,22 @@ def english_progress_message(message: str) -> str:
         ("PyTorch/MPS nelze nacist", "PyTorch/MPS cannot be loaded"),
         ("Vyřazuji bez platného star alignmentu", "Rejecting frame without valid star alignment"),
         ("Vyřazuji černý snímek bez hvězd", "Rejecting black frame without stars"),
+        ("Vyřazuji bez postupného star alignmentu", "Rejecting frame without sequential star alignment"),
+        ("Postupné zarovnání", "Sequential alignment"),
+        ("vpřed", "forward"),
+        ("zpět", "backward"),
+        ("vlaken", "threads"),
+        ("radku", "rows"),
         ("Hotovo", "Done"),
+        ("Žádný snímek neprošel zarovnáním. Zkontroluj, zda složka Light neobsahuje Dark/Bias snímky nebo zda jsou ve snímcích detekovatelné hvězdy.", "No frame passed alignment. Check whether the Light folder contains Dark/Bias frames or whether detectable stars are present."),
+        ("Žádný snímek neprošel postupným zarovnáním.", "No frame passed sequential alignment."),
+        ("Star + Comet výstupy vyžadují označení komety v prvním i posledním snímku.", "Star + Comet outputs require marking the comet in both the first and last frame."),
+        ("Ve složce nejsou žádné FIT/FITS ani RAW snímky. Vypni volbu Pouze RAW, pokud chceš skládat i PNG/JPG/TIFF/BMP.", "The folder contains no FIT/FITS or RAW frames. Disable RAW only if you also want to stack PNG/JPG/TIFF/BMP files."),
+        ("Ve složce nejsou žádné podporované obrázky. Podporované formáty zahrnují FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG a BMP.", "The folder contains no supported images. Supported formats include FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG and BMP."),
+        ("Ve složce nezbyly žádné light snímky. Zkontroluj, zda nejsou soubory označené jako Dark/Bias/Flat.", "No light frames remain in the folder. Check whether files are marked as Dark/Bias/Flat."),
+        ("Pro FITS podporu nainstaluj", "Install for FITS support"),
+        ("RAW podpora vyžaduje rawpy. Nainstaluj", "RAW support requires rawpy. Install"),
+        ("Prázdný obrazový soubor.", "Empty image file."),
     ]
     for src, dst in replacements:
         message = message.replace(src, dst)
@@ -97,10 +132,11 @@ def build_settings(args: argparse.Namespace, stack_settings_cls):
         "stack_mode": args.stack,
         "sigma": args.sigma,
         "max_images": args.max_images,
+        "raw_only": args.raw_only,
         "downscale_for_alignment": 0.5,
         "normalize_background": not args.no_normalize_background,
         "auto_reference": not args.no_auto_reference,
-        "quality_filter": not args.no_quality_filter,
+        "quality_filter": bool(args.quality_filter) and not args.no_quality_filter,
         "keep_percent": args.keep_percent,
         "max_star_shift": args.max_star_shift,
         "star_border_margin": args.star_border_margin,
@@ -140,26 +176,29 @@ def output_path_for(args: argparse.Namespace) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Astro Stacker command line engine for PixInsight wrappers.")
+    parser.add_argument("--version", action="version", version=f"Astro Stacker CLI {CLI_VERSION}")
     parser.add_argument("input", type=Path, help="Folder with light frames.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Output folder. Default: input/astro_stacker_output.")
     parser.add_argument("--output-name", default="AS_stack.fit", help="Output FIT/FITS name. AS_ prefix is added automatically.")
     parser.add_argument("--align", choices=["translation", "ecc_affine", "star_affine", "calibration"], default="star_affine")
-    parser.add_argument("--stack", choices=["mean", "median", "sigma"], default="sigma")
+    parser.add_argument("--stack", choices=["mean", "median", "sigma", "high_rejection"], default="sigma")
     parser.add_argument("--sigma", type=float, default=2.5)
     parser.add_argument("--max-images", type=int, default=0)
+    parser.add_argument("--raw-only", action="store_true", help="Use only FIT/FITS and camera RAW files; ignore JPG/PNG/BMP/TIFF previews.")
     parser.add_argument("--keep-percent", type=int, default=80)
     parser.add_argument("--max-star-shift", type=int, default=180)
     parser.add_argument("--star-border-margin", type=int, default=120)
     parser.add_argument("--bayer", default="auto", choices=["auto", "mono", "RGGB", "BGGR", "GRBG", "GBRG"])
-    parser.add_argument("--flat", type=Path, default=None)
-    parser.add_argument("--bias", type=Path, default=None)
-    parser.add_argument("--dark", type=Path, default=None)
+    parser.add_argument("--flat", type=Path, default=None, help="Master Flat file or folder with individual Flat frames.")
+    parser.add_argument("--bias", type=Path, default=None, help="Master Bias file or folder with individual Bias frames.")
+    parser.add_argument("--dark", type=Path, default=None, help="Master Dark file or folder with individual Dark frames.")
     parser.add_argument("--processes", type=int, default=0, help="CPU processes. 0 = auto.")
     parser.add_argument("--gpu", action="store_true")
     parser.add_argument("--aligned-cache", action="store_true", help="Enable aligned-frame cache for repeated runs.")
     parser.add_argument("--no-normalize-background", action="store_true")
     parser.add_argument("--no-auto-reference", action="store_true")
-    parser.add_argument("--no-quality-filter", action="store_true")
+    parser.add_argument("--quality-filter", action="store_true", help="Use only the best frames. Default: off.")
+    parser.add_argument("--no-quality-filter", action="store_true", help="Compatibility option; quality filter is already off by default.")
     parser.add_argument("--no-strict-star-filter", action="store_true")
     return parser.parse_args()
 
@@ -182,7 +221,7 @@ def main() -> int:
     processes = args.processes if args.processes and args.processes > 1 else auto_processes()
     progress(0, f"Settings: align={settings.align_mode}, stack={settings.stack_mode}, sigma={settings.sigma}, "
                 f"auto_ref={settings.auto_reference}, quality_filter={settings.quality_filter}, "
-                f"keep={settings.keep_percent}, max_star_shift={settings.max_star_shift}, "
+                f"raw_only={getattr(settings, 'raw_only', False)}, keep={settings.keep_percent}, max_star_shift={settings.max_star_shift}, "
                 f"border={settings.star_border_margin}, strict={settings.strict_star_filter}, "
                 f"bayer={settings.bayer_pattern}, normalize={settings.normalize_background}, "
                 f"processes={processes}")
@@ -207,7 +246,7 @@ def main() -> int:
     get_alignment_stats = getattr(engine, "get_alignment_stats", None)
     stats = dict(get_alignment_stats() if callable(get_alignment_stats) else {})
     run_log = [
-        "Astro Stacker CLI run",
+        f"Astro Stacker CLI {CLI_VERSION} run",
         f"Python: {sys.executable}",
         f"Input: {args.input}",
         f"Output: {output_path}",
@@ -216,6 +255,7 @@ def main() -> int:
         f"sigma={settings.sigma}",
         f"auto_reference={settings.auto_reference}",
         f"quality_filter={settings.quality_filter}",
+        f"raw_only={getattr(settings, 'raw_only', False)}",
         f"keep_percent={settings.keep_percent}",
         f"max_star_shift={settings.max_star_shift}",
         f"star_border_margin={settings.star_border_margin}",

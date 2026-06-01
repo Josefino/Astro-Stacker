@@ -46,8 +46,9 @@ function defaultSettings()
       maxShift: 180,
       border: 120,
       processes: 1,
+      rawOnly: false,
       autoRef: true,
-      quality: true,
+      quality: false,
       strictStars: true,
       normalize: true,
       gpu: false
@@ -484,7 +485,8 @@ function ASStackerDialog()
    this.stackCombo.addItem( "Sigma clip" );
    this.stackCombo.addItem( "Median" );
    this.stackCombo.addItem( "Mean" );
-   this.stackCombo.currentItem = Math.max( 0, Math.min( 2, saved.stack ) );
+   this.stackCombo.addItem( "High rejection mean" );
+   this.stackCombo.currentItem = Math.max( 0, Math.min( 3, saved.stack ) );
 
    this.bayerCombo = new ComboBox( this );
    this.bayerCombo.addItem( "Auto" );
@@ -527,6 +529,11 @@ function ASStackerDialog()
    this.processesSpin.minValue = 1;
    this.processesSpin.maxValue = 64;
    this.processesSpin.value = saved.processes;
+
+   this.rawOnlyCheck = new CheckBox( this );
+   this.rawOnlyCheck.text = "RAW only";
+   this.rawOnlyCheck.toolTip = "Use only FIT/FITS and camera RAW files. JPG/PNG/BMP/TIFF previews are ignored, including in automatic Flat/Bias/Dark folders.";
+   this.rawOnlyCheck.checked = saved.rawOnly;
 
    this.autoRefCheck = new CheckBox( this );
    this.autoRefCheck.text = "Auto reference";
@@ -606,7 +613,7 @@ function ASStackerDialog()
       var logPath = outDir + "/AS_stacker_cli_error.log";
 
       var alignValues = [ "star_affine", "translation", "ecc_affine", "calibration" ];
-      var stackValues = [ "sigma", "median", "mean" ];
+      var stackValues = [ "sigma", "median", "mean", "high_rejection" ];
       var bayerValues = [ "auto", "mono", "RGGB", "BGGR", "GRBG", "GBRG" ];
 
       var args = [
@@ -627,12 +634,14 @@ function ASStackerDialog()
 
       if ( this.dialog.gpuCheck.checked )
          args.push( "--gpu" );
+      if ( this.dialog.rawOnlyCheck.checked )
+         args.push( "--raw-only" );
       if ( !this.dialog.normalizeCheck.checked )
          args.push( "--no-normalize-background" );
       if ( !this.dialog.autoRefCheck.checked )
          args.push( "--no-auto-reference" );
-      if ( !this.dialog.qualityCheck.checked )
-         args.push( "--no-quality-filter" );
+      if ( this.dialog.qualityCheck.checked )
+         args.push( "--quality-filter" );
       if ( !this.dialog.strictStarsCheck.checked )
          args.push( "--no-strict-star-filter" );
 
@@ -651,6 +660,7 @@ function ASStackerDialog()
          maxShift: this.dialog.maxShiftSpin.value,
          border: this.dialog.borderSpin.value,
          processes: this.dialog.processesSpin.value,
+         rawOnly: this.dialog.rawOnlyCheck.checked,
          autoRef: this.dialog.autoRefCheck.checked,
          quality: this.dialog.qualityCheck.checked,
          strictStars: this.dialog.strictStarsCheck.checked,
@@ -721,6 +731,7 @@ function ASStackerDialog()
 
    var checks = new HorizontalSizer;
    checks.spacing = 12;
+   checks.add( this.rawOnlyCheck );
    checks.add( this.autoRefCheck );
    checks.add( this.qualityCheck );
    checks.add( this.strictStarsCheck );

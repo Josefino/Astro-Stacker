@@ -9,6 +9,8 @@ import traceback
 import unicodedata
 from pathlib import Path
 
+CLI_VERSION = "2.5"
+
 
 def ascii_text(text: str) -> str:
     text = unicodedata.normalize("NFKD", str(text))
@@ -42,6 +44,7 @@ def english_progress_message(message: str) -> str:
         ("Skladam Bias master na CPU po blocich RAM", "Stacking Bias master on CPU in RAM tiles"),
         ("Skladam Flat master na CPU po blocich RAM", "Stacking Flat master on CPU in RAM tiles"),
         ("Skladam Dark master na CPU po blocich RAM", "Stacking Dark master on CPU in RAM tiles"),
+        ("Skládám ručně vybranou složku", "Stacking manually selected folder"),
         ("Nacitam MasterBias z cache", "Loading MasterBias from cache"),
         ("Nacitam MasterFlat z cache", "Loading MasterFlat from cache"),
         ("Nacitam MasterDark z cache", "Loading MasterDark from cache"),
@@ -173,11 +176,12 @@ def output_path_for(args: argparse.Namespace) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Astro Stacker command line engine for PixInsight wrappers.")
+    parser.add_argument("--version", action="version", version=f"Astro Stacker CLI {CLI_VERSION}")
     parser.add_argument("input", type=Path, help="Folder with light frames.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Output folder. Default: input/astro_stacker_output.")
     parser.add_argument("--output-name", default="AS_stack.fit", help="Output FIT/FITS name. AS_ prefix is added automatically.")
     parser.add_argument("--align", choices=["translation", "ecc_affine", "star_affine", "calibration"], default="star_affine")
-    parser.add_argument("--stack", choices=["mean", "median", "sigma"], default="sigma")
+    parser.add_argument("--stack", choices=["mean", "median", "sigma", "high_rejection"], default="sigma")
     parser.add_argument("--sigma", type=float, default=2.5)
     parser.add_argument("--max-images", type=int, default=0)
     parser.add_argument("--raw-only", action="store_true", help="Use only FIT/FITS and camera RAW files; ignore JPG/PNG/BMP/TIFF previews.")
@@ -185,9 +189,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-star-shift", type=int, default=180)
     parser.add_argument("--star-border-margin", type=int, default=120)
     parser.add_argument("--bayer", default="auto", choices=["auto", "mono", "RGGB", "BGGR", "GRBG", "GBRG"])
-    parser.add_argument("--flat", type=Path, default=None)
-    parser.add_argument("--bias", type=Path, default=None)
-    parser.add_argument("--dark", type=Path, default=None)
+    parser.add_argument("--flat", type=Path, default=None, help="Master Flat file or folder with individual Flat frames.")
+    parser.add_argument("--bias", type=Path, default=None, help="Master Bias file or folder with individual Bias frames.")
+    parser.add_argument("--dark", type=Path, default=None, help="Master Dark file or folder with individual Dark frames.")
     parser.add_argument("--processes", type=int, default=0, help="CPU processes. 0 = auto.")
     parser.add_argument("--gpu", action="store_true")
     parser.add_argument("--aligned-cache", action="store_true", help="Enable aligned-frame cache for repeated runs.")
@@ -242,7 +246,7 @@ def main() -> int:
     get_alignment_stats = getattr(engine, "get_alignment_stats", None)
     stats = dict(get_alignment_stats() if callable(get_alignment_stats) else {})
     run_log = [
-        "Astro Stacker CLI run",
+        f"Astro Stacker CLI {CLI_VERSION} run",
         f"Python: {sys.executable}",
         f"Input: {args.input}",
         f"Output: {output_path}",

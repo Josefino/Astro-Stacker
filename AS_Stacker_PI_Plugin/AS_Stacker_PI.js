@@ -485,7 +485,8 @@ function ASStackerDialog()
    this.stackCombo.addItem( "Sigma clip" );
    this.stackCombo.addItem( "Median" );
    this.stackCombo.addItem( "Mean" );
-   this.stackCombo.currentItem = Math.max( 0, Math.min( 2, saved.stack ) );
+   this.stackCombo.addItem( "High rejection mean" );
+   this.stackCombo.currentItem = Math.max( 0, Math.min( 3, saved.stack ) );
 
    this.bayerCombo = new ComboBox( this );
    this.bayerCombo.addItem( "Auto" );
@@ -612,7 +613,7 @@ function ASStackerDialog()
       var logPath = outDir + "/AS_stacker_cli_error.log";
 
       var alignValues = [ "star_affine", "translation", "ecc_affine", "calibration" ];
-      var stackValues = [ "sigma", "median", "mean" ];
+      var stackValues = [ "sigma", "median", "mean", "high_rejection" ];
       var bayerValues = [ "auto", "mono", "RGGB", "BGGR", "GRBG", "GBRG" ];
 
       var args = [

@@ -4,7 +4,7 @@ Astro Stacker is a desktop application for astronomical image stacking, calibrat
 
 The application focuses on a practical workflow: load a folder of light frames, optionally apply calibration frames, align the sequence, stack it, inspect rejected frames, and export either a linear FIT/FITS result or a stretched visual image.
 
-Current application version: **2.4**
+Current application version: **2.5**
 
 ## Main Features
 
@@ -13,18 +13,19 @@ Current application version: **2.4**
 - Robust star alignment with frame rejection when alignment fails.
 - Automatic or manual reference-frame selection.
 - Optional frame-quality review before stacking, including manual exclusion with the Space key.
+- Frame-quality heading with Light, Dark, Flat, and Bias input totals.
 - Optional satellite-trail detection in the frame-quality table.
 - Flat, Bias, and Dark calibration.
 - Automatic detection of `Flat`, `Bias`, and `Dark` subfolders.
 - Cached `MasterFlat_AS.fit`, `MasterBias_AS.fit`, and `MasterDark_AS.fit` files for faster repeated processing.
-- Manual calibration-frame selection.
+- Manual calibration selection from a finished Master file or any folder with individual frames.
 - RAW only mode to exclude JPG/PNG/BMP/TIFF preview files while keeping FIT/FITS and camera RAW files.
 - Bayer FIT handling with Auto, Mono, RGGB, BGGR, GRBG, and GBRG modes.
 - GPU stacking support where available.
 - CPU multiprocessing and tiled CPU stacking for large datasets.
 - PixInsight wrapper support.
 - Simple and Advanced UI modes.
-- Preview tools: Balance, Auto WB, crop, background neutralization, histogram, flip/rotate, color correction, synthetic flat, vignette correction, SCNR Green, highlight compression, and Astro Denoise.
+- Preview tools: Balance, Auto WB, crop, background neutralization, polynomial gradient removal, histogram, flip/rotate, color correction, synthetic flat, vignette correction, SCNR Green, highlight compression, and Astro Denoise.
 - Linear FIT/FITS export plus visual TIFF/PNG export.
 
 ## Supported Formats
@@ -38,14 +39,14 @@ Input formats include:
 Recommended output formats:
 
 - **FIT/FITS** for linear astronomical data and further processing.
-- **TIFF** for 16-bit stretched visual export.
+- **TIFF** for 16-bit stretched visual export. External 16-bit TIFF files are also loaded without reducing their tonal depth.
 - **PNG** for 8-bit preview/share export.
 
 ## Basic Workflow
 
 1. Choose a folder containing Light frames.
 2. If the folder contains preview images, enable **RAW only**.
-3. Add Flat, Bias, and Dark frames manually, or place them in subfolders named `Flat`, `Bias`, and `Dark`.
+3. Add Flat, Bias, and Dark calibration manually as a Master file or an arbitrary frame folder, or place them in subfolders named `Flat`, `Bias`, and `Dark`.
 4. Use **Star alignment + RANSAC** for normal deep-sky sequences.
 5. Enable **Review frames before stacking** if you want to inspect quality scores and manually exclude frames.
 6. Start stacking.
@@ -64,10 +65,14 @@ When automatic calibration folders are used, the application creates cached mast
 
 These files are reused on later runs if the source calibration folder has not changed. The **Clear cache quality frames** command can remove cache files when needed.
 
-The flat calibration path uses a normalized master flat:
+The right-panel Flat, Bias, and Dark buttons also accept an arbitrary folder with individual calibration frames. The folder does not need a special name. Astro Stacker integrates it and stores a reusable Master cache directly inside it.
+
+Bias, Flat, and Dark master frames are integrated with an arithmetic average to use the signal from all calibration exposures.
+
+The flat calibration path subtracts the bias before normalizing the correction:
 
 ```text
-calibrated = (Light - Bias/Dark) / normalized(Flat - Bias)
+calibrated = (Light - Bias/Dark) / normalized(MasterFlat - MasterBias)
 ```
 
 For most workflows, this preserves image brightness while correcting vignetting and dust shadows.
@@ -82,6 +87,7 @@ Important tools:
 - **Auto WB**: automatic white balance.
 - **Crop edges**: crop border artifacts after alignment.
 - **Neutralize background**: reduce color cast in the background.
+- **Remove gradient**: subtract a smooth polynomial background model. This works especially well for galaxies; use it carefully with large nebulae.
 - **Synthetic flat**: approximate smooth background correction when no real flat is available.
 - **Color background correction**: remove strong color casts, useful for smart-telescope data.
 - **Astro Denoise**: gentle denoising with star and nebula-structure protection.
@@ -129,7 +135,9 @@ python astro_stacker_app.py
 
 ## Building Standalone Packages
 
-The project can be packaged with PyInstaller. Example macOS command:
+The project can be packaged with PyInstaller.
+
+Example macOS command:
 
 ```bash
 python -m PyInstaller \
@@ -144,7 +152,14 @@ python -m PyInstaller \
   astro_stacker_app.py
 ```
 
+xattr -dr com.apple.quarantine dist/AstroStacker.app
+
+Example Windows command:
+
+python -m PyInstaller --windowed --onedir --name AstroStacker --icon AstroStacker.ico --add-data "AS_balance_icon.png;." --add-data "AstroStacker_intro.png:." --collect-all cupy --collect-all cupyx --collect-all cupy_backends --collect-all nvidia astro_stacker_app.py
+
 On Windows, include GPU/CuPy packages only if you intend to distribute NVIDIA GPU support.
+
 
 ## Documentation
 
