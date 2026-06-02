@@ -148,6 +148,7 @@ def build_settings(args: argparse.Namespace, stack_settings_cls):
         "source_folder": str(args.input),
         "use_gpu": args.gpu,
         "use_aligned_cache": args.aligned_cache,
+        "mosaic_mode": args.mosaic,
         "language": "en",
     }
     if dataclasses.is_dataclass(stack_settings_cls):
@@ -195,6 +196,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--processes", type=int, default=0, help="CPU processes. 0 = auto.")
     parser.add_argument("--gpu", action="store_true")
     parser.add_argument("--aligned-cache", action="store_true", help="Enable aligned-frame cache for repeated runs.")
+    parser.add_argument("--mosaic", action="store_true", help="Expand the output canvas to include all aligned frames.")
     parser.add_argument("--no-normalize-background", action="store_true")
     parser.add_argument("--no-auto-reference", action="store_true")
     parser.add_argument("--quality-filter", action="store_true", help="Use only the best frames. Default: off.")
@@ -223,6 +225,7 @@ def main() -> int:
                 f"auto_ref={settings.auto_reference}, quality_filter={settings.quality_filter}, "
                 f"raw_only={getattr(settings, 'raw_only', False)}, keep={settings.keep_percent}, max_star_shift={settings.max_star_shift}, "
                 f"border={settings.star_border_margin}, strict={settings.strict_star_filter}, "
+                f"mosaic={getattr(settings, 'mosaic_mode', False)}, "
                 f"bayer={settings.bayer_pattern}, normalize={settings.normalize_background}, "
                 f"processes={processes}")
     if processes > 1:

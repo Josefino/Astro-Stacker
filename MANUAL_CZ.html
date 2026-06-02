@@ -122,6 +122,9 @@ strong { color: #111827; }
 <p>Přísnější kontrola tvaru hvězd. Pomáhá proti větvím, stopám a protáhlým artefaktům. Pokud program odmítá příliš mnoho použitelných snímků, může někdy pomoci tuto volbu vypnout.</p>
 <h3>Satellite trail / Satelitní stopa</h3>
 <p>Volba <strong>Satellite trail / Satelitní stopa</strong> přidá kontrolu dlouhých rovných stop družic nebo letadel. Při vyhodnocení kvality Astro Stacker analyzuje jednotlivé Light snímky a podezřelé snímky označí v tabulce Frame quality.</p>
+<h3>Mozaika - rozšířit plátno</h3>
+<p>Volba <strong>Mozaika - rozšířit plátno</strong> zachová zarovnané části snímků mimo referenční obraz a vytvoří výstup větší než nativní rozlišení kamery. Hodí se pro mozaikové sekvence chytrých dalekohledů, například Vespera. Částečně pokryté okraje se skládají korektně. Při zapnuté GPU volbě posílá mozaika řádkové dlaždice přímo do VRAM CUDA nebo Apple Metal/MPS. Pokud GPU není dostupná, Astro Stacker použije paměťově chráněnou paralelní dlaždicovou CPU cestu.</p>
+<p>GPU režim posílá zarovnané snímky do CUDA nebo Apple Metal/MPS po řádkových dlaždicích také při běžném skládání bez mozaiky. Před GPU výpočtem tak nevzniká druhá kopie celého stacku v RAM.</p>
 <p>Detektor je nastavený tak, aby dával přednost jasným dlouhým rovným stopám. Soubory nemaže automaticky. Nejlépe funguje společně s volbou <strong>Review frames before stacking / Zkontrolovat snímky před skládáním</strong>, kde lze podezřelé řádky vyřadit mezerníkem.</p>
 <h2>4. Diagnostická tabulka snímků</h2>
 <p>Ve spodní části je tabulka <strong>Frame quality / Vyhodnocení snímků</strong>. Slouží ke kontrole, proč byly snímky použity nebo vyřazeny. Vedle nadpisu zobrazuje také celkový počet vstupních Lights, Darks, Flats a Biases. Nezapočítává uložené mastery, cache ani výsledné výstupy programu.</p>

@@ -122,6 +122,9 @@ strong { color: #111827; }
 <p>Applies stricter star shape filtering. It helps suppress branches, trails, and elongated artifacts. If too many usable frames are rejected, disabling this option can sometimes help.</p>
 <h3>Satellite Trail</h3>
 <p><strong>Satellite trail</strong> is an optional quality check for long straight satellite or aircraft trails. When enabled, Astro Stacker analyzes each Light frame during quality scoring and marks suspicious frames in the Frame quality table.</p>
+<h3>Mosaic Canvas</h3>
+<p><strong>Mosaic - expand canvas</strong> preserves aligned areas outside the reference frame and creates an output larger than the native camera resolution. It is useful for smart-telescope mosaic sequences such as Vespera captures. Partially covered edges are combined correctly. With GPU enabled, mosaic integration uploads row tiles directly to CUDA or Apple Metal/MPS VRAM. If GPU processing is unavailable, Astro Stacker uses the RAM-protected parallel tiled CPU path.</p>
+<p>GPU mode also sends standard non-mosaic stacks to CUDA or Apple Metal/MPS in row tiles. This avoids creating a second full-stack copy in RAM before GPU processing.</p>
 <p>The detector is tuned to prefer clear, long, straight trails. It does not automatically delete image files. Use it together with <strong>Review frames before stacking</strong> and press Space on suspicious rows if you want to exclude them from the stack.</p>
 <h2>4. Diagnostic Frame Quality Table</h2>
 <p>The lower part of the window contains the <strong>Frame quality</strong> table. It helps explain why frames were used or excluded. Its heading also shows the total number of input Lights, Darks, Flats, and Biases. Saved masters, cache files, and program outputs are not counted.</p>

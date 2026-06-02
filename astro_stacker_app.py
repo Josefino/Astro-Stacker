@@ -1,45 +1,51 @@
 """
-Astro Stacker GUI — jednoduchá aplikace pro skládání astrofotek ze složky.
+Astro Stacker GUI - desktop application for astronomical image stacking.
 
-Funkce:
-- výběr složky se snímky JPG/PNG/TIF/TIFF/BMP/FITS/FIT/CR2/CR3/RAW
-- otevření samostatného obrázku/FIT do náhledu
-- režimy zarovnání: posun, afinní ECC, star alignment, comet alignment
-- skládání: průměr, medián, sigma-clipped průměr
-- robustní star alignment: automatická reference, filtr kvality, velký EAA drift, bezpečný fallback
-- comet alignment pro skládání na pohybující se kometu
-- ruční označení komety v prvním a posledním snímku
-- jemné doladění komety po dvoubodové predikci pomocí lokální korelace
-- Star + Comet režim ukládá samostatný lineární FIT star stack a comet stack
-- podpora mono i Bayer FIT/FITS, včetně ruční volby Bayer masky
-- kompletní kalibrace snímků DARK/BIAS/FLAT
-- Auto White Balance (AWB)
-- neutralizace pozadí s možností zrušení
-- SCNR Green 0–5 pro potlačení zeleného nádechu
-- black point, white point, gamma, kontrast, saturace, RGB multiplikátory
-- komprese jasů pro ochranu hvězd a jasných jader galaxií
-- horizontální a vertikální otočení náhledu
-- zoom Fit, 1:1, plus/minus a posun obrazu myší
-- export výsledku do PNG, TIFF nebo FITS
-- FIT/FITS export zůstává lineární a nestretchovaný
-- PNG/TIFF export používá stejný stretch jako GUI náhled
-- ukládání a načítání profilů nastavení do JSON
-- multiprocessing přes CPU jádra
-- volitelná GPU akcelerace skládání přes NVIDIA CUDA/CuPy nebo Apple Metal/MPS s automatickým fallbackem na CPU
-- přísnější detekce hvězd: ignoruje okraje, větve/stromy a protáhlé objekty
-- rozšířené nastavení ignorování okraje až na 5000 px pro EAA/komety se stromy v obraze
+English overview:
+- loads image sequences and standalone preview files: FIT/FITS, camera RAW,
+  TIFF, PNG, JPG, and BMP
+- aligns frames by translation, affine ECC, stars + RANSAC, or a moving comet
+- stacks with mean, median, sigma-clipped mean, or high-rejection mean
+- supports automatic/manual reference selection, quality review, satellite
+  trail detection, and large EAA drift
+- calibrates Lights with Flat, Bias, and Dark frames before debayering when
+  raw sensor data are available
+- accepts automatic calibration subfolders, arbitrary manually selected
+  calibration folders, or finished Master files
+- handles monochrome and Bayer FIT/FITS data; Auto mode debayers only when an
+  explicit Bayer/CFA pattern is present in the FIT header
+- provides preview adjustments, background tools, zoom, flips, rotations,
+  visual PNG/TIFF export, and linear unstretched FIT/FITS export
+- supports CPU multiprocessing and optional NVIDIA CUDA/CuPy or Apple
+  Metal/MPS acceleration with an automatic CPU fallback
 
-Instalace:
+Cesky prehled:
+- nacita sekvence snimku i samostatne nahledy: FIT/FITS, foto RAW, TIFF, PNG,
+  JPG a BMP
+- zarovnava snimky posunem, afinnim ECC, podle hvezd + RANSAC nebo na kometu
+- sklada prumerem, medianem, sigma-clipped prumerem nebo high-rejection mean
+- podporuje automatickou/rucni referenci, kontrolu kvality, detekci
+  satelitnich stop a velky EAA drift
+- kalibruje Light snimky pomoci Flat, Bias a Dark pred debayeringem, pokud
+  jsou dostupna raw senzorova data
+- umi automaticke kalibracni podslozky, libovolne rucne vybrane kalibracni
+  slozky i hotove Master soubory
+- rozlisuje monochromaticke a Bayer FIT/FITS snimky; rezim Auto debayeruje jen
+  pri nalezeni explicitni Bayer/CFA masky v FIT hlavicce
+- nabizi upravy nahledu, nastroje pro pozadi, zoom, flipy, rotace, vizualni
+  PNG/TIFF export a linearni nestretchovany FIT/FITS export
+- podporuje CPU multiprocessing a volitelnou NVIDIA CUDA/CuPy nebo Apple
+  Metal/MPS akceleraci s automatickym fallbackem na CPU
+
+Installation / Instalace:
     pip install PySide6 opencv-python numpy pillow astropy rawpy
-    volitelně pro NVIDIA GPU akceleraci:
+    optional NVIDIA GPU acceleration / volitelna NVIDIA GPU akcelerace:
     pip install cupy-cuda12x
-    volitelně pro Apple Silicon Metal/MPS akceleraci:
+    optional Apple Silicon Metal/MPS acceleration / volitelna Apple Metal/MPS akcelerace:
     pip install torch
 
-Spuštění:
+Run / Spusteni:
     python astro_stacker_app.py
-
-
 """
 
 from __future__ import annotations
@@ -371,6 +377,7 @@ class StackSettings:
     auto_reference: bool = True       # vybere nejostřejší snímek jako referenci
     manual_reference_path: Optional[str] = None  # ručně zvolená reference pro běžné zarovnání
     sequential_alignment: bool = False  # zarovnává sousední snímky a skládá transformace k referenci
+    mosaic_mode: bool = False           # rozšíří výstupní plátno podle transformací přijatých snímků
     quality_filter: bool = True       # vyřadí nejhorší snímky podle skóre
     keep_percent: int = 80            # kolik % nejlepších snímků ponechat
     manual_excluded_paths: Tuple[str, ...] = ()  # ručně vyřazené light snímky z review tabulky
@@ -2284,7 +2291,7 @@ def refresh_last_stack_selection_after_alignment(used_paths: List[Path]) -> None
     LAST_STACK_SELECTION["quality_excluded_paths"] = [p for p in all_paths if p not in selected_set]
 
 
-def warp_to_reference(img: np.ndarray, matrix: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+def warp_to_reference(img: np.ndarray, matrix: np.ndarray, shape: Tuple[int, int], border_value: float = 0.0) -> np.ndarray:
     h, w = shape
     matrix = np.asarray(matrix, dtype=np.float32)
     if matrix.shape == (3, 3):
@@ -2294,7 +2301,7 @@ def warp_to_reference(img: np.ndarray, matrix: np.ndarray, shape: Tuple[int, int
             (w, h),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
+            borderValue=border_value,
         )
     else:
         warped = cv2.warpAffine(
@@ -2303,9 +2310,109 @@ def warp_to_reference(img: np.ndarray, matrix: np.ndarray, shape: Tuple[int, int
             (w, h),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
+            borderValue=border_value,
         )
     return warped.astype(np.float32)
+
+
+def matrix_to_homogeneous(matrix: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=np.float32)
+    if matrix.shape == (3, 3):
+        return matrix
+    if matrix.shape == (2, 3):
+        return np.vstack([matrix, [0, 0, 1]]).astype(np.float32)
+    raise ValueError(f"Unsupported alignment matrix shape: {matrix.shape}")
+
+
+def mosaic_canvas_for_matrices(shape: Tuple[int, int], matrices: List[np.ndarray]) -> Tuple[Tuple[int, int], List[np.ndarray]]:
+    """Return an expanded mosaic canvas and transforms shifted into its coordinates."""
+    h, w = shape
+    corners = np.array([[0, 0, 1], [w, 0, 1], [w, h, 1], [0, h, 1]], dtype=np.float32).T
+    transformed_corners = []
+    homogeneous = []
+    for matrix in matrices:
+        full = matrix_to_homogeneous(matrix)
+        projected = full @ corners
+        divisor = np.where(np.abs(projected[2]) > 1e-8, projected[2], 1.0)
+        transformed_corners.append((projected[:2] / divisor).T)
+        homogeneous.append(full)
+
+    all_points = np.concatenate(transformed_corners, axis=0)
+    min_x = float(np.floor(np.min(all_points[:, 0])))
+    min_y = float(np.floor(np.min(all_points[:, 1])))
+    max_x = float(np.ceil(np.max(all_points[:, 0])))
+    max_y = float(np.ceil(np.max(all_points[:, 1])))
+    canvas_w = max(1, int(max_x - min_x))
+    canvas_h = max(1, int(max_y - min_y))
+
+    # A bad transform must not attempt an enormous allocation.
+    if canvas_w > w * 4 or canvas_h > h * 4 or canvas_w * canvas_h > w * h * 16:
+        raise ValueError(
+            f"Mozaika by vytvořila podezřele velké plátno {canvas_w} × {canvas_h} px. "
+            "Zkontroluj alignment nebo sniž maximální drift hvězd."
+        )
+
+    offset = np.array([[1, 0, -min_x], [0, 1, -min_y], [0, 0, 1]], dtype=np.float32)
+    shifted = [(offset @ matrix).astype(np.float32) for matrix in homogeneous]
+    return (canvas_h, canvas_w), shifted
+
+
+def warp_mosaic_records(
+    records: List[Tuple[Path, np.ndarray, np.ndarray]],
+    reference_shape: Tuple[int, int],
+    progress_callback=None,
+) -> List[np.ndarray]:
+    canvas_shape, shifted_matrices = mosaic_canvas_for_matrices(reference_shape, [record[2] for record in records])
+    canvas_h, canvas_w = canvas_shape
+    if progress_callback:
+        progress_callback(72, f"Mozaika: vytvářím plátno {canvas_w} × {canvas_h} px...")
+    total = len(records)
+    cpu_count = max(1, os.cpu_count() or 1)
+    desired_workers = max(1, min(total, cpu_count - 1 if cpu_count > 2 else cpu_count))
+    available = available_system_memory_bytes()
+    bytes_per_worker = max(1, canvas_h * canvas_w * np.dtype(np.float32).itemsize * 5)
+    max_by_memory = max(1, int((available * 0.30) / bytes_per_worker)) if available > 0 else min(desired_workers, 4)
+    workers = max(1, min(desired_workers, max_by_memory))
+    aligned: List[Optional[np.ndarray]] = [None] * total
+
+    log_debug(
+        f"Mosaic canvas warp: frames={total}, canvas={canvas_w}x{canvas_h}, "
+        f"workers={workers}, available={available}, bytes_per_worker={bytes_per_worker}"
+    )
+    if progress_callback:
+        progress_callback(72, f"Mozaika: převádím snímky na plátno ({workers} vláken)...")
+
+    def warp_one(index: int) -> Tuple[int, np.ndarray]:
+        _path, img, _matrix = records[index]
+        shifted = shifted_matrices[index]
+        warped = warp_to_reference(img, shifted, canvas_shape, border_value=0.0)
+        coverage = warp_to_reference(np.ones(img.shape[:2], dtype=np.float32), shifted, canvas_shape, border_value=0.0)
+        valid = coverage > 1e-4
+        if warped.ndim == 3:
+            warped = warped / np.maximum(coverage[..., None], 1e-6)
+            warped[~valid, :] = np.nan
+        else:
+            warped = warped / np.maximum(coverage, 1e-6)
+            warped[~valid] = np.nan
+        return index, warped.astype(np.float32)
+
+    if workers <= 1:
+        for completed, index in enumerate(range(total), start=1):
+            result_index, warped = warp_one(index)
+            aligned[result_index] = warped
+            if progress_callback and (completed == total or completed % max(1, total // 10) == 0):
+                progress_callback(72 + int(completed / max(1, total) * 6), f"Mozaika: převádím snímky na plátno ({completed}/{total})...")
+    else:
+        completed = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(warp_one, index) for index in range(total)]
+            for future in as_completed(futures):
+                result_index, warped = future.result()
+                aligned[result_index] = warped
+                completed += 1
+                if progress_callback and (completed == total or completed % max(1, total // 10) == 0):
+                    progress_callback(72 + int(completed / max(1, total) * 6), f"Mozaika: převádím snímky na plátno ({completed}/{total})...")
+    return [frame for frame in aligned if frame is not None]
 
 
 def compose_affine(parent_to_ref: np.ndarray, child_to_parent: np.ndarray) -> np.ndarray:
@@ -2322,24 +2429,32 @@ def normalize_background(img: np.ndarray, reference_median: np.ndarray) -> np.nd
 
 
 def sigma_clip_mean(stack: np.ndarray, sigma: float) -> np.ndarray:
-    median = np.median(stack, axis=0)
-    std = np.std(stack, axis=0) + 1e-6
+    use_nan = not np.isfinite(stack).all()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        median = np.nanmedian(stack, axis=0) if use_nan else np.median(stack, axis=0)
+        std = (np.nanstd(stack, axis=0) if use_nan else np.std(stack, axis=0)) + 1e-6
     keep = np.abs(stack - median) <= sigma * std
     masked = np.where(keep, stack, np.nan)
-    result = np.nanmean(masked, axis=0)
-    result = np.where(np.isnan(result), median, result)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        result = np.nanmean(masked, axis=0)
+    result = np.where(np.isnan(result), np.nan_to_num(median, nan=0.0), result)
     return result.astype(np.float32)
 
 
 def high_rejection_mean(stack: np.ndarray, sigma: float) -> np.ndarray:
     """Average frames after rejecting only unusually bright temporal outliers."""
-    median = np.median(stack, axis=0)
-    robust_sigma = np.median(np.abs(stack - median), axis=0) * 1.4826 + 1e-6
-    keep = stack <= median + max(0.5, float(sigma)) * robust_sigma
+    use_nan = not np.isfinite(stack).all()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        median = np.nanmedian(stack, axis=0) if use_nan else np.median(stack, axis=0)
+        robust_sigma = (np.nanmedian(np.abs(stack - median), axis=0) if use_nan else np.median(np.abs(stack - median), axis=0)) * 1.4826 + 1e-6
+    keep = np.isfinite(stack) & (stack <= median + max(0.5, float(sigma)) * robust_sigma)
     counts = np.sum(keep, axis=0)
     summed = np.sum(np.where(keep, stack, 0.0), axis=0)
     result = summed / np.maximum(counts, 1)
-    return np.where(counts > 0, result, median).astype(np.float32)
+    return np.where(counts > 0, result, np.nan_to_num(median, nan=0.0)).astype(np.float32)
 
 
 def stack_temp_factor(mode: str) -> float:
@@ -2461,12 +2576,17 @@ def stack_frames_cpu_tiled_from_sequence(frames: List[np.ndarray], mode: str, si
 
     bytes_per_row = max(1, n * w * channels * np.dtype(np.float32).itemsize)
     cpu_count = max(1, os.cpu_count() or 1)
-    desired_workers = max(1, min(cpu_count - 1 if cpu_count > 2 else cpu_count, 8))
+    worker_limit = cpu_count if force_tiled else 8
+    desired_workers = max(1, min(cpu_count - 1 if cpu_count > 2 else cpu_count, worker_limit))
     parallel_budget = int((available or 768 * 1024 * 1024) * 0.30)
     target_bytes = int(parallel_budget / max(1, desired_workers))
     target_bytes = max(16 * 1024 * 1024, min(target_bytes, 256 * 1024 * 1024))
     rows_per_tile = max(4, int(target_bytes / max(1, bytes_per_row * temp_factor)))
     rows_per_tile = min(h, rows_per_tile)
+    if force_tiled and desired_workers > 1:
+        # Mosaic mode should not collapse into one large NumPy operation when
+        # RAM is plentiful. Create enough row ranges to keep CPU cores busy.
+        rows_per_tile = min(rows_per_tile, max(4, int(math.ceil(h / desired_workers))))
     result = np.empty(first.shape, dtype=np.float32)
     tile_ranges = [(y0, min(h, y0 + rows_per_tile)) for y0 in range(0, h, rows_per_tile)]
     tile_temp_bytes = int(bytes_per_row * rows_per_tile * temp_factor)
@@ -2574,10 +2694,17 @@ def mps_available() -> bool:
 
 
 def stack_frames_cpu(arr: np.ndarray, mode: str, sigma: float) -> np.ndarray:
+    use_nan = not np.isfinite(arr).all()
     if mode == "median":
-        return np.median(arr, axis=0).astype(np.float32)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            result = np.nanmedian(arr, axis=0) if use_nan else np.median(arr, axis=0)
+        return np.nan_to_num(result, nan=0.0).astype(np.float32)
     if mode == "mean":
-        return np.mean(arr, axis=0).astype(np.float32)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            result = np.nanmean(arr, axis=0) if use_nan else np.mean(arr, axis=0)
+        return np.nan_to_num(result, nan=0.0).astype(np.float32)
     if mode == "high_rejection":
         return high_rejection_mean(arr, sigma)
     return sigma_clip_mean(arr, sigma)
@@ -2598,27 +2725,39 @@ def cpu_stack_tile_worker_count(tile_temp_bytes: int, tile_count: int, available
 
 
 def stack_frames_torch_tensor(tensor, mode: str, sigma: float):
-    if mode == "median":
-        return torch.median(tensor, dim=0).values
-    if mode == "mean":
-        return torch.mean(tensor, dim=0)
-
-    median = torch.median(tensor, dim=0).values
-    if mode == "high_rejection":
-        robust_sigma = torch.median(torch.abs(tensor - median), dim=0).values * 1.4826 + 1e-6
-        keep = tensor <= median + max(0.5, float(sigma)) * robust_sigma
-        summed = torch.where(keep, tensor, torch.zeros((), dtype=tensor.dtype, device=tensor.device)).sum(dim=0)
-        counts = keep.sum(dim=0)
-        safe_counts = torch.clamp(counts, min=1).to(dtype=tensor.dtype)
-        return torch.where(counts > 0, summed / safe_counts, median)
-
-    std = torch.std(tensor, dim=0, unbiased=False) + 1e-6
-    keep = torch.abs(tensor - median) <= float(sigma) * std
-    summed = torch.where(keep, tensor, torch.zeros((), dtype=tensor.dtype, device=tensor.device)).sum(dim=0)
-    counts = keep.sum(dim=0)
+    valid = torch.isfinite(tensor)
+    zero = torch.zeros((), dtype=tensor.dtype, device=tensor.device)
+    safe_tensor = torch.where(valid, tensor, zero)
+    counts = valid.sum(dim=0)
     safe_counts = torch.clamp(counts, min=1).to(dtype=tensor.dtype)
-    result = summed / safe_counts
-    return torch.where(counts > 0, result, median)
+
+    if mode == "mean":
+        result = safe_tensor.sum(dim=0) / safe_counts
+        return torch.where(counts > 0, result, zero)
+
+    median = torch.nanmedian(tensor, dim=0).values
+    median_safe = torch.nan_to_num(median, nan=0.0)
+    if mode == "median":
+        return median_safe
+
+    if mode == "high_rejection":
+        robust_sigma = torch.nanmedian(torch.abs(tensor - median), dim=0).values * 1.4826
+        robust_sigma = torch.nan_to_num(robust_sigma, nan=0.0) + 1e-6
+        keep = valid & (tensor <= median + max(0.5, float(sigma)) * robust_sigma)
+        accepted_counts = keep.sum(dim=0)
+        summed = torch.where(keep, tensor, zero).sum(dim=0)
+        safe_accepted_counts = torch.clamp(accepted_counts, min=1).to(dtype=tensor.dtype)
+        return torch.where(accepted_counts > 0, summed / safe_accepted_counts, median_safe)
+
+    mean = safe_tensor.sum(dim=0) / safe_counts
+    centered = torch.where(valid, tensor - mean, zero)
+    std = torch.sqrt((centered * centered).sum(dim=0) / safe_counts) + 1e-6
+    keep = valid & (torch.abs(tensor - median) <= float(sigma) * std)
+    accepted_counts = keep.sum(dim=0)
+    summed = torch.where(keep, tensor, zero).sum(dim=0)
+    safe_accepted_counts = torch.clamp(accepted_counts, min=1).to(dtype=tensor.dtype)
+    result = summed / safe_accepted_counts
+    return torch.where(accepted_counts > 0, result, median_safe)
 
 
 def stack_frames_mps(arr: np.ndarray, mode: str, sigma: float) -> np.ndarray:
@@ -2751,7 +2890,7 @@ def stack_frames_gpu_tiled(arr: np.ndarray, mode: str, sigma: float, free_mem: i
     channels = int(np.prod(arr.shape[3:])) if arr.ndim > 3 else 1
     bytes_per_row = max(1, n * w * channels * np.dtype(np.float32).itemsize)
     temp_factor = 6.0 if mode in {"sigma", "high_rejection"} else 4.0 if mode == "median" else 2.0
-    target_bytes = int((free_mem or 512 * 1024 * 1024) * 0.22)
+    target_bytes = min(256 * 1024 * 1024, int((free_mem or 512 * 1024 * 1024) * 0.22))
     rows_per_tile = max(8, int(target_bytes / max(1, bytes_per_row * temp_factor)))
     rows_per_tile = min(h, rows_per_tile)
 
@@ -2765,26 +2904,32 @@ def stack_frames_gpu_tiled(arr: np.ndarray, mode: str, sigma: float, free_mem: i
         for y0 in range(0, h, rows_per_tile):
             y1 = min(h, y0 + rows_per_tile)
             tile = cp.asarray(arr[:, y0:y1, ...], dtype=cp.float32)
+            valid = cp.isfinite(tile)
             if mode == "median":
-                tile_result = cp.median(tile, axis=0)
+                tile_result = cp.nanmedian(tile, axis=0)
             elif mode == "mean":
-                tile_result = cp.mean(tile, axis=0)
+                counts = cp.sum(valid, axis=0)
+                summed = cp.sum(cp.where(valid, tile, cp.float32(0.0)), axis=0)
+                tile_result = cp.where(counts > 0, summed / cp.maximum(counts, 1), cp.float32(0.0))
             elif mode == "high_rejection":
-                median = cp.median(tile, axis=0)
-                robust_sigma = cp.median(cp.abs(tile - median), axis=0) * cp.float32(1.4826) + cp.float32(1e-6)
-                keep = tile <= median + cp.float32(max(0.5, float(sigma))) * robust_sigma
+                median = cp.nanmedian(tile, axis=0)
+                median_safe = cp.nan_to_num(median, nan=0.0)
+                robust_sigma = cp.nanmedian(cp.abs(tile - median), axis=0) * cp.float32(1.4826)
+                robust_sigma = cp.nan_to_num(robust_sigma, nan=0.0) + cp.float32(1e-6)
+                keep = valid & (tile <= median + cp.float32(max(0.5, float(sigma))) * robust_sigma)
                 counts = cp.sum(keep, axis=0)
                 summed = cp.sum(cp.where(keep, tile, cp.float32(0.0)), axis=0)
-                tile_result = cp.where(counts > 0, summed / cp.maximum(counts, 1), median)
+                tile_result = cp.where(counts > 0, summed / cp.maximum(counts, 1), median_safe)
             else:
-                median = cp.median(tile, axis=0)
-                std = cp.std(tile, axis=0) + cp.float32(1e-6)
-                keep = cp.abs(tile - median) <= cp.float32(float(sigma)) * std
-                masked = cp.where(keep, tile, cp.nan)
-                tile_result = cp.nanmean(masked, axis=0)
-                tile_result = cp.where(cp.isnan(tile_result), median, tile_result)
+                median = cp.nanmedian(tile, axis=0)
+                median_safe = cp.nan_to_num(median, nan=0.0)
+                std = cp.nanstd(tile, axis=0) + cp.float32(1e-6)
+                keep = valid & (cp.abs(tile - median) <= cp.float32(float(sigma)) * std)
+                counts = cp.sum(keep, axis=0)
+                summed = cp.sum(cp.where(keep, tile, cp.float32(0.0)), axis=0)
+                tile_result = cp.where(counts > 0, summed / cp.maximum(counts, 1), median_safe)
 
-            tile_result = cp.clip(tile_result, 0, 1).astype(cp.float32)
+            tile_result = cp.clip(cp.nan_to_num(tile_result, nan=0.0), 0, 1).astype(cp.float32)
             result_cpu[y0:y1, ...] = cp.asnumpy(tile_result)
             del tile, tile_result
             try:
@@ -2795,15 +2940,134 @@ def stack_frames_gpu_tiled(arr: np.ndarray, mode: str, sigma: float, free_mem: i
     return result_cpu.astype(np.float32)
 
 
+def stack_frames_gpu_tiled_from_sequence(frames: List[np.ndarray], mode: str, sigma: float, progress_callback=None) -> np.ndarray:
+    """Upload row tiles directly from aligned frames instead of building a full RAM stack."""
+    if cp is None:
+        raise RuntimeError("CuPy neni nainstalovane.")
+    if not frames:
+        raise ValueError("No frames to stack.")
+
+    first = np.asarray(frames[0], dtype=np.float32)
+    n = len(frames)
+    h, w = first.shape[:2]
+    channels = int(np.prod(first.shape[2:])) if first.ndim > 2 else 1
+    bytes_per_row = max(1, n * w * channels * np.dtype(np.float32).itemsize)
+    temp_factor = 6.0 if mode in {"sigma", "high_rejection"} else 4.0 if mode == "median" else 2.0
+    try:
+        free_mem, _total_mem = cp.cuda.runtime.memGetInfo()
+    except Exception:
+        free_mem = 0
+    target_bytes = int((free_mem or 512 * 1024 * 1024) * 0.22)
+    rows_per_tile = max(8, int(target_bytes / max(1, bytes_per_row * temp_factor)))
+    rows_per_tile = min(h, rows_per_tile)
+    result_cpu = np.empty(first.shape, dtype=np.float32)
+
+    log_debug(
+        f"GPU sequence tiles: mode={mode}, frames={n}, shape={first.shape}, "
+        f"rows_per_tile={rows_per_tile}, free_mem={free_mem}"
+    )
+    with cp.cuda.Device(0):
+        for tile_idx, y0 in enumerate(range(0, h, rows_per_tile), start=1):
+            y1 = min(h, y0 + rows_per_tile)
+            host_tile = np.stack([np.asarray(frame[y0:y1, ...], dtype=np.float32) for frame in frames], axis=0)
+            tile = cp.asarray(host_tile, dtype=cp.float32)
+            valid = cp.isfinite(tile)
+            if mode == "median":
+                tile_result = cp.nanmedian(tile, axis=0)
+            elif mode == "mean":
+                counts = cp.sum(valid, axis=0)
+                summed = cp.sum(cp.where(valid, tile, cp.float32(0.0)), axis=0)
+                tile_result = cp.where(counts > 0, summed / cp.maximum(counts, 1), cp.float32(0.0))
+            elif mode == "high_rejection":
+                median = cp.nanmedian(tile, axis=0)
+                median_safe = cp.nan_to_num(median, nan=0.0)
+                robust_sigma = cp.nanmedian(cp.abs(tile - median), axis=0) * cp.float32(1.4826)
+                robust_sigma = cp.nan_to_num(robust_sigma, nan=0.0) + cp.float32(1e-6)
+                keep = valid & (tile <= median + cp.float32(max(0.5, float(sigma))) * robust_sigma)
+                counts = cp.sum(keep, axis=0)
+                summed = cp.sum(cp.where(keep, tile, cp.float32(0.0)), axis=0)
+                tile_result = cp.where(counts > 0, summed / cp.maximum(counts, 1), median_safe)
+            else:
+                median = cp.nanmedian(tile, axis=0)
+                median_safe = cp.nan_to_num(median, nan=0.0)
+                std = cp.nanstd(tile, axis=0) + cp.float32(1e-6)
+                keep = valid & (cp.abs(tile - median) <= cp.float32(float(sigma)) * std)
+                counts = cp.sum(keep, axis=0)
+                summed = cp.sum(cp.where(keep, tile, cp.float32(0.0)), axis=0)
+                tile_result = cp.where(counts > 0, summed / cp.maximum(counts, 1), median_safe)
+
+            tile_result = cp.clip(cp.nan_to_num(tile_result, nan=0.0), 0, 1).astype(cp.float32)
+            result_cpu[y0:y1, ...] = cp.asnumpy(tile_result)
+            del host_tile, tile, tile_result
+            try:
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+            if progress_callback:
+                tiles = max(1, int(math.ceil(h / rows_per_tile)))
+                progress_callback(min(98, 80 + int(tile_idx / tiles * 18)), f"Skladam na GPU po blocich VRAM ({tile_idx}/{tiles})...")
+    return result_cpu.astype(np.float32)
+
+
+def stack_frames_mps_tiled_from_sequence(frames: List[np.ndarray], mode: str, sigma: float, progress_callback=None) -> np.ndarray:
+    """Upload row tiles directly from aligned frames to Apple Metal/MPS."""
+    if torch is None:
+        raise RuntimeError("PyTorch neni nainstalovany.")
+    if not frames:
+        raise ValueError("No frames to stack.")
+
+    first = np.asarray(frames[0], dtype=np.float32)
+    n = len(frames)
+    h, w = first.shape[:2]
+    channels = int(np.prod(first.shape[2:])) if first.ndim > 2 else 1
+    bytes_per_row = max(1, n * w * channels * np.dtype(np.float32).itemsize)
+    temp_factor = 6.0 if mode in {"sigma", "high_rejection"} else 4.0 if mode == "median" else 2.0
+    target_bytes = 256 * 1024 * 1024
+    rows_per_tile = max(8, int(target_bytes / max(1, bytes_per_row * temp_factor)))
+    rows_per_tile = min(h, rows_per_tile)
+    result_cpu = np.empty(first.shape, dtype=np.float32)
+    device = torch.device("mps")
+
+    log_debug(f"MPS sequence tiles: mode={mode}, frames={n}, shape={first.shape}, rows_per_tile={rows_per_tile}")
+    with torch.no_grad():
+        for tile_idx, y0 in enumerate(range(0, h, rows_per_tile), start=1):
+            y1 = min(h, y0 + rows_per_tile)
+            host_tile = np.stack([np.asarray(frame[y0:y1, ...], dtype=np.float32) for frame in frames], axis=0)
+            tile = torch.from_numpy(np.ascontiguousarray(host_tile)).to(device)
+            tile_result = stack_frames_torch_tensor(tile, mode, sigma)
+            tile_result = torch.clamp(tile_result, 0, 1).to(dtype=torch.float32)
+            result_cpu[y0:y1, ...] = tile_result.cpu().numpy()
+            del host_tile, tile, tile_result
+            try:
+                torch.mps.empty_cache()
+            except Exception:
+                pass
+            if progress_callback:
+                tiles = max(1, int(math.ceil(h / rows_per_tile)))
+                progress_callback(min(98, 80 + int(tile_idx / tiles * 18)), f"Skladam na GPU po blocich sdilene pameti ({tile_idx}/{tiles})...")
+    return result_cpu.astype(np.float32)
+
+
 def stack_aligned_frames(aligned: List[np.ndarray], settings: StackSettings, progress_callback=None) -> np.ndarray:
     if not aligned:
         raise ValueError("No aligned frames to stack.")
 
     first_shape = tuple(np.asarray(aligned[0]).shape)
     use_tiled_cpu, required_bytes, available_bytes = should_stack_tiled_on_cpu(first_shape, len(aligned), settings.stack_mode)
+    mosaic_mode = bool(getattr(settings, "mosaic_mode", False))
     use_gpu = bool(getattr(settings, "use_gpu", False))
 
     if not use_gpu:
+        if mosaic_mode:
+            if progress_callback:
+                progress_callback(80, "Mozaika: skládám paralelně na CPU po blocích RAM...")
+            return stack_frames_cpu_tiled_from_sequence(
+                aligned,
+                settings.stack_mode,
+                settings.sigma,
+                progress_callback,
+                force_tiled=True,
+            )
         if settings.stack_mode == "mean":
             if progress_callback:
                 progress_callback(80, "Skladam prumer na CPU po blocich RAM...")
@@ -2829,23 +3093,13 @@ def stack_aligned_frames(aligned: List[np.ndarray], settings: StackSettings, pro
             progress_callback(80, "Skladam snimky...")
         return stack_frames_cpu(arr, settings.stack_mode, settings.sigma)
 
-    try:
-        if progress_callback:
-            progress_callback(78, "Pripravuji stack v RAM...")
-        arr = np.stack(aligned, axis=0).astype(np.float32, copy=False)
-    except MemoryError:
-        if progress_callback:
-            progress_callback(80, "RAM ochrana: nedostatek pameti pro cely stack, skladam po castech...")
-        return stack_frames_cpu_tiled_from_sequence(aligned, settings.stack_mode, settings.sigma, progress_callback)
-
-    use_gpu = bool(getattr(settings, "use_gpu", False))
     gpu_failed_message = None
     gpu_unavailable_detail = ""
     if use_gpu and gpu_available():
         if progress_callback:
-            progress_callback(80, "Skladam snimky na GPU (CUDA/CuPy)...")
+            progress_callback(80, "Posilam stack po blocich primo do GPU (CUDA/CuPy)...")
         try:
-            return stack_frames_gpu(arr, settings.stack_mode, settings.sigma)
+            return stack_frames_gpu_tiled_from_sequence(aligned, settings.stack_mode, settings.sigma, progress_callback)
         except Exception as exc:
             gpu_failed_message = str(exc).splitlines()[0]
             log_debug(f"GPU stack failed:\n{traceback.format_exc()}")
@@ -2859,9 +3113,9 @@ def stack_aligned_frames(aligned: List[np.ndarray], settings: StackSettings, pro
 
     if use_gpu and mps_available():
         if progress_callback:
-            progress_callback(80, "Skladam snimky na GPU (Apple Metal/MPS)...")
+            progress_callback(80, "Posilam stack po blocich primo do GPU (Apple Metal/MPS)...")
         try:
-            return stack_frames_mps(arr, settings.stack_mode, settings.sigma)
+            return stack_frames_mps_tiled_from_sequence(aligned, settings.stack_mode, settings.sigma, progress_callback)
         except Exception as exc:
             gpu_failed_message = str(exc).splitlines()[0]
             log_debug(f"MPS stack failed:\n{traceback.format_exc()}")
@@ -2882,11 +3136,15 @@ def stack_aligned_frames(aligned: List[np.ndarray], settings: StackSettings, pro
             progress_callback(80, f"GPU neni dostupne{detail}; Python: {sys.executable}; skladam na CPU...")
         else:
             progress_callback(80, "Skladam snimky...")
-    if use_tiled_cpu:
-        if progress_callback:
-            progress_callback(80, "RAM ochrana: CPU fallback skladam po castech...")
-        return stack_frames_cpu_tiled_from_sequence(aligned, settings.stack_mode, settings.sigma, progress_callback)
-    return stack_frames_cpu(arr, settings.stack_mode, settings.sigma)
+    if progress_callback:
+        progress_callback(80, "CPU fallback skladam po castech...")
+    return stack_frames_cpu_tiled_from_sequence(
+        aligned,
+        settings.stack_mode,
+        settings.sigma,
+        progress_callback,
+        force_tiled=mosaic_mode,
+    )
 
 
 def frame_quality_preview_gray(gray: np.ndarray, center_fraction: float = 0.72, max_edge: int = 900) -> np.ndarray:
@@ -3470,7 +3728,7 @@ def aligned_frame_cache_path(path: Path, reference_path: Path, settings: StackSe
 
 
 def load_aligned_frame_cache(path: Path, reference_path: Path, settings: StackSettings, predicted_xy: Optional[Tuple[float, float]] = None) -> Optional[np.ndarray]:
-    if not bool(getattr(settings, "use_aligned_cache", False)):
+    if not bool(getattr(settings, "use_aligned_cache", False)) or bool(getattr(settings, "mosaic_mode", False)):
         return None
     cache_path = aligned_frame_cache_path(path, reference_path, settings, predicted_xy)
     if not cache_path.exists():
@@ -3483,7 +3741,7 @@ def load_aligned_frame_cache(path: Path, reference_path: Path, settings: StackSe
 
 
 def save_aligned_frame_cache(path: Path, reference_path: Path, settings: StackSettings, predicted_xy: Optional[Tuple[float, float]], img: np.ndarray) -> None:
-    if not bool(getattr(settings, "use_aligned_cache", False)):
+    if not bool(getattr(settings, "use_aligned_cache", False)) or bool(getattr(settings, "mosaic_mode", False)):
         return
     cache_path = aligned_frame_cache_path(path, reference_path, settings, predicted_xy)
     try:
@@ -4399,7 +4657,7 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
         )
         return None
 
-    if settings.align_mode == "star_affine" and getattr(settings, "sequential_alignment", False):
+    if settings.align_mode == "star_affine" and getattr(settings, "sequential_alignment", False) and not getattr(settings, "mosaic_mode", False):
         return stack_folder_sequential_star(folder, settings, progress_callback)
 
     paths, reference_path, scores, sequence_paths = prepare_paths_for_alignment_mode(folder, settings, progress_callback)
@@ -4410,6 +4668,7 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
     reference_median = np.median(reference.reshape(-1, 3), axis=0)
 
     aligned: List[np.ndarray] = []
+    mosaic_records: List[Tuple[Path, np.ndarray, np.ndarray]] = []
     used_paths: List[Path] = []
     total = len(paths)
 
@@ -4431,6 +4690,7 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
         if path == reference_path or settings.align_mode == "calibration":
             # Kalibrační snímky skládáme pixel na pixel bez zarovnání.
             warped = img
+            matrix = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
         else:
             moving_gray = to_gray_float(img)
             if settings.align_mode == "comet":
@@ -4451,17 +4711,28 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
                 matrix = estimate_ecc_affine(reference_gray, moving_gray, settings.downscale_for_alignment)
             else:
                 matrix = estimate_translation(reference_gray, moving_gray, settings.downscale_for_alignment)
-            warped = warp_to_reference(img, matrix, (h, w))
+            if getattr(settings, "mosaic_mode", False):
+                warped = img
+            else:
+                warped = warp_to_reference(img, matrix, (h, w))
 
-        if settings.normalize_background:
+        if settings.normalize_background and not getattr(settings, "mosaic_mode", False):
             warped = normalize_background(warped, reference_median)
         if path != reference_path and settings.align_mode != "calibration":
             save_aligned_frame_cache(path, reference_path, settings, predicted_xy, warped)
 
-        aligned.append(warped)
+        if getattr(settings, "mosaic_mode", False):
+            if settings.normalize_background:
+                img = normalize_background(img, reference_median)
+            mosaic_records.append((path, img, matrix))
+        else:
+            aligned.append(warped)
         used_paths.append(path)
         if progress_callback:
             progress_callback(10 + int((idx + 1) / total * 60), f"Zarovnávám ({idx + 1}/{total}): {path.name}")
+
+    if getattr(settings, "mosaic_mode", False):
+        aligned = warp_mosaic_records(mosaic_records, (h, w), progress_callback)
 
     if not aligned:
         raise ValueError("Žádný snímek neprošel zarovnáním. Zkontroluj, zda složka Light neobsahuje Dark/Bias snímky nebo zda jsou ve snímcích detekovatelné hvězdy.")
@@ -5300,7 +5571,7 @@ def init_process_single_image_mp(context: Dict[str, Any]) -> None:
     MP_WORKER_CONTEXT = dict(context or {})
 
 
-def process_single_image_mp(args: Dict[str, Any]) -> Optional[Tuple[str, np.ndarray]]:
+def process_single_image_mp(args: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
     """Worker funkce pro multiprocessing. Musí být top-level kvůli Windows/macOS spawn režimu."""
     cv2.setNumThreads(1)
 
@@ -5332,6 +5603,7 @@ def process_single_image_mp(args: Dict[str, Any]) -> Optional[Tuple[str, np.ndar
     if path == reference_path or settings.align_mode == "calibration":
         # Kalibrační snímky skládáme pixel na pixel bez zarovnání.
         warped = img
+        matrix = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
     else:
         moving_gray = to_gray_float(img)
         if settings.align_mode == "comet":
@@ -5347,10 +5619,17 @@ def process_single_image_mp(args: Dict[str, Any]) -> Optional[Tuple[str, np.ndar
             matrix = estimate_ecc_affine(reference_gray, moving_gray, settings.downscale_for_alignment)
         else:
             matrix = estimate_translation(reference_gray, moving_gray, settings.downscale_for_alignment)
-        warped = warp_to_reference(img, matrix, (h, w))
+        if getattr(settings, "mosaic_mode", False):
+            warped = img
+        else:
+            warped = warp_to_reference(img, matrix, (h, w))
 
-    if settings.normalize_background:
+    if settings.normalize_background and not getattr(settings, "mosaic_mode", False):
         warped = normalize_background(warped, reference_median)
+    if getattr(settings, "mosaic_mode", False):
+        if settings.normalize_background:
+            img = normalize_background(img, reference_median)
+        return str(path), np.clip(img, 0, 1).astype(np.float32), np.asarray(matrix, dtype=np.float32)
     if path != reference_path and settings.align_mode != "calibration":
         save_aligned_frame_cache(path, reference_path, settings, predicted_xy, warped)
 
@@ -5371,7 +5650,7 @@ def stack_folder_multiprocessing(folder: Path, settings: StackSettings, processe
         )
         return None
 
-    if settings.align_mode == "star_affine" and getattr(settings, "sequential_alignment", False):
+    if settings.align_mode == "star_affine" and getattr(settings, "sequential_alignment", False) and not getattr(settings, "mosaic_mode", False):
         return stack_folder_sequential_star(folder, settings, progress_callback)
 
     paths, reference_path, scores, sequence_paths = prepare_paths_for_alignment_mode(folder, settings, progress_callback)
@@ -5420,6 +5699,7 @@ def stack_folder_multiprocessing(folder: Path, settings: StackSettings, processe
     ]
 
     aligned: List[np.ndarray] = []
+    mosaic_records: List[Tuple[Path, np.ndarray, np.ndarray]] = []
     used_paths: List[Path] = []
 
     # Chunksize 1 dává plynulejší progress bar; pro velmi mnoho snímků lze zvýšit.
@@ -5430,13 +5710,20 @@ def stack_folder_multiprocessing(folder: Path, settings: StackSettings, processe
                 if progress_callback:
                     progress_callback(10 + int((idx + 1) / total * 60), f"Vyřazuji bez platného star alignmentu ({idx + 1}/{total}): {name}")
                 continue
-            used_path, warped = item
-            aligned.append(warped)
+            if getattr(settings, "mosaic_mode", False):
+                used_path, img, matrix = item
+                mosaic_records.append((Path(used_path), img, matrix))
+            else:
+                used_path, warped = item
+                aligned.append(warped)
             used_paths.append(Path(used_path))
             if progress_callback:
                 progress_callback(10 + int((idx + 1) / total * 60), f"Zarovnávám paralelně ({idx + 1}/{total}): {name}")
         if progress_callback:
             progress_callback(72, "Dokoncuji paralelni alignment...")
+
+    if getattr(settings, "mosaic_mode", False):
+        aligned = warp_mosaic_records(mosaic_records, (h, w), progress_callback)
 
     if not aligned:
         raise ValueError("Žádný snímek neprošel zarovnáním. Zkontroluj, zda složka Light neobsahuje Dark/Bias snímky nebo zda jsou ve snímcích detekovatelné hvězdy.")
@@ -5870,6 +6157,9 @@ class StackWorker(QThread):
             ("Zarovnavam", "Aligning"),
             ("Skládám snímky na GPU", "Stacking frames on GPU"),
             ("Skladam snimky na GPU", "Stacking frames on GPU"),
+            ("Posilam stack po blocich primo do GPU", "Sending stack tiles directly to GPU"),
+            ("Skladam na GPU po blocich VRAM", "Stacking on GPU in VRAM tiles"),
+            ("Skladam na GPU po blocich sdilene pameti", "Stacking on GPU in shared-memory tiles"),
             ("Apple Metal/MPS neni dostupne", "Apple Metal/MPS is not available"),
             ("PyTorch/MPS nelze nacist", "PyTorch/MPS cannot be loaded"),
             ("CUDA/CuPy neni dostupne", "CUDA/CuPy is not available"),
@@ -5926,6 +6216,11 @@ class StackWorker(QThread):
             ("Vyřazuji černý snímek bez hvězd", "Rejecting black frame without stars"),
             ("Vyřazuji bez postupného star alignmentu", "Rejecting frame without sequential star alignment"),
             ("Postupné zarovnání", "Sequential alignment"),
+            ("Mozaika: vytvářím plátno", "Mosaic: creating canvas"),
+            ("Mozaika: převádím snímky na plátno", "Mosaic: warping frames to canvas"),
+            ("Mozaika: skládám paralelně na CPU po blocích RAM", "Mosaic: stacking in parallel on CPU in RAM tiles"),
+            ("Mozaika by vytvořila podezřele velké plátno", "Mosaic would create a suspiciously large canvas"),
+            ("Zkontroluj alignment nebo sniž maximální drift hvězd.", "Check alignment or reduce the maximum star drift."),
             ("vpřed", "forward"),
             ("zpět", "backward"),
             ("GPU vypocet selhal", "GPU computation failed"),
@@ -6017,6 +6312,8 @@ class AstroStackerWindow(QMainWindow):
             "manual_reference_tooltip": "Ručně zvolený referenční snímek. Automatická reference je vypnutá.",
             "sequential_alignment": "Postupné zarovnání",
             "sequential_alignment_tooltip": "Zarovnává sousední snímky postupně a skládá transformace k referenci. Pomáhá při velkém driftu mezi začátkem a koncem sekvence.",
+            "mosaic_mode": "Mozaika - rozšířit plátno",
+            "mosaic_mode_tooltip": "Rozšíří výsledné plátno podle polohy všech zarovnaných snímků. Vhodné pro mozaikové sekvence chytrých dalekohledů. Při zapnuté GPU volbě se mozaika skládá po dlaždicích VRAM; jinak použije paralelní CPU cestu.",
             "keep": "Ponechat", "max_star_drift": "Max. drift hvězd", "max_comet_move": "Max. pohyb komety",
             "comet_refine": "Jemně doladit kometu", "comet_template": "Šablona komety",
             "comet_search": "Hledání komety", "ignore_edge": "Ignorovat okraj",
@@ -6162,6 +6459,8 @@ class AstroStackerWindow(QMainWindow):
             "manual_reference_tooltip": "Manually selected reference frame. Automatic reference is disabled.",
             "sequential_alignment": "Sequential alignment",
             "sequential_alignment_tooltip": "Aligns neighboring frames sequentially and composes transforms back to the reference. Helps with large drift across a sequence.",
+            "mosaic_mode": "Mosaic - expand canvas",
+            "mosaic_mode_tooltip": "Expands the output canvas to include all aligned frames. Useful for smart telescope mosaic sequences. With GPU enabled, mosaic integration uses VRAM tiles; otherwise it uses the parallel CPU path.",
             "keep": "Keep", "max_star_drift": "Max. star drift", "max_comet_move": "Max. comet motion",
             "comet_refine": "Refine comet position", "comet_template": "Comet template",
             "comet_search": "Comet search", "ignore_edge": "Ignore border",
@@ -6319,6 +6618,9 @@ class AstroStackerWindow(QMainWindow):
         self.zoom_factor: float = 0.5
         self.preview_override: Optional[np.ndarray] = None
         self.preview_source_shape: Optional[Tuple[int, int]] = None
+        self.flip_horizontal: bool = False
+        self.flip_vertical: bool = False
+        self.preview_rotation_degrees: int = 0
         self.preview_display_cache: Optional[np.ndarray] = None
         self.preview_display_cache_source_id: Optional[int] = None
         self.preview_display_cache_neutralized: bool = False
@@ -6611,6 +6913,10 @@ class AstroStackerWindow(QMainWindow):
         self.sequential_alignment_check.setChecked(False)
         self.sequential_alignment_check.setToolTip(self.tr_ui("sequential_alignment_tooltip"))
 
+        self.mosaic_mode_check = QCheckBox("Mozaika - rozšířit plátno")
+        self.mosaic_mode_check.setChecked(False)
+        self.mosaic_mode_check.setToolTip(self.tr_ui("mosaic_mode_tooltip"))
+
         self.quality_filter_check = QCheckBox("Použít jen nejlepší snímky")
         self.quality_filter_check.setChecked(False)
 
@@ -6712,6 +7018,7 @@ class AstroStackerWindow(QMainWindow):
         add_form_row("", self.review_frames_check, advanced=True)
         add_form_row("", self.manual_reference_btn, advanced=True)
         add_form_row("", self.sequential_alignment_check, advanced=True)
+        add_form_row("", self.mosaic_mode_check, advanced=True)
         add_form_row("", self.quality_filter_check, advanced=True)
         add_form_row("Ponechat", self.keep_percent_spin, advanced=True)
         add_form_row("Max. drift hvězd", self.max_star_shift_spin)
@@ -7232,27 +7539,59 @@ class AstroStackerWindow(QMainWindow):
 
     def frame_type_counts_for_folder(self) -> Dict[str, int]:
         counts = {"Light": 0, "Dark": 0, "Flat": 0, "Bias": 0}
-        if not self.folder:
-            return counts
-
         extensions = (
             RAW_STACK_EXTENSIONS
             if hasattr(self, "fit_only_check") and self.fit_only_check.isChecked()
             else IMAGE_EXTENSIONS
         )
         ignored_dirs = {"astro_stacker_cache", "astro_stacker_output", "__pycache__"}
-        try:
-            paths = Path(self.folder).rglob("*")
-            for path in paths:
+        counted_paths: set[str] = set()
+
+        def add_path(path: Path, kind: Optional[str] = None, allow_master: bool = False):
+            try:
+                path = Path(path)
                 if not path.is_file() or path.suffix.lower() not in extensions:
-                    continue
-                if path.name.lower().startswith("master"):
-                    continue
+                    return
+                if not allow_master and path.name.lower().startswith("master"):
+                    return
                 if any(part.lower() in ignored_dirs for part in path.parts):
-                    continue
-                counts[self.classify_frame_path(path)] += 1
-        except Exception:
-            pass
+                    return
+                key = str(path.resolve())
+                if key in counted_paths:
+                    return
+                counted_paths.add(key)
+                counts[kind or self.classify_frame_path(path)] += 1
+            except Exception:
+                pass
+
+        if self.folder:
+            try:
+                for path in Path(self.folder).rglob("*"):
+                    add_path(path)
+            except Exception:
+                pass
+
+        # A manually selected calibration source may live outside the Light
+        # folder and does not need a conventional Flat/Bias/Dark directory name.
+        for kind, attr in (
+            ("Flat", "flat_frame_path"),
+            ("Bias", "bias_frame_path"),
+            ("Dark", "dark_frame_path"),
+        ):
+            source = getattr(self, attr, None)
+            if not source:
+                continue
+            source = Path(source)
+            if source.is_dir():
+                try:
+                    for path in source.iterdir():
+                        add_path(path, kind=kind)
+                except Exception:
+                    pass
+            else:
+                # A manually selected finished Master represents one active
+                # calibration input even though automatic scans skip masters.
+                add_path(source, kind=kind, allow_master=True)
         return counts
 
     def update_frame_quality_title(self):
@@ -7829,6 +8168,7 @@ class AstroStackerWindow(QMainWindow):
             else f"{kind} folder selected: {source}" if source.is_dir()
             else f"{kind} Frame selected: {source}"
         )
+        self.update_frame_quality_title()
 
     def choose_flat_frame(self):
         self.choose_calibration_source("Flat")
@@ -7850,6 +8190,7 @@ class AstroStackerWindow(QMainWindow):
         if hasattr(self, "dark_label"):
             self.dark_label.setText(self.tr_ui("dark_unused"))
         self.status_label.setText(self.tr_ui("calibration_off"))
+        self.update_frame_quality_title()
 
     def clear_cache_dialog(self):
         if self.folder is None:
@@ -8289,6 +8630,7 @@ class AstroStackerWindow(QMainWindow):
             "review_frames_check": "review_frames",
             "manual_reference_btn": "manual_reference",
             "sequential_alignment_check": "sequential_alignment",
+            "mosaic_mode_check": "mosaic_mode",
             "quality_filter_check": "quality_filter",
             "comet_refine_check": "comet_refine",
             "strict_star_filter_check": "strict_stars",
@@ -8331,6 +8673,8 @@ class AstroStackerWindow(QMainWindow):
             self.stack_btn.setText(self.tr_ui("continue_stack"))
         if hasattr(self, "sequential_alignment_check"):
             self.sequential_alignment_check.setToolTip(self.tr_ui("sequential_alignment_tooltip"))
+        if hasattr(self, "mosaic_mode_check"):
+            self.mosaic_mode_check.setToolTip(self.tr_ui("mosaic_mode_tooltip"))
         if hasattr(self, "max_comet_shift_spin"):
             self.max_comet_shift_spin.setToolTip(self.tr_ui("max_comet_tooltip"))
         if hasattr(self, "comet_refine_check"):
@@ -8492,8 +8836,9 @@ class AstroStackerWindow(QMainWindow):
                 "<li>The <b>Frame quality</b> heading shows the total number of input Lights, Darks, Flats, and Biases. Saved masters, cache files, and program outputs are not counted.</li>"
                 "<li><b>FWHM px</b> in the Frame quality table is a relative stellar-size measurement in pixels of the reduced quality preview, not an arcsecond value.</li>"
                 "<li><b>Satellite trail</b> adds an optional frame-quality check for long straight satellite or aircraft trails. Suspect frames are marked in the Frame quality table and can be removed during manual review.</li>"
+                "<li><b>Mosaic - expand canvas</b> preserves aligned image areas outside the reference frame and creates a larger output canvas. It is useful for mosaic sequences from smart telescopes such as Vespera. With GPU enabled, mosaic integration uses VRAM tiles while correctly ignoring partially covered edges. If GPU processing is unavailable, Astro Stacker uses the parallel tiled CPU path.</li>"
                 "<li><b>CPU processes</b> can run in Auto mode or Manual mode. Auto keeps the system responsive while using most CPU cores.</li>"
-                "<li><b>GPU</b> enables CUDA/CuPy on NVIDIA or Apple Metal/MPS through PyTorch for the final stacking step. If it fails, the app falls back to CPU.</li>"
+                "<li><b>GPU</b> enables CUDA/CuPy on NVIDIA or Apple Metal/MPS through PyTorch for the final stacking step. Aligned frames are sent to the GPU in row tiles, avoiding a second full-stack RAM copy. If GPU processing fails, the app falls back to CPU.</li>"
                 "</ul>"
                 "<h3>Calibration</h3>"
                 "<ul>"
@@ -8553,8 +8898,9 @@ class AstroStackerWindow(QMainWindow):
                 "<li>Nadpis <b>Frame quality</b> ukazuje celkový počet vstupních Lights, Darks, Flats a Biases. Uložené mastery, cache ani výsledné výstupy programu se nezapočítávají.</li>"
                 "<li><b>FWHM px</b> v tabulce Frame quality je relativní velikost hvězd v pixelech zmenšeného náhledu pro hodnocení kvality, nikoliv hodnota v úhlových vteřinách.</li>"
                 "<li><b>Satelitní stopa</b> přidá volitelnou kontrolu dlouhých rovných stop družic nebo letadel. Podezřelé snímky se označí v tabulce Frame quality a lze je vyřadit při ruční kontrole.</li>"
+                "<li><b>Mozaika - rozšířit plátno</b> zachová zarovnané části snímků mimo referenční obraz a vytvoří větší výstupní plátno. Hodí se pro mozaikové sekvence chytrých dalekohledů, například Vespera. Mozaika používá CPU skládání, aby byly správně zpracované částečně pokryté okraje.</li>"
                 "<li><b>CPU procesy</b> umí režim Auto nebo Ručně. Auto využije většinu CPU, ale nechá systém a GUI dýchat.</li>"
-                "<li><b>GPU</b> zapne CUDA/CuPy na NVIDIA nebo Apple Metal/MPS přes PyTorch pro finální skládání. Při problému program bezpečně spadne zpět na CPU.</li>"
+                "<li><b>GPU</b> zapne CUDA/CuPy na NVIDIA nebo Apple Metal/MPS přes PyTorch pro finální skládání. Zarovnané snímky se posílají do GPU po řádkových dlaždicích, takže nevzniká druhá kopie celého stacku v RAM. Při problému program bezpečně spadne zpět na CPU.</li>"
                 "</ul>"
                 "<h3>Kalibrace</h3>"
                 "<ul>"
@@ -8856,6 +9202,7 @@ class AstroStackerWindow(QMainWindow):
                 "auto_reference": self.auto_reference_check.isChecked(),
                 "manual_reference_path": self.manual_reference_path,
                 "sequential_alignment": self.sequential_alignment_check.isChecked(),
+                "mosaic_mode": self.mosaic_mode_check.isChecked() if hasattr(self, "mosaic_mode_check") else False,
                 "quality_filter": self.quality_filter_check.isChecked(),
                 "review_frames": self.review_frames_check.isChecked(),
                 "keep_percent": self.keep_percent_spin.value(),
@@ -8943,6 +9290,8 @@ class AstroStackerWindow(QMainWindow):
         self.manual_reference_path = stack.get("manual_reference_path")
         if hasattr(self, "sequential_alignment_check"):
             set_check(self.sequential_alignment_check, "sequential_alignment", stack)
+        if hasattr(self, "mosaic_mode_check"):
+            set_check(self.mosaic_mode_check, "mosaic_mode", stack)
         set_check(self.quality_filter_check, "quality_filter", stack)
         if hasattr(self, "review_frames_check"):
             set_check(self.review_frames_check, "review_frames", stack)
@@ -9046,6 +9395,7 @@ class AstroStackerWindow(QMainWindow):
             auto_reference=self.auto_reference_check.isChecked(),
             manual_reference_path=self.manual_reference_path,
             sequential_alignment=self.sequential_alignment_check.isChecked() if hasattr(self, "sequential_alignment_check") else False,
+            mosaic_mode=self.mosaic_mode_check.isChecked() if hasattr(self, "mosaic_mode_check") else False,
             quality_filter=self.quality_filter_check.isChecked(),
             keep_percent=self.keep_percent_spin.value(),
             manual_excluded_paths=tuple(sorted(self.manual_excluded_paths)),
@@ -10088,11 +10438,11 @@ class AstroStackerWindow(QMainWindow):
 
 
     def toggle_flip_horizontal(self):
-        self.flip_horizontal = not self.flip_horizontal
+        self.flip_horizontal = not bool(getattr(self, "flip_horizontal", False))
         self.update_preview()
 
     def toggle_flip_vertical(self):
-        self.flip_vertical = not self.flip_vertical
+        self.flip_vertical = not bool(getattr(self, "flip_vertical", False))
         self.update_preview()
 
     def rotate_preview_left(self):

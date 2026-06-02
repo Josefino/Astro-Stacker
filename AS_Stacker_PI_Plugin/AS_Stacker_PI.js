@@ -51,6 +51,7 @@ function defaultSettings()
       quality: false,
       strictStars: true,
       normalize: true,
+      mosaic: false,
       gpu: false
    };
 }
@@ -551,6 +552,11 @@ function ASStackerDialog()
    this.normalizeCheck.text = "Normalize background";
    this.normalizeCheck.checked = saved.normalize;
 
+   this.mosaicCheck = new CheckBox( this );
+   this.mosaicCheck.text = "Mosaic canvas";
+   this.mosaicCheck.toolTip = "Expand the output canvas to include all aligned frames. With GPU enabled, mosaic integration uses VRAM tiles; otherwise it uses the parallel CPU path.";
+   this.mosaicCheck.checked = saved.mosaic;
+
    this.gpuCheck = new CheckBox( this );
    this.gpuCheck.text = "Use GPU";
    this.gpuCheck.checked = saved.gpu;
@@ -644,6 +650,8 @@ function ASStackerDialog()
          args.push( "--quality-filter" );
       if ( !this.dialog.strictStarsCheck.checked )
          args.push( "--no-strict-star-filter" );
+      if ( this.dialog.mosaicCheck.checked )
+         args.push( "--mosaic" );
 
       saveSettings( {
          python: python,
@@ -665,6 +673,7 @@ function ASStackerDialog()
          quality: this.dialog.qualityCheck.checked,
          strictStars: this.dialog.strictStarsCheck.checked,
          normalize: this.dialog.normalizeCheck.checked,
+         mosaic: this.dialog.mosaicCheck.checked,
          gpu: this.dialog.gpuCheck.checked
       } );
 
@@ -736,6 +745,7 @@ function ASStackerDialog()
    checks.add( this.qualityCheck );
    checks.add( this.strictStarsCheck );
    checks.add( this.normalizeCheck );
+   checks.add( this.mosaicCheck );
    checks.add( this.gpuCheck );
    checks.addStretch();
    this.sizer.add( checks );

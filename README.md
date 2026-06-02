@@ -8,7 +8,7 @@ Current application version: **2.5**
 
 ## Main Features
 
-- Light-frame stacking with translation, ECC affine, star alignment + RANSAC, sequential alignment, comet alignment, and calibration-frame stacking.
+- Light-frame stacking with translation, ECC affine, star alignment + RANSAC, sequential alignment, comet alignment, optional expanded-canvas mosaic mode, and calibration-frame stacking.
 - Mean, median, and sigma-clipped mean stacking.
 - Robust star alignment with frame rejection when alignment fails.
 - Automatic or manual reference-frame selection.
@@ -21,7 +21,7 @@ Current application version: **2.5**
 - Manual calibration selection from a finished Master file or any folder with individual frames.
 - RAW only mode to exclude JPG/PNG/BMP/TIFF preview files while keeping FIT/FITS and camera RAW files.
 - Bayer FIT handling with Auto, Mono, RGGB, BGGR, GRBG, and GBRG modes.
-- GPU stacking support where available.
+- GPU stacking support where available. Aligned frames are streamed to CUDA or Metal/MPS in row tiles to avoid a second full-stack RAM copy.
 - CPU multiprocessing and tiled CPU stacking for large datasets.
 - PixInsight wrapper support.
 - Simple and Advanced UI modes.
@@ -49,9 +49,16 @@ Recommended output formats:
 3. Add Flat, Bias, and Dark calibration manually as a Master file or an arbitrary frame folder, or place them in subfolders named `Flat`, `Bias`, and `Dark`.
 4. Use **Star alignment + RANSAC** for normal deep-sky sequences.
 5. Enable **Review frames before stacking** if you want to inspect quality scores and manually exclude frames.
-6. Start stacking.
-7. Use the right panel to adjust the preview.
-8. Save a linear FIT/FITS file for processing, or export a stretched TIFF/PNG image.
+6. For smart-telescope mosaic sequences, enable **Mosaic - expand canvas** in Advanced mode.
+7. Start stacking.
+8. Use the right panel to adjust the preview.
+9. Save a linear FIT/FITS file for processing, or export a stretched TIFF/PNG image.
+
+## Mosaic Mode
+
+**Mosaic - expand canvas** preserves aligned image areas outside the reference frame and creates an output larger than the native camera resolution. It is intended for smart-telescope mosaic sequences such as Vespera captures.
+
+Partially covered mosaic edges are ignored during pixel integration instead of being treated as black pixels. With GPU enabled, mosaic integration uploads row tiles directly to CUDA or Apple Metal/MPS VRAM. If GPU processing is unavailable, Astro Stacker uses the RAM-protected parallel tiled CPU path.
 
 ## Calibration
 
