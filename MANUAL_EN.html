@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>Astro Stacker 2.5 - User Manual</title>
+<title>Astro Stacker 2.7 - User Manual</title>
 <style>
 @page { margin: 18mm 16mm; }
 body {
@@ -41,7 +41,7 @@ strong { color: #111827; }
 </style>
 </head>
 <body>
-<h1>Astro Stacker 2.5 - User Manual</h1>
+<h1>Astro Stacker 2.7 - User Manual</h1>
 <p>Astro Stacker is an application for stacking astronomical images from DSLR and mirrorless cameras, astronomy cameras, and smart telescopes. It loads a sequence of Light frames, optionally applies Flat/Bias/Dark calibration, aligns the frames on stars or a comet, stacks the result, and provides preview tools for inspection and export.</p>
 <p>The program is designed so the linear FIT output remains suitable for further processing. Most controls in the right panel affect the preview and PNG/TIFF export, not the original linear data.</p>
 <h2>1. What Astro Stacker Does</h2>
@@ -49,13 +49,11 @@ strong { color: #111827; }
 <li>Stacks Light frames from a selected folder.</li>
 <li>Supports FIT/FITS, common camera RAW files, and standard image formats.</li>
 <li>Applies optional Flat, Bias, and Dark calibration.</li>
-<li>Aligns frames by translation, affine ECC, robust stars + RANSAC, or comet motion.</li>
+<li>Aligns frames by translation, affine ECC, stars with RANSAC, perspective star matching, or comet motion.</li>
 <li>Allows automatic or manual reference frame selection.</li>
 <li>Filters the best frames by quality score.</li>
-<li>Optionally detects frames with long straight satellite or aircraft trails.</li>
 <li>Shows a diagnostic frame quality table.</li>
-<li>Allows manual frame review before stacking and Space-key frame exclusion.</li>
-<li>Can clear frame quality cache and aligned-frame cache for the selected folder.</li>
+<li>Detects satellite trails and masks only the affected pixels during stacking.</li>
 <li>Saves and loads settings profiles.</li>
 <li>Provides preview tools with histogram, curves, color controls, background balancing, and Balance.</li>
 <li>Exports linear FIT or visually adjusted PNG/TIFF.</li>
@@ -69,7 +67,7 @@ strong { color: #111827; }
 </ol>
 <ul>
 <li><strong>Alignment:</strong> Star alignment - stars + RANSAC</li>
-<li><strong>Stacking:</strong> Sigma-clipped mean</li>
+<li><strong>Stacking:</strong> Median</li>
 <li><strong>Automatically choose best reference:</strong> enabled</li>
 <li><strong>Use only best frames:</strong> enabled as needed</li>
 </ul>
@@ -79,6 +77,12 @@ strong { color: #111827; }
 <li>Save the result with <strong>File &gt; Save result as</strong>.</li>
 </ol>
 <h2>3. Left Panel - Stacking Controls</h2>
+<p>The left and right side panels can be collapsed with the small arrow button in</p>
+<p>the top-left corner of each panel. When a panel is hidden, only a narrow arrow</p>
+<p>rail remains. This gives more space to the central preview and the Frame quality</p>
+<p>table on smaller displays.</p>
+<h3>Help and Updates</h3>
+<p>Astro Stacker checks GitHub Releases for a newer version shortly after startup. If a newer release is available, it shows a notification and can open the download page. You can also run the check manually from <strong>Help &gt; Check for updates</strong>.</p>
 <h3>Folder and Preview Selection</h3>
 <p><strong>Choose folder</strong> loads the working folder. The file list shows Light, Flat, Bias, and Dark frames. After stacking, the list marks:</p>
 <ul>
@@ -88,6 +92,7 @@ strong { color: #111827; }
 <p>The file list can also be used to inspect individual frames.</p>
 <h3>RAW Only</h3>
 <p>When enabled, <strong>RAW only</strong> keeps FIT/FITS and camera RAW files such as ARW, CR2, CR3, and similar formats. It excludes JPG, PNG, BMP, and TIFF files. This is useful when a camera or smart telescope stores both working frames and preview images in the same folder.</p>
+<p>For Bayer FIT/FITS sequences, calibration is applied to the sensor mosaic before debayering. Large FIT headers are inspected without loading the full image, and the actual loading, debayering, and alignment run in parallel worker processes when multiprocessing is enabled.</p>
 <h3>Alignment Modes</h3>
 <p><strong>Translation</strong></p>
 <p>Fast shift-only alignment. Suitable for small drift without rotation.</p>
@@ -96,21 +101,21 @@ strong { color: #111827; }
 <p><strong>ECC affine</strong></p>
 <p>Uses image correlation to estimate shift, rotation, and scale. It can be slower and may not work well on weak objects.</p>
 <p><strong>Star alignment + RANSAC</strong></p>
-<p>The recommended main mode. The program detects stars, matches them against the reference frame, and estimates the transformation with RANSAC. The newer robust implementation tries multiple shift and rotation candidates, which improves success with EAA sequences, dithering, and smart telescopes with larger jump-like drift. Frames without a valid alignment are rejected.</p>
+<p>The recommended main mode. The program detects stars, matches them against the reference frame, and estimates the transformation with RANSAC. Frames without a valid alignment are rejected.</p>
+<p><strong>Star perspective - stars + corners</strong></p>
+<p>An experimental mode for more complex distortion. Use it only when normal RANSAC alignment is not enough.</p>
 <p><strong>Comet alignment</strong></p>
 <p>Stacks on the comet position.</p>
 <p><strong>Star + Comet</strong></p>
 <p>Creates separate star and comet stack outputs.</p>
 <h3>Automatic and Manual Reference</h3>
-<p><strong>Automatically choose best reference</strong> selects the frame with the best quality score. The score is based on sharpness, detected star count, and typical star shape. Frames with smaller and rounder stars are preferred because they provide a better reference for accurate alignment.</p>
+<p><strong>Automatically choose best reference</strong> selects the frame with the best quality score. The score is based mainly on sharpness and detected star count.</p>
 <p>If automatic reference selection does not work well for a specific sequence, select a suitable frame in the file list and click <strong>Use current frame as reference</strong>. This disables automatic reference selection and uses the selected frame instead.</p>
 <h3>Quality Filter</h3>
 <p>The program computes a quality score for each Light frame. The score combines:</p>
 <ul>
 <li>frame sharpness,</li>
-<li>detected star count,</li>
-<li>star roundness,</li>
-<li>typical star size expressed as FWHM px.</li>
+<li>detected star count.</li>
 </ul>
 <p><strong>Keep</strong> defines what percentage of the best frames will be used. For example, 80% keeps the best 80% and excludes the worst 20% before alignment.</p>
 <p>Important: a frame can pass the quality filter and still be rejected later if alignment fails.</p>
@@ -121,13 +126,9 @@ strong { color: #111827; }
 <h3>Strict Star Filter</h3>
 <p>Applies stricter star shape filtering. It helps suppress branches, trails, and elongated artifacts. If too many usable frames are rejected, disabling this option can sometimes help.</p>
 <h3>Satellite Trail</h3>
-<p><strong>Satellite trail</strong> is an optional quality check for long straight satellite or aircraft trails. When enabled, Astro Stacker analyzes each Light frame during quality scoring and marks suspicious frames in the Frame quality table.</p>
-<h3>Mosaic Canvas</h3>
-<p><strong>Mosaic - expand canvas</strong> preserves aligned areas outside the reference frame and creates an output larger than the native camera resolution. It is useful for smart-telescope mosaic sequences such as Vespera captures. Partially covered edges are combined correctly. With GPU enabled, mosaic integration uploads row tiles directly to CUDA or Apple Metal/MPS VRAM. If GPU processing is unavailable, Astro Stacker uses the RAM-protected parallel tiled CPU path.</p>
-<p>GPU mode also sends standard non-mosaic stacks to CUDA or Apple Metal/MPS in row tiles. This avoids creating a second full-stack copy in RAM before GPU processing.</p>
-<p>The detector is tuned to prefer clear, long, straight trails. It does not automatically delete image files. Use it together with <strong>Review frames before stacking</strong> and press Space on suspicious rows if you want to exclude them from the stack.</p>
+<p>Detects long straight satellite or aircraft trails and marks suspect frames in the Frame quality table. During stacking, Astro Stacker masks the complete detected line from edge to edge. Only the trail pixels are excluded; the unaffected part of the exposure remains available for integration.</p>
 <h2>4. Diagnostic Frame Quality Table</h2>
-<p>The lower part of the window contains the <strong>Frame quality</strong> table. It helps explain why frames were used or excluded. Its heading also shows the total number of input Lights, Darks, Flats, and Biases. Saved masters, cache files, and program outputs are not counted.</p>
+<p>The lower part of the window contains the <strong>Frame quality</strong> table. It helps explain why frames were used or excluded.</p>
 <p>Columns:</p>
 <ul>
 <li><code>#</code> frame order,</li>
@@ -135,9 +136,6 @@ strong { color: #111827; }
 <li><code>Score</code> overall quality score,</li>
 <li><code>Stars</code> detected star count,</li>
 <li><code>Sharpness</code> Laplacian variance sharpness metric,</li>
-<li><code>Roundness</code> typical stellar roundness; values closer to <code>1.0</code> indicate rounder stars,</li>
-<li><code>FWHM px</code> typical stellar size in pixels of the reduced preview used for quality scoring; a lower value usually indicates finer and sharper stars. It is intended for relative comparison within the same sequence, not as an arcsecond measurement,</li>
-<li><code>Trail</code> satellite/aircraft trail check result,</li>
 <li><code>Status</code> frame status,</li>
 <li><code>Ref</code> reference marker.</li>
 </ul>
@@ -149,7 +147,6 @@ strong { color: #111827; }
 <li><strong>Rejected alignment</strong> - the frame passed quality filtering, but alignment failed.</li>
 <li><strong>Skipped</strong> - the frame was not part of the stack, for example a calibration or unused file type.</li>
 </ul>
-<p>If <strong>Satellite trail</strong> is enabled, the <code>Trail</code> column shows <strong>Suspect</strong> for frames where a long straight trail was detected. This is a warning for review, not an automatic file deletion.</p>
 <p>Clicking a row switches the preview to that frame.</p>
 <h3>Reviewing Frames Before Stacking</h3>
 <p><strong>Review frames before stacking</strong> adds a manual review step before the actual stack begins.</p>
@@ -169,26 +166,9 @@ strong { color: #111827; }
 <p>Calibration frames can be used in two ways:</p>
 <ul>
 <li>automatically, if they are in appropriately named folders,</li>
-<li>manually with the <strong>Flat</strong>, <strong>Bias</strong>, and <strong>Dark</strong> buttons in the right panel. Each button accepts either a finished Master file or any folder with individual calibration frames.</li>
+<li>manually with the <strong>Flat</strong>, <strong>Bias</strong>, and <strong>Dark</strong> buttons in the right panel.</li>
 </ul>
 <p>Calibration is applied before alignment and stacking.</p>
-<p>A manually selected calibration folder does not need to be named <code>Flat</code>, <code>Bias</code>, or <code>Dark</code>. Astro Stacker integrates its frames with an arithmetic average and stores a reusable Master cache directly in that folder.</p>
-<p>When automatic calibration folders are used, Astro Stacker creates reusable master files in those folders:</p>
-<ul>
-<li><code>MasterBias_AS.fit</code> and <code>MasterBias_AS.json</code></li>
-<li><code>MasterFlat_AS.fit</code> and <code>MasterFlat_AS.json</code></li>
-<li><code>MasterDark_AS.fit</code> and <code>MasterDark_AS.json</code></li>
-</ul>
-<p>On the next run, the program reuses the saved master if the folder contents, Bayer setting, and <strong>RAW only</strong> setting have not changed. If files are added, removed, modified, or the RAW-only mode changes, the master is rebuilt automatically.</p>
-<p>Bias, Flat, and Dark master frames are integrated with an arithmetic average to use the signal from all calibration exposures.</p>
-<p>For the simplest automatic calibration workflow, keep Light frames directly in the selected working folder and create subfolders named <code>Flat</code>, <code>Bias</code>, and <code>Dark</code> inside it. Put each calibration-frame type into its matching subfolder:</p>
-<pre><code>MySequence/
-  Light_001.fit
-  Light_002.fit
-  Flat/
-  Bias/
-  Dark/</code></pre>
-<p><strong>RAW only</strong> also applies to automatic Flat/Bias/Dark folders. JPG, PNG, BMP, and TIFF preview files in calibration folders are ignored when RAW only is enabled.</p>
 <p><strong>Reset calibration</strong> removes the selected calibration frames.</p>
 <h2>6. Comet Stacking</h2>
 <p>For comet stacking, the most reliable method is to mark the comet position in two frames.</p>
@@ -227,16 +207,10 @@ strong { color: #111827; }
 </ul>
 <h2>8. Right Panel - Preview and Adjustments</h2>
 <p>The right panel is used for inspection and visual adjustments. These controls mainly affect preview and PNG/TIFF export. Linear FIT data remains suitable for further processing.</p>
-<p>External 16-bit TIFF files are loaded at their full bit depth without conversion to 8 bits.</p>
+<p>Use the small arrow in the top-left corner of the panel to hide the whole right</p>
+<p>panel temporarily. Click the remaining arrow rail to show it again.</p>
 <h3>Show Stacked Image</h3>
 <p>Restores the preview to the original stacked image without crop, neutralization, or visual adjustments.</p>
-<h3>Clear Cache Quality Frames</h3>
-<p>Clears the stored frame quality cache and, if present, aligned-frame cache. Use it after changing settings, Bayer pattern, reference frame, program version, or whenever you want to force a fresh frame quality evaluation.</p>
-<ul>
-<li><strong>Current folder only</strong> removes only the <code>astro_stacker_cache</code> directory in the currently selected folder.</li>
-<li><strong>All cache in this folder</strong> recursively scans the selected folder and removes only directories named <code>astro_stacker_cache</code>.</li>
-</ul>
-<p>The program does not delete Light, Flat, Bias, Dark, or other image files.</p>
 <h3>Balance</h3>
 <p><strong>Balance</strong> automatically sets a reasonable preview for a linear image:</p>
 <ul>
@@ -254,7 +228,7 @@ strong { color: #111827; }
 <li><strong>Gamma</strong> adjusts midtones.</li>
 </ul>
 <h3>Highlight Compression</h3>
-<p>Compresses very bright highlights, such as bright stars or object cores. A value of 10 preserves the original brightness; moving toward 0 increases highlight compression. Useful for previewing high dynamic range images.</p>
+<p>Compresses very bright highlights, such as bright stars or object cores. Useful for previewing high dynamic range images.</p>
 <h3>Vignette Removal</h3>
 <p>Gently brightens edges and corners. It is not a replacement for real Flat calibration, but it can help with quick visual inspection.</p>
 <h3>Synthetic Flat</h3>
@@ -271,14 +245,19 @@ strong { color: #111827; }
 </ul>
 <h3>Histogram</h3>
 <p>The histogram shows luminance and RGB channels. It helps verify whether data is clipped in shadows or highlights.</p>
-<h3>Crop Edges</h3>
-<p>Crops the selected percentage from each edge of the current image. Useful after rotation, dithering, or EAA sequences with dark corners.</p>
+<h3>Turn Angle</h3>
+<p>Rotates the current image by the selected angle. This is useful when a stacked image is slightly tilted and you want to straighten the field before choosing the final crop.</p>
+<p>The <strong>Select</strong> button enables manual crop selection. Drag a rectangle directly</p>
+<p>in the preview; the selected area is kept and everything outside it is removed.</p>
+<p>This is useful when only one side or an irregular border area needs to be</p>
+<p>removed. Manual crop affects the current preview/opened image or stacked image,</p>
+<p>after any Turn Angle rotation if one was applied.</p>
+<h3>Undo</h3>
+<p>The <strong>Undo</strong> button restores the previous preview-processing state. It is useful after actions such as Balance, Auto WB, denoise, Turn Angle, or manual crop.</p>
 <h3>Auto White Balance</h3>
 <p>Attempts automatic white balance on neutral/gray regions. For some astro images, manual RGB adjustment or Color background correction may work better.</p>
 <h3>Neutralize Background</h3>
 <p>Attempts to equalize the background color. It works best when there is enough neutral background without nebulosity and without problematic edges.</p>
-<h3>Remove Gradient</h3>
-<p>Subtracts a smooth polynomial model of the background for preview and PNG/TIFF export. It is especially useful for galaxies with light-pollution gradients. Use it carefully with large nebulae, where real faint structures can be mistaken for background. Linear FIT output remains unchanged.</p>
 <h3>Flip Horizontal / Vertical</h3>
 <p>Flips the preview horizontally or vertically.</p>
 <h3>Fit and 1:1</h3>
@@ -286,16 +265,15 @@ strong { color: #111827; }
 <li><strong>Fit</strong> fits the image to the window.</li>
 <li><strong>1:1</strong> shows real pixels.</li>
 </ul>
-<h3>High Rejection Mean</h3>
-<p>This method rejects only unusually bright pixels compared with the other aligned frames. It is intended primarily for satellite or aircraft trails. The <strong>Sigma</strong> value controls its sensitivity.</p>
 <h2>9. PixInsight Wrapper</h2>
 <p>The <strong>PixInsight</strong> button opens PixInsight and runs the AS_Stacker wrapper if it is available. The wrapper can run the CLI stacker from PixInsight and open the resulting FIT file after completion.</p>
 <p>The wrapper needs a Python environment with the required packages installed.</p>
+<p>The wrapper in version 2.7 also provides the <strong>Satellite trail</strong> option and uses Star alignment + RANSAC with Median as the defaults for a new configuration.</p>
 <h2>10. Recommended Workflows</h2>
 <h3>Normal Deep-Sky Sequence</h3>
 <ul>
 <li>Star alignment + RANSAC</li>
-<li>Sigma-clipped mean</li>
+<li>Median</li>
 <li>Auto reference enabled</li>
 <li>Quality filter 80-100%</li>
 <li>Strict star filter enabled</li>
@@ -309,7 +287,7 @@ strong { color: #111827; }
 <h3>Smart Telescopes and EAA</h3>
 <ul>
 <li>Enable RAW only if preview images are mixed with stackable frames.</li>
-<li>Use Crop edges for rotation and dark corners.</li>
+<li>Use Turn Angle and Select crop for rotation and dark corners.</li>
 <li>Use Color background correction for pink or purple backgrounds.</li>
 </ul>
 <h3>Comets</h3>
@@ -335,7 +313,7 @@ strong { color: #111827; }
 <li>crop the edges and neutralize again.</li>
 </ol>
 <h3>The Result Has Dark Corners</h3>
-<p>This is common with rotation, dithering, or large drift. Use Crop edges or crop the result later in another editor.</p>
+<p>This is common with rotation, dithering, or large drift. Use Turn Angle, Select crop, or crop the result later in another editor.</p>
 <h3>FIT Output Looks Dark</h3>
 <p>This is normal. FIT output is linear and needs stretching. Use Balance for preview, or process the output in PixInsight, Siril, or another astrophotography editor.</p>
 </body>

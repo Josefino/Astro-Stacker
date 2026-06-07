@@ -63,6 +63,8 @@ import subprocess
 import tempfile
 import ctypes
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -74,7 +76,40 @@ from PIL import Image
 
 
 LOG_PATH: Optional[Path] = None
-APP_VERSION = "2.5"
+APP_VERSION = "2.7"
+GITHUB_RELEASES_API_URL = "https://api.github.com/repos/Josefino/Astro-Stacker/releases/latest"
+GITHUB_RELEASES_PAGE_URL = "https://github.com/Josefino/Astro-Stacker/releases/latest"
+
+
+def parse_version_tuple(value: str) -> Tuple[int, ...]:
+    text = str(value or "").strip().lower()
+    text = text.lstrip("v")
+    if "." not in text:
+        digits_only = re.sub(r"\D+", "", text)
+        if len(digits_only) == 2:
+            return (int(digits_only[0]), int(digits_only[1]))
+        if len(digits_only) == 3:
+            return (int(digits_only[0]), int(digits_only[1:]))
+    parts = re.findall(r"\d+", text)
+    return tuple(int(part) for part in parts) if parts else (0,)
+
+
+def is_newer_version(candidate: str, current: str) -> bool:
+    cand = list(parse_version_tuple(candidate))
+    cur = list(parse_version_tuple(current))
+    width = max(len(cand), len(cur))
+    cand.extend([0] * (width - len(cand)))
+    cur.extend([0] * (width - len(cur)))
+    return tuple(cand) > tuple(cur)
+
+
+def display_version(value: str) -> str:
+    parsed = parse_version_tuple(value)
+    if parsed == (0,):
+        return str(value or "").strip().lstrip("v") or "?"
+    if len(parsed) >= 2:
+        return f"{parsed[0]}.{parsed[1]}"
+    return str(parsed[0])
 
 
 def init_log_path() -> Path:
@@ -236,8 +271,8 @@ try:
     import rawpy
 except ImportError:
     rawpy = None
-from PySide6.QtCore import QPoint, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QIcon, QImage, QPainter, QPixmap, QPolygon
+from PySide6.QtCore import QPoint, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDesktopServices, QIcon, QImage, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -273,7 +308,7 @@ FITS_EXTENSIONS = {".fits", ".fit"}
 RAW_STACK_EXTENSIONS = FITS_EXTENSIONS | RAW_EXTENSIONS
 
 LAST_STACK_SELECTION: Dict[str, Any] = {}
-ALIGNMENT_CACHE_VERSION = "aligned-v6-standard-flat-normalization"
+ALIGNMENT_CACHE_VERSION = "aligned-v8-full-satellite-mask"
 QUALITY_CACHE_VERSION = "quality-v15-star-shape-reference"
 CALIBRATION_SIGNATURE_CACHE: Dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
 MP_WORKER_CONTEXT: Dict[str, Any] = {}
@@ -376,7 +411,6 @@ class StackSettings:
     normalize_background: bool = True
     auto_reference: bool = True       # vybere nejostřejší snímek jako referenci
     manual_reference_path: Optional[str] = None  # ručně zvolená reference pro běžné zarovnání
-    sequential_alignment: bool = False  # zarovnává sousední snímky a skládá transformace k referenci
     mosaic_mode: bool = False           # rozšíří výstupní plátno podle transformací přijatých snímků
     quality_filter: bool = True       # vyřadí nejhorší snímky podle skóre
     keep_percent: int = 80            # kolik % nejlepších snímků ponechat
@@ -386,7 +420,7 @@ class StackSettings:
     max_star_shift: int = 180          # max. drift hvězd vůči referenci v pixelech
     star_border_margin: int = 120       # okraj obrazu ignorovaný při detekci hvězd, pomáhá proti stromům/větvím; lze nastavit i stovky až tisíce px
     strict_star_filter: bool = True     # přísnější filtr tvaru hvězd, potlačí větve, dráty a rozmazané fleky
-    satellite_trail_filter: bool = False  # volitelně označí snímky s dlouhou rovnou satelitní stopou
+    satellite_trail_filter: bool = False  # detekuje a maskuje dlouhé rovné satelitní stopy
     bayer_pattern: str = "auto"          # auto | mono | RGGB | BGGR | GRBG | GBRG
     max_comet_shift: int = 800         # maximální očekávaný pohyb komety vůči referenci v pixelech
     comet_refine: bool = True          # po dvoubodové predikci jemně dohledá kometu lokální korelací
@@ -654,6 +688,9 @@ def bayer_pattern_for_fits_path(path: Path, override: Optional[str] = None) -> O
     Bere v úvahu ruční nastavení Bayer masky. Pokud je zvoleno Mono,
     vrací None. Pokud je ručně zvolen konkrétní pattern, vrací ho pro
     2D FIT/cube data bez ohledu na hlavičku. V režimu Auto čte hlavičku.
+    Obrazová data se zde záměrně nenačítají: tato funkce se volá pro celou
+    sekvenci ještě před multiprocessingem a načtení každého velkého FITu by
+    vytvořilo zbytečnou sériovou fázi před paralelním debayeringem.
     """
     if fits is None or Path(path).suffix.lower() not in {".fits", ".fit"}:
         return None
@@ -663,22 +700,30 @@ def bayer_pattern_for_fits_path(path: Path, override: Optional[str] = None) -> O
     selected_lower = selected.lower()
 
     try:
-        with open_fits_safely(path, memmap=False) as hdul:
+        with open_fits_safely(path, memmap=True) as hdul:
             for hdu in hdul:
-                data = getattr(hdu, "data", None)
-                if data is None:
+                header = getattr(hdu, "header", None)
+                if header is None:
                     continue
-                arr = np.asarray(data)
+                naxis = int(header.get("NAXIS", 0) or 0)
+                if naxis <= 0:
+                    continue
                 # Ruční Mono: nedebayerovat.
                 if selected_lower == "mono":
                     return None
                 # Ruční pattern: debayerovat jen 2D raw nebo první rovinu cube.
                 if selected_upper in BAYER_PATTERNS:
-                    if arr.ndim == 2 or (arr.ndim == 3 and arr.shape[-1] not in (3, 4) and arr.shape[0] not in (3, 4)):
+                    if naxis == 2:
                         return selected_upper
+                    if naxis == 3:
+                        # NumPy tvar FIT cube je (NAXIS3, NAXIS2, NAXIS1).
+                        axis1 = int(header.get("NAXIS1", 0) or 0)
+                        axis3 = int(header.get("NAXIS3", 0) or 0)
+                        if axis1 not in (3, 4) and axis3 not in (3, 4):
+                            return selected_upper
                     return None
                 # Auto: použít FIT hlavičku.
-                return detect_bayer_pattern_from_header(getattr(hdu, "header", None))
+                return detect_bayer_pattern_from_header(header)
     except Exception:
         return None
     return None
@@ -2315,6 +2360,29 @@ def warp_to_reference(img: np.ndarray, matrix: np.ndarray, shape: Tuple[int, int
     return warped.astype(np.float32)
 
 
+def warp_valid_coverage(source_shape: Tuple[int, int], matrix: np.ndarray, output_shape: Tuple[int, int]) -> np.ndarray:
+    """Return per-pixel source coverage for a warp.
+
+    Normal star alignment keeps the reference frame size, so rotations/translations
+    leave invalid borders. Those borders must not participate in median stacking
+    or background normalization, otherwise they can create dark/colored bands.
+    """
+    source_h, source_w = source_shape
+    mask = np.ones((source_h, source_w), dtype=np.float32)
+    return warp_to_reference(mask, matrix, output_shape, border_value=0.0)
+
+
+def mark_invalid_warp_pixels(img: np.ndarray, matrix: np.ndarray, output_shape: Tuple[int, int], threshold: float = 0.999) -> np.ndarray:
+    coverage = warp_valid_coverage(img.shape[:2], matrix, output_shape)
+    valid = coverage >= float(threshold)
+    out = np.asarray(img, dtype=np.float32).copy()
+    if out.ndim == 3:
+        out[~valid, :] = np.nan
+    else:
+        out[~valid] = np.nan
+    return out
+
+
 def matrix_to_homogeneous(matrix: np.ndarray) -> np.ndarray:
     matrix = np.asarray(matrix, dtype=np.float32)
     if matrix.shape == (3, 3):
@@ -2358,7 +2426,7 @@ def mosaic_canvas_for_matrices(shape: Tuple[int, int], matrices: List[np.ndarray
 
 
 def warp_mosaic_records(
-    records: List[Tuple[Path, np.ndarray, np.ndarray]],
+    records: List[Tuple[Path, np.ndarray, np.ndarray, Optional[np.ndarray]]],
     reference_shape: Tuple[int, int],
     progress_callback=None,
 ) -> List[np.ndarray]:
@@ -2383,7 +2451,7 @@ def warp_mosaic_records(
         progress_callback(72, f"Mozaika: převádím snímky na plátno ({workers} vláken)...")
 
     def warp_one(index: int) -> Tuple[int, np.ndarray]:
-        _path, img, _matrix = records[index]
+        _path, img, _matrix, trail_mask = records[index]
         shifted = shifted_matrices[index]
         warped = warp_to_reference(img, shifted, canvas_shape, border_value=0.0)
         coverage = warp_to_reference(np.ones(img.shape[:2], dtype=np.float32), shifted, canvas_shape, border_value=0.0)
@@ -2394,6 +2462,7 @@ def warp_mosaic_records(
         else:
             warped = warped / np.maximum(coverage, 1e-6)
             warped[~valid] = np.nan
+        warped = apply_warped_exclusion_mask(warped, trail_mask, shifted, canvas_shape)
         return index, warped.astype(np.float32)
 
     if workers <= 1:
@@ -2415,16 +2484,32 @@ def warp_mosaic_records(
     return [frame for frame in aligned if frame is not None]
 
 
-def compose_affine(parent_to_ref: np.ndarray, child_to_parent: np.ndarray) -> np.ndarray:
-    """Compose two 2x3 affine matrices: child -> parent -> reference."""
-    a = np.vstack([parent_to_ref.astype(np.float32), [0, 0, 1]])
-    b = np.vstack([child_to_parent.astype(np.float32), [0, 0, 1]])
-    return (a @ b)[:2, :].astype(np.float32)
-
-
 def normalize_background(img: np.ndarray, reference_median: np.ndarray) -> np.ndarray:
-    med = np.median(img.reshape(-1, 3), axis=0)
-    corrected = img - med + reference_median
+    arr = np.asarray(img, dtype=np.float32)
+    if arr.ndim == 2:
+        flat = arr.reshape(-1, 1)
+    else:
+        flat = arr.reshape(-1, arr.shape[-1])
+
+    finite = np.all(np.isfinite(flat), axis=1)
+    if np.count_nonzero(finite) < 100:
+        return arr
+
+    # Ignore warp borders and clipped black pixels. Real astro backgrounds are
+    # normally above zero after calibration; constant zeros mostly mean "no data".
+    lum = np.mean(flat, axis=1)
+    valid = finite & (lum > 1e-6)
+    if np.count_nonzero(valid) < 100:
+        valid = finite
+
+    med = np.median(flat[valid], axis=0).astype(np.float32)
+    ref = np.asarray(reference_median, dtype=np.float32).reshape(-1)
+    if ref.size == 1 and med.size > 1:
+        ref = np.full(med.shape, float(ref[0]), dtype=np.float32)
+    elif ref.size != med.size:
+        ref = np.resize(ref, med.shape).astype(np.float32)
+
+    corrected = arr - med + ref
     return np.clip(corrected, 0, 1)
 
 
@@ -2552,7 +2637,144 @@ def should_stack_tiled_on_cpu(frame_shape: Tuple[int, ...], frame_count: int, mo
     return required >= safe_budget or stack_bytes >= hard_limit, required, available
 
 
-def stack_frames_cpu_tiled_from_sequence(frames: List[np.ndarray], mode: str, sigma: float, progress_callback=None, force_tiled: bool = False) -> np.ndarray:
+def minimum_valid_stack_count(frame_count: int, require_majority_coverage: bool) -> int:
+    if not require_majority_coverage:
+        return 1
+    return max(1, int(frame_count) // 2 + 1)
+
+
+def apply_numpy_minimum_coverage(result: np.ndarray, counts: np.ndarray, frame_count: int, require_majority_coverage: bool) -> np.ndarray:
+    if not require_majority_coverage:
+        return result
+    min_count = minimum_valid_stack_count(frame_count, True)
+    return np.where(counts >= min_count, result, 0.0).astype(np.float32)
+
+
+def normalize_angle_90(angle_deg: float) -> float:
+    """Normalize an angle to the nearest horizontal/vertical axis."""
+    angle = float(angle_deg)
+    while angle <= -90.0:
+        angle += 180.0
+    while angle > 90.0:
+        angle -= 180.0
+    if angle > 45.0:
+        angle -= 90.0
+    elif angle < -45.0:
+        angle += 90.0
+    return angle
+
+
+def estimate_valid_frame_angle(img: np.ndarray) -> Optional[float]:
+    """Estimate the tilt of the valid stacked-image footprint from dark borders."""
+    arr = np.asarray(img, dtype=np.float32)
+    if arr.ndim == 3:
+        lum = 0.2126 * arr[..., 0] + 0.7152 * arr[..., 1] + 0.0722 * arr[..., 2]
+        finite = np.all(np.isfinite(arr[..., :3]), axis=2)
+    else:
+        lum = arr
+        finite = np.isfinite(arr)
+    h, w = lum.shape[:2]
+    if h < 64 or w < 64:
+        return None
+
+    finite_lum = lum[finite]
+    finite_lum = finite_lum[np.isfinite(finite_lum)]
+    if finite_lum.size < 1000:
+        return None
+
+    positive = finite_lum[finite_lum > 1e-6]
+    if positive.size < finite_lum.size * 0.10:
+        return None
+
+    center = lum[h // 4: (3 * h) // 4, w // 4: (3 * w) // 4]
+    center = center[np.isfinite(center)]
+    center_positive = center[center > 1e-6]
+    thresholds = [max(1e-6, float(np.percentile(positive, 0.5)) * 0.25)]
+    if center_positive.size > 100:
+        center_median = float(np.median(center_positive))
+        thresholds.extend([
+            max(1e-6, float(np.percentile(center_positive, 10.0)) * 0.25),
+            max(1e-6, float(np.percentile(center_positive, 20.0)) * 0.35),
+            max(1e-6, center_median * 0.15),
+            max(1e-6, center_median * 0.25),
+            max(1e-6, center_median * 0.40),
+        ])
+
+    kernel = np.ones((7, 7), np.uint8)
+    selected_contour = None
+    selected_area = 0.0
+    frame_area = float(h * w)
+    for threshold in sorted(set(float(t) for t in thresholds)):
+        mask = ((lum > threshold) & finite).astype(np.uint8) * 255
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        contours, _hier = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        largest = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(largest))
+        area_ratio = area / frame_area if frame_area > 0 else 0.0
+        if 0.20 <= area_ratio <= 0.985 and area > selected_area:
+            selected_contour = largest
+            selected_area = area
+
+    if selected_contour is None:
+        return None
+
+    box = cv2.boxPoints(cv2.minAreaRect(selected_contour)).astype(np.float32)
+    edge_angles = []
+    for idx in range(4):
+        p0 = box[idx]
+        p1 = box[(idx + 1) % 4]
+        dx = float(p1[0] - p0[0])
+        dy = float(p1[1] - p0[1])
+        length = math.hypot(dx, dy)
+        if length < 8:
+            continue
+        edge_angles.append((length, normalize_angle_90(math.degrees(math.atan2(dy, dx)))))
+    if not edge_angles:
+        return None
+
+    # Prefer the edge that is closest to horizontal. It gives the visible frame
+    # tilt regardless of whether the footprint is portrait or landscape.
+    _length, angle = min(edge_angles, key=lambda item: abs(item[1]))
+    if abs(angle) < 0.15 or abs(angle) > 12.0:
+        return None
+    return float(angle)
+
+
+def rotate_image_expand(img: np.ndarray, angle_deg: float) -> np.ndarray:
+    arr = np.asarray(img, dtype=np.float32)
+    h, w = arr.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, float(angle_deg), 1.0).astype(np.float32)
+    cos_a = abs(float(matrix[0, 0]))
+    sin_a = abs(float(matrix[0, 1]))
+    new_w = int(math.ceil(h * sin_a + w * cos_a))
+    new_h = int(math.ceil(h * cos_a + w * sin_a))
+    matrix[0, 2] += new_w / 2.0 - center[0]
+    matrix[1, 2] += new_h / 2.0 - center[1]
+    rotated = cv2.warpAffine(
+        arr,
+        matrix,
+        (new_w, new_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    return np.clip(rotated, 0, 1).astype(np.float32)
+
+
+def auto_rotate_stacked_footprint(img: np.ndarray) -> Tuple[np.ndarray, Optional[float]]:
+    angle = estimate_valid_frame_angle(img)
+    if angle is None:
+        return np.asarray(img, dtype=np.float32), None
+    # Rotate in the opposite direction of the detected frame tilt.
+    return rotate_image_expand(img, -angle), -angle
+
+
+def stack_frames_cpu_tiled_from_sequence(frames: List[np.ndarray], mode: str, sigma: float, progress_callback=None, force_tiled: bool = False, require_majority_coverage: bool = False) -> np.ndarray:
     if not frames:
         raise ValueError("No frames to stack.")
     if len(frames) == 1:
@@ -2572,7 +2794,12 @@ def stack_frames_cpu_tiled_from_sequence(frames: List[np.ndarray], mode: str, si
             f"CPU stack uses full array: mode={mode}, frames={n}, shape={first.shape}, "
             f"stack_bytes={full_stack_bytes}, available_mem={available}"
         )
-        return stack_frames_cpu(np.stack(frames, axis=0), mode, sigma)
+        return stack_frames_cpu(
+            np.stack(frames, axis=0),
+            mode,
+            sigma,
+            require_majority_coverage=require_majority_coverage,
+        )
 
     bytes_per_row = max(1, n * w * channels * np.dtype(np.float32).itemsize)
     cpu_count = max(1, os.cpu_count() or 1)
@@ -2603,7 +2830,7 @@ def stack_frames_cpu_tiled_from_sequence(frames: List[np.ndarray], mode: str, si
 
     def compute_tile(y0: int, y1: int) -> Tuple[int, int, np.ndarray]:
         tile = np.stack([np.asarray(frame[y0:y1, ...], dtype=np.float32) for frame in frames], axis=0)
-        tile_result = stack_frames_cpu(tile, mode, sigma)
+        tile_result = stack_frames_cpu(tile, mode, sigma, require_majority_coverage=require_majority_coverage)
         return y0, y1, tile_result
 
     if workers <= 1 or len(tile_ranges) <= 1:
@@ -2693,21 +2920,26 @@ def mps_available() -> bool:
         return False
 
 
-def stack_frames_cpu(arr: np.ndarray, mode: str, sigma: float) -> np.ndarray:
+def stack_frames_cpu(arr: np.ndarray, mode: str, sigma: float, require_majority_coverage: bool = False) -> np.ndarray:
     use_nan = not np.isfinite(arr).all()
+    counts = np.sum(np.isfinite(arr), axis=0) if use_nan else np.full(arr.shape[1:], arr.shape[0], dtype=np.int32)
     if mode == "median":
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             result = np.nanmedian(arr, axis=0) if use_nan else np.median(arr, axis=0)
-        return np.nan_to_num(result, nan=0.0).astype(np.float32)
+        result = np.nan_to_num(result, nan=0.0).astype(np.float32)
+        return apply_numpy_minimum_coverage(result, counts, arr.shape[0], require_majority_coverage)
     if mode == "mean":
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             result = np.nanmean(arr, axis=0) if use_nan else np.mean(arr, axis=0)
-        return np.nan_to_num(result, nan=0.0).astype(np.float32)
+        result = np.nan_to_num(result, nan=0.0).astype(np.float32)
+        return apply_numpy_minimum_coverage(result, counts, arr.shape[0], require_majority_coverage)
     if mode == "high_rejection":
-        return high_rejection_mean(arr, sigma)
-    return sigma_clip_mean(arr, sigma)
+        result = high_rejection_mean(arr, sigma)
+        return apply_numpy_minimum_coverage(result, counts, arr.shape[0], require_majority_coverage)
+    result = sigma_clip_mean(arr, sigma)
+    return apply_numpy_minimum_coverage(result, counts, arr.shape[0], require_majority_coverage)
 
 
 def cpu_stack_tile_worker_count(tile_temp_bytes: int, tile_count: int, available: int) -> int:
@@ -2724,21 +2956,27 @@ def cpu_stack_tile_worker_count(tile_temp_bytes: int, tile_count: int, available
     return max(1, min(desired, max_by_memory))
 
 
-def stack_frames_torch_tensor(tensor, mode: str, sigma: float):
+def stack_frames_torch_tensor(tensor, mode: str, sigma: float, require_majority_coverage: bool = False):
     valid = torch.isfinite(tensor)
     zero = torch.zeros((), dtype=tensor.dtype, device=tensor.device)
     safe_tensor = torch.where(valid, tensor, zero)
     counts = valid.sum(dim=0)
     safe_counts = torch.clamp(counts, min=1).to(dtype=tensor.dtype)
+    min_count = minimum_valid_stack_count(int(tensor.shape[0]), require_majority_coverage)
+
+    def apply_min_coverage(result):
+        if not require_majority_coverage:
+            return result
+        return torch.where(counts >= min_count, result, zero)
 
     if mode == "mean":
         result = safe_tensor.sum(dim=0) / safe_counts
-        return torch.where(counts > 0, result, zero)
+        return apply_min_coverage(torch.where(counts > 0, result, zero))
 
     median = torch.nanmedian(tensor, dim=0).values
     median_safe = torch.nan_to_num(median, nan=0.0)
     if mode == "median":
-        return median_safe
+        return apply_min_coverage(median_safe)
 
     if mode == "high_rejection":
         robust_sigma = torch.nanmedian(torch.abs(tensor - median), dim=0).values * 1.4826
@@ -2747,7 +2985,7 @@ def stack_frames_torch_tensor(tensor, mode: str, sigma: float):
         accepted_counts = keep.sum(dim=0)
         summed = torch.where(keep, tensor, zero).sum(dim=0)
         safe_accepted_counts = torch.clamp(accepted_counts, min=1).to(dtype=tensor.dtype)
-        return torch.where(accepted_counts > 0, summed / safe_accepted_counts, median_safe)
+        return apply_min_coverage(torch.where(accepted_counts > 0, summed / safe_accepted_counts, median_safe))
 
     mean = safe_tensor.sum(dim=0) / safe_counts
     centered = torch.where(valid, tensor - mean, zero)
@@ -2757,7 +2995,7 @@ def stack_frames_torch_tensor(tensor, mode: str, sigma: float):
     summed = torch.where(keep, tensor, zero).sum(dim=0)
     safe_accepted_counts = torch.clamp(accepted_counts, min=1).to(dtype=tensor.dtype)
     result = summed / safe_accepted_counts
-    return torch.where(accepted_counts > 0, result, median_safe)
+    return apply_min_coverage(torch.where(accepted_counts > 0, result, median_safe))
 
 
 def stack_frames_mps(arr: np.ndarray, mode: str, sigma: float) -> np.ndarray:
@@ -2854,25 +3092,31 @@ def stack_frames_gpu(arr: np.ndarray, mode: str, sigma: float) -> np.ndarray:
 
     with cp.cuda.Device(0):
         gpu_arr = cp.asarray(arr, dtype=cp.float32)
+        valid = cp.isfinite(gpu_arr)
         if mode == "median":
-            result = cp.median(gpu_arr, axis=0)
+            result = cp.nanmedian(gpu_arr, axis=0)
         elif mode == "mean":
-            result = cp.mean(gpu_arr, axis=0)
+            counts = cp.sum(valid, axis=0)
+            summed = cp.sum(cp.where(valid, gpu_arr, cp.float32(0.0)), axis=0)
+            result = cp.where(counts > 0, summed / cp.maximum(counts, 1), cp.float32(0.0))
         elif mode == "high_rejection":
-            median = cp.median(gpu_arr, axis=0)
-            robust_sigma = cp.median(cp.abs(gpu_arr - median), axis=0) * cp.float32(1.4826) + cp.float32(1e-6)
-            keep = gpu_arr <= median + cp.float32(max(0.5, float(sigma))) * robust_sigma
+            median = cp.nanmedian(gpu_arr, axis=0)
+            median_safe = cp.nan_to_num(median, nan=0.0)
+            robust_sigma = cp.nanmedian(cp.abs(gpu_arr - median), axis=0) * cp.float32(1.4826)
+            robust_sigma = cp.nan_to_num(robust_sigma, nan=0.0) + cp.float32(1e-6)
+            keep = valid & (gpu_arr <= median + cp.float32(max(0.5, float(sigma))) * robust_sigma)
             counts = cp.sum(keep, axis=0)
             summed = cp.sum(cp.where(keep, gpu_arr, cp.float32(0.0)), axis=0)
-            result = cp.where(counts > 0, summed / cp.maximum(counts, 1), median)
+            result = cp.where(counts > 0, summed / cp.maximum(counts, 1), median_safe)
         else:
-            median = cp.median(gpu_arr, axis=0)
-            std = cp.std(gpu_arr, axis=0) + cp.float32(1e-6)
-            keep = cp.abs(gpu_arr - median) <= cp.float32(float(sigma)) * std
-            masked = cp.where(keep, gpu_arr, cp.nan)
-            result = cp.nanmean(masked, axis=0)
-            result = cp.where(cp.isnan(result), median, result)
-        result = cp.clip(result, 0, 1).astype(cp.float32)
+            median = cp.nanmedian(gpu_arr, axis=0)
+            median_safe = cp.nan_to_num(median, nan=0.0)
+            std = cp.nanstd(gpu_arr, axis=0) + cp.float32(1e-6)
+            keep = valid & (cp.abs(gpu_arr - median) <= cp.float32(float(sigma)) * std)
+            counts = cp.sum(keep, axis=0)
+            summed = cp.sum(cp.where(keep, gpu_arr, cp.float32(0.0)), axis=0)
+            result = cp.where(counts > 0, summed / cp.maximum(counts, 1), median_safe)
+        result = cp.clip(cp.nan_to_num(result, nan=0.0), 0, 1).astype(cp.float32)
         out = cp.asnumpy(result)
 
     try:
@@ -2940,7 +3184,7 @@ def stack_frames_gpu_tiled(arr: np.ndarray, mode: str, sigma: float, free_mem: i
     return result_cpu.astype(np.float32)
 
 
-def stack_frames_gpu_tiled_from_sequence(frames: List[np.ndarray], mode: str, sigma: float, progress_callback=None) -> np.ndarray:
+def stack_frames_gpu_tiled_from_sequence(frames: List[np.ndarray], mode: str, sigma: float, progress_callback=None, require_majority_coverage: bool = False) -> np.ndarray:
     """Upload row tiles directly from aligned frames instead of building a full RAM stack."""
     if cp is None:
         raise RuntimeError("CuPy neni nainstalovane.")
@@ -2972,12 +3216,12 @@ def stack_frames_gpu_tiled_from_sequence(frames: List[np.ndarray], mode: str, si
             host_tile = np.stack([np.asarray(frame[y0:y1, ...], dtype=np.float32) for frame in frames], axis=0)
             tile = cp.asarray(host_tile, dtype=cp.float32)
             valid = cp.isfinite(tile)
+            coverage_counts = cp.sum(valid, axis=0)
             if mode == "median":
                 tile_result = cp.nanmedian(tile, axis=0)
             elif mode == "mean":
-                counts = cp.sum(valid, axis=0)
                 summed = cp.sum(cp.where(valid, tile, cp.float32(0.0)), axis=0)
-                tile_result = cp.where(counts > 0, summed / cp.maximum(counts, 1), cp.float32(0.0))
+                tile_result = cp.where(coverage_counts > 0, summed / cp.maximum(coverage_counts, 1), cp.float32(0.0))
             elif mode == "high_rejection":
                 median = cp.nanmedian(tile, axis=0)
                 median_safe = cp.nan_to_num(median, nan=0.0)
@@ -2996,6 +3240,9 @@ def stack_frames_gpu_tiled_from_sequence(frames: List[np.ndarray], mode: str, si
                 summed = cp.sum(cp.where(keep, tile, cp.float32(0.0)), axis=0)
                 tile_result = cp.where(counts > 0, summed / cp.maximum(counts, 1), median_safe)
 
+            if require_majority_coverage:
+                min_count = minimum_valid_stack_count(n, True)
+                tile_result = cp.where(coverage_counts >= min_count, tile_result, cp.float32(0.0))
             tile_result = cp.clip(cp.nan_to_num(tile_result, nan=0.0), 0, 1).astype(cp.float32)
             result_cpu[y0:y1, ...] = cp.asnumpy(tile_result)
             del host_tile, tile, tile_result
@@ -3009,7 +3256,7 @@ def stack_frames_gpu_tiled_from_sequence(frames: List[np.ndarray], mode: str, si
     return result_cpu.astype(np.float32)
 
 
-def stack_frames_mps_tiled_from_sequence(frames: List[np.ndarray], mode: str, sigma: float, progress_callback=None) -> np.ndarray:
+def stack_frames_mps_tiled_from_sequence(frames: List[np.ndarray], mode: str, sigma: float, progress_callback=None, require_majority_coverage: bool = False) -> np.ndarray:
     """Upload row tiles directly from aligned frames to Apple Metal/MPS."""
     if torch is None:
         raise RuntimeError("PyTorch neni nainstalovany.")
@@ -3034,7 +3281,7 @@ def stack_frames_mps_tiled_from_sequence(frames: List[np.ndarray], mode: str, si
             y1 = min(h, y0 + rows_per_tile)
             host_tile = np.stack([np.asarray(frame[y0:y1, ...], dtype=np.float32) for frame in frames], axis=0)
             tile = torch.from_numpy(np.ascontiguousarray(host_tile)).to(device)
-            tile_result = stack_frames_torch_tensor(tile, mode, sigma)
+            tile_result = stack_frames_torch_tensor(tile, mode, sigma, require_majority_coverage=require_majority_coverage)
             tile_result = torch.clamp(tile_result, 0, 1).to(dtype=torch.float32)
             result_cpu[y0:y1, ...] = tile_result.cpu().numpy()
             del host_tile, tile, tile_result
@@ -3056,6 +3303,7 @@ def stack_aligned_frames(aligned: List[np.ndarray], settings: StackSettings, pro
     use_tiled_cpu, required_bytes, available_bytes = should_stack_tiled_on_cpu(first_shape, len(aligned), settings.stack_mode)
     mosaic_mode = bool(getattr(settings, "mosaic_mode", False))
     use_gpu = bool(getattr(settings, "use_gpu", False))
+    require_majority_coverage = not mosaic_mode
 
     if not use_gpu:
         if mosaic_mode:
@@ -3067,11 +3315,18 @@ def stack_aligned_frames(aligned: List[np.ndarray], settings: StackSettings, pro
                 settings.sigma,
                 progress_callback,
                 force_tiled=True,
+                require_majority_coverage=False,
             )
         if settings.stack_mode == "mean":
             if progress_callback:
                 progress_callback(80, "Skladam prumer na CPU po blocich RAM...")
-            return stack_frames_cpu_tiled_from_sequence(aligned, settings.stack_mode, settings.sigma, progress_callback)
+            return stack_frames_cpu_tiled_from_sequence(
+                aligned,
+                settings.stack_mode,
+                settings.sigma,
+                progress_callback,
+                require_majority_coverage=require_majority_coverage,
+            )
 
         # Robust rejection modes need access to all frames per pixel. Process
         # row tiles directly from the aligned list so we do not spend a long,
@@ -3079,7 +3334,13 @@ def stack_aligned_frames(aligned: List[np.ndarray], settings: StackSettings, pro
         if use_tiled_cpu or len(aligned) > 8 or settings.stack_mode in {"median", "sigma", "high_rejection"}:
             if progress_callback:
                 progress_callback(80, "Skladam na CPU po blocich RAM...")
-            return stack_frames_cpu_tiled_from_sequence(aligned, settings.stack_mode, settings.sigma, progress_callback)
+            return stack_frames_cpu_tiled_from_sequence(
+                aligned,
+                settings.stack_mode,
+                settings.sigma,
+                progress_callback,
+                require_majority_coverage=require_majority_coverage,
+            )
 
         try:
             if progress_callback:
@@ -3088,10 +3349,16 @@ def stack_aligned_frames(aligned: List[np.ndarray], settings: StackSettings, pro
         except MemoryError:
             if progress_callback:
                 progress_callback(80, "RAM ochrana: nedostatek pameti pro cely stack, skladam po castech...")
-            return stack_frames_cpu_tiled_from_sequence(aligned, settings.stack_mode, settings.sigma, progress_callback)
+            return stack_frames_cpu_tiled_from_sequence(
+                aligned,
+                settings.stack_mode,
+                settings.sigma,
+                progress_callback,
+                require_majority_coverage=require_majority_coverage,
+            )
         if progress_callback:
             progress_callback(80, "Skladam snimky...")
-        return stack_frames_cpu(arr, settings.stack_mode, settings.sigma)
+        return stack_frames_cpu(arr, settings.stack_mode, settings.sigma, require_majority_coverage=require_majority_coverage)
 
     gpu_failed_message = None
     gpu_unavailable_detail = ""
@@ -3099,7 +3366,13 @@ def stack_aligned_frames(aligned: List[np.ndarray], settings: StackSettings, pro
         if progress_callback:
             progress_callback(80, "Posilam stack po blocich primo do GPU (CUDA/CuPy)...")
         try:
-            return stack_frames_gpu_tiled_from_sequence(aligned, settings.stack_mode, settings.sigma, progress_callback)
+            return stack_frames_gpu_tiled_from_sequence(
+                aligned,
+                settings.stack_mode,
+                settings.sigma,
+                progress_callback,
+                require_majority_coverage=require_majority_coverage,
+            )
         except Exception as exc:
             gpu_failed_message = str(exc).splitlines()[0]
             log_debug(f"GPU stack failed:\n{traceback.format_exc()}")
@@ -3115,7 +3388,13 @@ def stack_aligned_frames(aligned: List[np.ndarray], settings: StackSettings, pro
         if progress_callback:
             progress_callback(80, "Posilam stack po blocich primo do GPU (Apple Metal/MPS)...")
         try:
-            return stack_frames_mps_tiled_from_sequence(aligned, settings.stack_mode, settings.sigma, progress_callback)
+            return stack_frames_mps_tiled_from_sequence(
+                aligned,
+                settings.stack_mode,
+                settings.sigma,
+                progress_callback,
+                require_majority_coverage=require_majority_coverage,
+            )
         except Exception as exc:
             gpu_failed_message = str(exc).splitlines()[0]
             log_debug(f"MPS stack failed:\n{traceback.format_exc()}")
@@ -3144,6 +3423,7 @@ def stack_aligned_frames(aligned: List[np.ndarray], settings: StackSettings, pro
         settings.sigma,
         progress_callback,
         force_tiled=mosaic_mode,
+        require_majority_coverage=require_majority_coverage,
     )
 
 
@@ -3367,6 +3647,168 @@ def detect_satellite_trail_from_gray(gray: np.ndarray) -> Dict[str, float]:
     except Exception as exc:
         log_debug(f"Satellite trail detection failed: {exc}")
         return {"satellite_trail": 0.0, "trail_score": 0.0, "trail_count": 0.0}
+
+
+def satellite_trail_mask_from_gray(gray: np.ndarray, confirmed: bool = False) -> Optional[np.ndarray]:
+    """Return a full-resolution mask for a confirmed long satellite trail.
+
+    The existing conservative trail detector decides whether a frame is
+    suspicious. Only then do we locate the dominant line and create a slightly
+    wider mask that also covers the trail halo. Masked pixels are excluded from
+    integration as NaN; the rest of the frame remains usable.
+    """
+    if not confirmed:
+        metrics = detect_satellite_trail_from_gray(gray)
+        if float(metrics.get("satellite_trail", 0.0)) < 0.5:
+            return None
+
+    try:
+        source = np.asarray(gray, dtype=np.float32)
+        source_h, source_w = source.shape[:2]
+        preview = frame_quality_preview_gray(source, center_fraction=1.0, max_edge=1100)
+        finite = np.isfinite(preview)
+        if preview.ndim != 2 or not np.any(finite):
+            return None
+
+        values = preview[finite]
+        lo = float(np.percentile(values, 5.0))
+        hi = float(np.percentile(values, 99.8))
+        if hi <= lo + 1e-8:
+            return None
+        norm = np.clip((preview - lo) / (hi - lo), 0.0, 1.0)
+        h, w = norm.shape[:2]
+
+        blur_size = min(61, max(21, int(round(min(h, w) / 28.0)) | 1))
+        background = cv2.medianBlur((norm * 255).astype(np.uint8), blur_size).astype(np.float32) / 255.0
+        residual = np.clip(norm - background, 0.0, 1.0)
+        residual_values = residual[np.isfinite(residual)]
+        threshold = max(
+            float(np.percentile(residual_values, 99.25)),
+            float(residual_values.mean() + 2.7 * residual_values.std()),
+            0.042,
+        )
+        candidate = (residual > threshold).astype(np.uint8) * 255
+        candidate = cv2.morphologyEx(
+            candidate,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=1,
+        )
+        edges = cv2.Canny(candidate, 18, 72)
+
+        min_len = max(70, int(round(min(h, w) * 0.25)))
+        lines = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 360.0,
+            threshold=max(20, int(round(min(h, w) * 0.035))),
+            minLineLength=min_len,
+            maxLineGap=3,
+        )
+
+        best_line = None
+        best_score = -1.0
+        if lines is not None:
+            support_thickness = max(3, int(round(min(h, w) / 260.0)))
+            for x1, y1, x2, y2 in lines[:, 0, :]:
+                length = float(math.hypot(int(x2) - int(x1), int(y2) - int(y1)))
+                if length < min_len:
+                    continue
+                probe = np.zeros((h, w), dtype=np.uint8)
+                cv2.line(probe, (int(x1), int(y1)), (int(x2), int(y2)), 255, support_thickness)
+                support = float(np.count_nonzero(cv2.bitwise_and(candidate, probe)))
+                mean_residual = float(cv2.mean(residual, mask=probe)[0])
+                score = length * (1.0 + support / max(1.0, length)) * (1.0 + mean_residual)
+                if score > best_score:
+                    best_score = score
+                    best_line = (int(x1), int(y1), int(x2), int(y2))
+
+        if best_line is None:
+            standard_lines = cv2.HoughLines(
+                edges,
+                1,
+                np.pi / 360.0,
+                threshold=max(48, int(round(min(h, w) * 0.085))),
+            )
+            if standard_lines is None:
+                return None
+            rho, theta = [float(v) for v in standard_lines[0, 0, :]]
+            a = math.cos(theta)
+            b = math.sin(theta)
+            x0 = a * rho
+            y0 = b * rho
+            span = int(math.ceil(math.hypot(w, h) * 1.5))
+            best_line = (
+                int(round(x0 + span * (-b))),
+                int(round(y0 + span * a)),
+                int(round(x0 - span * (-b))),
+                int(round(y0 - span * a)),
+            )
+
+        # HoughLinesP usually returns only the brightest continuous segment of
+        # a trail. Extend its direction beyond both endpoints so the exclusion
+        # mask covers the complete straight trail across the frame.
+        x1, y1, x2, y2 = best_line
+        dx = float(x2 - x1)
+        dy = float(y2 - y1)
+        line_length = math.hypot(dx, dy)
+        if line_length > 1e-6:
+            ux = dx / line_length
+            uy = dy / line_length
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+            span = float(math.hypot(w, h) * 1.5)
+            best_line = (
+                int(round(cx - ux * span)),
+                int(round(cy - uy * span)),
+                int(round(cx + ux * span)),
+                int(round(cy + uy * span)),
+            )
+
+        mask_preview = np.zeros((h, w), dtype=np.uint8)
+        halo_width = max(7, int(round(min(h, w) / 115.0)))
+        cv2.line(
+            mask_preview,
+            (best_line[0], best_line[1]),
+            (best_line[2], best_line[3]),
+            255,
+            halo_width,
+            cv2.LINE_AA,
+        )
+        mask_preview = cv2.dilate(
+            mask_preview,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1,
+        )
+        full_mask = cv2.resize(mask_preview, (source_w, source_h), interpolation=cv2.INTER_NEAREST)
+        return full_mask > 0
+    except Exception as exc:
+        log_debug(f"Satellite trail mask creation failed: {exc}")
+        return None
+
+
+def apply_warped_exclusion_mask(
+    img: np.ndarray,
+    source_mask: Optional[np.ndarray],
+    matrix: np.ndarray,
+    output_shape: Tuple[int, int],
+) -> np.ndarray:
+    """Warp a source-space exclusion mask and mark matching output pixels NaN."""
+    if source_mask is None or not np.any(source_mask):
+        return np.asarray(img, dtype=np.float32)
+    warped_mask = warp_to_reference(
+        np.asarray(source_mask, dtype=np.float32),
+        matrix,
+        output_shape,
+        border_value=0.0,
+    )
+    excluded = warped_mask > 0.05
+    out = np.asarray(img, dtype=np.float32).copy()
+    if out.ndim == 3:
+        out[excluded, :] = np.nan
+    else:
+        out[excluded] = np.nan
+    return out
 
 
 def frame_quality_score_from_gray(gray: np.ndarray) -> float:
@@ -3711,6 +4153,7 @@ def alignment_cache_key(path: Path, reference_path: Path, settings: StackSetting
         int(getattr(settings, "max_comet_shift", 0)),
         int(getattr(settings, "star_border_margin", 0)),
         bool(getattr(settings, "strict_star_filter", True)),
+        bool(getattr(settings, "satellite_trail_filter", False)),
         bool(getattr(settings, "comet_refine", True)),
         int(getattr(settings, "comet_refine_patch", 0)),
         int(getattr(settings, "comet_refine_search", 0)),
@@ -4569,78 +5012,14 @@ def prepare_paths_for_alignment_mode(folder: Path, settings: StackSettings, prog
     return paths, reference_path, scores, sequence_paths
 
 
-def stack_folder_sequential_star(folder: Path, settings: StackSettings, progress_callback=None) -> np.ndarray:
-    set_bayer_pattern_override(getattr(settings, "bayer_pattern", "auto"))
-    flat_frame, bias_frame, dark_frame = load_calibration_frames(settings, progress_callback)
-    paths, reference_path, scores, sequence_paths = prepare_paths_for_alignment_mode(folder, settings, progress_callback)
-
-    sequence_index = {str(p.resolve()): i for i, p in enumerate(sequence_paths)}
-    ordered_paths = sorted(paths, key=lambda p: sequence_index.get(str(p.resolve()), 10**9))
-    if reference_path not in ordered_paths:
-        ordered_paths.insert(0, reference_path)
-    ref_idx = ordered_paths.index(reference_path)
-
-    reference = load_calibrated_image_as_float(reference_path, flat_frame, bias_frame, dark_frame)
-    h, w = reference.shape[:2]
-    reference_gray = to_gray_float(reference)
-    reference_median = np.median(reference.reshape(-1, 3), axis=0)
-    identity = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
-
-    aligned_by_path: Dict[Path, np.ndarray] = {reference_path: reference}
-    used_paths: List[Path] = [reference_path]
-    total = len(ordered_paths)
-
-    def load_calibrated(path: Path) -> np.ndarray:
-        img = load_calibrated_image_as_float(path, flat_frame, bias_frame, dark_frame)
-        if img.shape[:2] != (h, w):
-            img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
-        return img
-
-    def process_side(side_paths: List[Path], reverse_label: bool = False) -> None:
-        nonlocal used_paths
-        parent_gray = reference_gray
-        parent_to_ref = identity
-        for local_idx, path in enumerate(side_paths, start=1):
-            img = load_calibrated(path)
-            moving_gray = to_gray_float(img)
-            local_matrix = estimate_star_affine(
-                parent_gray,
-                moving_gray,
-                settings.downscale_for_alignment,
-                settings.max_star_shift,
-                settings.star_border_margin,
-                settings.strict_star_filter,
-                allow_fallback=False,
-            )
-            if local_matrix is None:
-                if progress_callback:
-                    progress_callback(10 + int(len(used_paths) / max(1, total) * 60), f"Vyřazuji bez postupného star alignmentu: {path.name}")
-                continue
-
-            matrix_to_ref = compose_affine(parent_to_ref, local_matrix)
-            warped = warp_to_reference(img, matrix_to_ref, (h, w))
-            if settings.normalize_background:
-                warped = normalize_background(warped, reference_median)
-            aligned_by_path[path] = warped
-            used_paths.append(path)
-            parent_gray = moving_gray
-            parent_to_ref = matrix_to_ref
-            if progress_callback:
-                direction = "zpět" if reverse_label else "vpřed"
-                progress_callback(10 + int(len(used_paths) / max(1, total) * 60), f"Postupné zarovnání {direction} ({local_idx}/{len(side_paths)}): {path.name}")
-
-    process_side(ordered_paths[ref_idx + 1:], reverse_label=False)
-    process_side(list(reversed(ordered_paths[:ref_idx])), reverse_label=True)
-
-    aligned = [aligned_by_path[p] for p in ordered_paths if p in aligned_by_path]
-    if not aligned:
-        raise ValueError("Žádný snímek neprošel postupným zarovnáním.")
-
-    refresh_last_stack_selection_after_alignment(used_paths)
-    result = stack_aligned_frames(aligned, settings, progress_callback)
-    if progress_callback:
-        progress_callback(100, "Hotovo")
-    return np.clip(result, 0, 1)
+def selected_satellite_trail_paths() -> set:
+    """Return resolved paths marked as trail suspects by the quality pass."""
+    metrics = LAST_STACK_SELECTION.get("quality_metrics", {})
+    return {
+        str(path)
+        for path, values in metrics.items()
+        if isinstance(values, dict) and float(values.get("satellite_trail", 0.0)) >= 0.5
+    }
 
 
 def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) -> Optional[np.ndarray]:
@@ -4657,10 +5036,10 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
         )
         return None
 
-    if settings.align_mode == "star_affine" and getattr(settings, "sequential_alignment", False) and not getattr(settings, "mosaic_mode", False):
-        return stack_folder_sequential_star(folder, settings, progress_callback)
-
     paths, reference_path, scores, sequence_paths = prepare_paths_for_alignment_mode(folder, settings, progress_callback)
+    satellite_trail_paths = selected_satellite_trail_paths()
+    if bool(getattr(settings, "satellite_trail_filter", False)):
+        LAST_STACK_SELECTION["satellite_masked_paths"] = sorted(satellite_trail_paths)
 
     reference = load_calibrated_image_as_float(reference_path, flat_frame, bias_frame, dark_frame)
     h, w = reference.shape[:2]
@@ -4668,7 +5047,7 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
     reference_median = np.median(reference.reshape(-1, 3), axis=0)
 
     aligned: List[np.ndarray] = []
-    mosaic_records: List[Tuple[Path, np.ndarray, np.ndarray]] = []
+    mosaic_records: List[Tuple[Path, np.ndarray, np.ndarray, Optional[np.ndarray]]] = []
     used_paths: List[Path] = []
     total = len(paths)
 
@@ -4686,6 +5065,15 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
         img = load_calibrated_image_as_float(path, flat_frame, bias_frame, dark_frame)
         if img.shape[:2] != (h, w):
             img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+        trail_mask = None
+        if (
+            bool(getattr(settings, "satellite_trail_filter", False))
+            and settings.align_mode != "calibration"
+            and str(path.resolve()) in satellite_trail_paths
+        ):
+            trail_mask = satellite_trail_mask_from_gray(to_gray_float(img), confirmed=True)
+            if trail_mask is not None:
+                log_debug(f"Satellite trail masked: {path}")
 
         if path == reference_path or settings.align_mode == "calibration":
             # Kalibrační snímky skládáme pixel na pixel bez zarovnání.
@@ -4715,6 +5103,9 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
                 warped = img
             else:
                 warped = warp_to_reference(img, matrix, (h, w))
+                warped = mark_invalid_warp_pixels(warped, matrix, (h, w))
+        if not getattr(settings, "mosaic_mode", False):
+            warped = apply_warped_exclusion_mask(warped, trail_mask, matrix, (h, w))
 
         if settings.normalize_background and not getattr(settings, "mosaic_mode", False):
             warped = normalize_background(warped, reference_median)
@@ -4724,7 +5115,7 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
         if getattr(settings, "mosaic_mode", False):
             if settings.normalize_background:
                 img = normalize_background(img, reference_median)
-            mosaic_records.append((path, img, matrix))
+            mosaic_records.append((path, img, matrix, trail_mask))
         else:
             aligned.append(warped)
         used_paths.append(path)
@@ -4751,12 +5142,12 @@ def apply_scnr_green(img: np.ndarray, strength: int = 0) -> np.ndarray:
     strength:
     0 = vypnuto
     1 = velmi jemné
-    5 = silné
+    10 = silné
 
     Princip: když je G kanál vyšší než průměr R/B, stáhne se směrem k R/B.
     Nepřepisuje červený ani modrý kanál.
     """
-    strength = int(max(0, min(5, strength)))
+    strength = int(max(0, min(10, strength)))
     if strength <= 0:
         return img
 
@@ -4768,8 +5159,8 @@ def apply_scnr_green(img: np.ndarray, strength: int = 0) -> np.ndarray:
     # Cíl pro zelený kanál: robustní průměr R/B.
     rb = 0.5 * (r + b)
 
-    # Míra zásahu: 1..5 -> 20..100 %
-    amount = strength / 5.0
+    # Míra zásahu: 1..10 -> 10..100 %
+    amount = strength / 10.0
 
     # Pouze tam, kde je zelená nad R/B, ji stáhneme.
     g_new = np.where(g > rb, g * (1.0 - amount) + rb * amount, g)
@@ -5007,9 +5398,9 @@ def apply_polynomial_gradient_removal(img: np.ndarray) -> np.ndarray:
 def apply_astro_denoise(img: np.ndarray, strength: float = 0.0) -> np.ndarray:
     """Preview/export denoise that protects stars and bright nebula detail.
 
-    This is intentionally conservative: it smooths low-contrast background and
-    chroma noise, while a luminance/edge mask keeps stars and sharper structure
-    close to the original stretched image.
+    This is intentionally conservative: it smooths low-contrast background,
+    plus stronger color speckle noise in chroma channels, while a luminance/edge
+    mask keeps stars and sharper structure close to the original stretched image.
     """
     amount = max(0.0, min(1.0, float(strength)))
     arr = np.asarray(img, dtype=np.float32)
@@ -5053,14 +5444,41 @@ def apply_astro_denoise(img: np.ndarray, strength: float = 0.0) -> np.ndarray:
     sigma_color = 0.018 + amount * 0.055
     sigma_space = 1.2 + amount * 3.8
     lum_denoised = cv2.bilateralFilter(lum, d=0, sigmaColor=sigma_color, sigmaSpace=sigma_space)
-    # Chroma denoise: smooth color residuals more than luminance.
-    chroma = work - lum[..., None]
-    chroma_sigma = 0.6 + amount * 2.4
-    chroma_smooth = cv2.GaussianBlur(chroma, (0, 0), chroma_sigma)
-    denoised = lum_denoised[..., None] + chroma_smooth
 
-    blend = amount * (1.0 - 0.90 * protect)
-    out = work * (1.0 - blend[..., None]) + denoised * blend[..., None]
+    # Chroma denoise: operate in Lab so random red/green/blue speckles can be
+    # reduced without flattening the luminance detail that defines stars and
+    # nebula structure. Median catches isolated color pixels, bilateral keeps
+    # broad color transitions, and a wider Gaussian removes fine chroma grain.
+    try:
+        lab = cv2.cvtColor(work, cv2.COLOR_RGB2LAB).astype(np.float32)
+        chroma = lab[..., 1:3]
+        chroma_med = np.empty_like(chroma)
+        for c in range(2):
+            chroma_med[..., c] = cv2.medianBlur(chroma[..., c], 3)
+        chroma_bilateral = cv2.bilateralFilter(
+            chroma_med,
+            d=0,
+            sigmaColor=4.0 + amount * 16.0,
+            sigmaSpace=1.5 + amount * 5.0,
+        )
+        chroma_blur = cv2.GaussianBlur(chroma_bilateral, (0, 0), 0.9 + amount * 3.2)
+        lab_smooth = lab.copy()
+        chroma_blend = np.clip(amount * 1.25 * (1.0 - 0.70 * protect), 0.0, 1.0)
+        lab_smooth[..., 1:3] = (
+            lab[..., 1:3] * (1.0 - chroma_blend[..., None])
+            + chroma_blur * chroma_blend[..., None]
+        )
+        chroma_denoised = np.clip(cv2.cvtColor(lab_smooth, cv2.COLOR_LAB2RGB), 0, 1).astype(np.float32)
+    except Exception:
+        chroma_residual = work - lum[..., None]
+        chroma_smooth = cv2.GaussianBlur(chroma_residual, (0, 0), 0.9 + amount * 3.2)
+        chroma_blend = np.clip(amount * 1.15 * (1.0 - 0.70 * protect), 0.0, 1.0)
+        chroma_denoised = work * (1.0 - chroma_blend[..., None]) + (lum[..., None] + chroma_smooth) * chroma_blend[..., None]
+
+    lum_mix = np.clip(amount * 0.75 * (1.0 - 0.92 * protect), 0.0, 1.0)
+    out_lum = lum * (1.0 - lum_mix) + lum_denoised * lum_mix
+    chroma_lum = (0.2126 * chroma_denoised[..., 0] + 0.7152 * chroma_denoised[..., 1] + 0.0722 * chroma_denoised[..., 2]).astype(np.float32)
+    out = chroma_denoised + (out_lum - chroma_lum)[..., None]
     return np.clip(out, 0, 1).astype(np.float32)
 
 
@@ -5087,11 +5505,20 @@ def apply_stretch(img: np.ndarray, s: StretchSettings) -> np.ndarray:
         out = out / (1.0 + c * out)
 
     # Jemná filmic / S-curve komprese highlightů.
-    # Pomáhá proti přepáleným hvězdám a jádrům galaxií.
+    # Pomáhá proti přepáleným hvězdám a jádrům galaxií. Normalizace se nesmí
+    # počítat z aktuálního minima/maxima obrazu, protože po cropu by se tím
+    # změnil význam Black/White/Gamma jezdců.
     k = 7.5
     midpoint = 0.38
+    curve_min = 1.0 / (1.0 + math.exp(-k * (0.0 - midpoint)))
+    curve_input_max = 1.0
+    if hc > 0:
+        c = hc * hc * 0.15
+        curve_input_max = 1.0 / (1.0 + c)
+    curve_max = 1.0 / (1.0 + math.exp(-k * (curve_input_max - midpoint)))
     out = 1.0 / (1.0 + np.exp(-k * (out - midpoint)))
-    out = (out - out.min()) / max(1e-6, (out.max() - out.min()))
+    out = (out - curve_min) / max(1e-6, (curve_max - curve_min))
+    out = np.clip(out, 0, 1)
 
     out = (out - 0.5) * s.contrast + 0.5
     out = np.clip(out, 0, 1)
@@ -5599,6 +6026,16 @@ def process_single_image_mp(args: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
     )
     if img.shape[:2] != (h, w):
         img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+    trail_mask = None
+    satellite_trail_paths = set(context.get("satellite_trail_paths", ()))
+    if (
+        bool(getattr(settings, "satellite_trail_filter", False))
+        and settings.align_mode != "calibration"
+        and str(path.resolve()) in satellite_trail_paths
+    ):
+        trail_mask = satellite_trail_mask_from_gray(to_gray_float(img), confirmed=True)
+        if trail_mask is not None:
+            log_debug(f"Satellite trail masked: {path}")
 
     if path == reference_path or settings.align_mode == "calibration":
         # Kalibrační snímky skládáme pixel na pixel bez zarovnání.
@@ -5623,13 +6060,16 @@ def process_single_image_mp(args: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
             warped = img
         else:
             warped = warp_to_reference(img, matrix, (h, w))
+            warped = mark_invalid_warp_pixels(warped, matrix, (h, w))
+    if not getattr(settings, "mosaic_mode", False):
+        warped = apply_warped_exclusion_mask(warped, trail_mask, matrix, (h, w))
 
     if settings.normalize_background and not getattr(settings, "mosaic_mode", False):
         warped = normalize_background(warped, reference_median)
     if getattr(settings, "mosaic_mode", False):
         if settings.normalize_background:
             img = normalize_background(img, reference_median)
-        return str(path), np.clip(img, 0, 1).astype(np.float32), np.asarray(matrix, dtype=np.float32)
+        return str(path), np.clip(img, 0, 1).astype(np.float32), np.asarray(matrix, dtype=np.float32), trail_mask
     if path != reference_path and settings.align_mode != "calibration":
         save_aligned_frame_cache(path, reference_path, settings, predicted_xy, warped)
 
@@ -5650,10 +6090,10 @@ def stack_folder_multiprocessing(folder: Path, settings: StackSettings, processe
         )
         return None
 
-    if settings.align_mode == "star_affine" and getattr(settings, "sequential_alignment", False) and not getattr(settings, "mosaic_mode", False):
-        return stack_folder_sequential_star(folder, settings, progress_callback)
-
     paths, reference_path, scores, sequence_paths = prepare_paths_for_alignment_mode(folder, settings, progress_callback)
+    satellite_trail_paths = selected_satellite_trail_paths()
+    if bool(getattr(settings, "satellite_trail_filter", False)):
+        LAST_STACK_SELECTION["satellite_masked_paths"] = sorted(satellite_trail_paths)
 
     cv2.setNumThreads(1)
 
@@ -5689,6 +6129,7 @@ def stack_folder_multiprocessing(folder: Path, settings: StackSettings, processe
         "flat_frame": flat_frame,
         "bias_frame": bias_frame,
         "dark_frame": dark_frame,
+        "satellite_trail_paths": tuple(sorted(satellite_trail_paths)),
     }
     tasks = [
         {
@@ -5699,7 +6140,7 @@ def stack_folder_multiprocessing(folder: Path, settings: StackSettings, processe
     ]
 
     aligned: List[np.ndarray] = []
-    mosaic_records: List[Tuple[Path, np.ndarray, np.ndarray]] = []
+    mosaic_records: List[Tuple[Path, np.ndarray, np.ndarray, Optional[np.ndarray]]] = []
     used_paths: List[Path] = []
 
     # Chunksize 1 dává plynulejší progress bar; pro velmi mnoho snímků lze zvýšit.
@@ -5711,8 +6152,8 @@ def stack_folder_multiprocessing(folder: Path, settings: StackSettings, processe
                     progress_callback(10 + int((idx + 1) / total * 60), f"Vyřazuji bez platného star alignmentu ({idx + 1}/{total}): {name}")
                 continue
             if getattr(settings, "mosaic_mode", False):
-                used_path, img, matrix = item
-                mosaic_records.append((Path(used_path), img, matrix))
+                used_path, img, matrix, trail_mask = item
+                mosaic_records.append((Path(used_path), img, matrix, trail_mask))
             else:
                 used_path, warped = item
                 aligned.append(warped)
@@ -5743,6 +6184,7 @@ class ClickableImageLabel(QLabel):
     obraz řeší hlavní okno podle aktuálního měřítka náhledu.
     """
     image_clicked = Signal(float, float)
+    crop_selected = Signal(float, float, float, float)
     image_double_clicked = Signal()
     wheel_zoomed = Signal(float, float, float)
     drag_started = Signal(float, float)
@@ -5756,14 +6198,63 @@ class ClickableImageLabel(QLabel):
         self._last_drag_global = None
         self._dragging = False
         self._marking_mode = False
+        self._crop_selection_mode = False
+        self._crop_start_pos = None
+        self._crop_current_pos = None
         self.setCursor(Qt.OpenHandCursor)
+
+    def _interaction_cursor(self):
+        if self._marking_mode or self._crop_selection_mode:
+            return Qt.CrossCursor
+        return Qt.OpenHandCursor
 
     def set_marking_mode(self, enabled: bool):
         self._marking_mode = bool(enabled)
-        self.setCursor(Qt.CrossCursor if self._marking_mode else Qt.OpenHandCursor)
+        if self._marking_mode:
+            self._crop_selection_mode = False
+            self._crop_start_pos = None
+            self._crop_current_pos = None
+            self.update()
+        self.setCursor(self._interaction_cursor())
+
+    def set_crop_selection_mode(self, enabled: bool):
+        self._crop_selection_mode = bool(enabled)
+        if self._crop_selection_mode:
+            self._marking_mode = False
+        self._crop_start_pos = None
+        self._crop_current_pos = None
+        self.setCursor(self._interaction_cursor())
+        self.update()
+
+    def _widget_to_pixmap_point(self, point, clamp: bool = False):
+        pixmap = self.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return None
+        pw = float(pixmap.width())
+        ph = float(pixmap.height())
+        ox = max(0.0, (self.width() - pw) / 2.0)
+        oy = max(0.0, (self.height() - ph) / 2.0)
+        px = float(point.x()) - ox
+        py = float(point.y()) - oy
+        if clamp:
+            px = max(0.0, min(pw, px))
+            py = max(0.0, min(ph, py))
+            return px, py
+        if 0 <= px < pw and 0 <= py < ph:
+            return px, py
+        return None
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            if self._crop_selection_mode:
+                if self._widget_to_pixmap_point(event.position()) is None:
+                    event.accept()
+                    return
+                self._crop_start_pos = event.position()
+                self._crop_current_pos = event.position()
+                self.update()
+                event.accept()
+                return
             self._press_pos = event.position()
             self._last_drag_pos = event.position()
             self._last_drag_global = event.globalPosition()
@@ -5778,6 +6269,11 @@ class ClickableImageLabel(QLabel):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._crop_selection_mode and self._crop_start_pos is not None:
+            self._crop_current_pos = event.position()
+            self.update()
+            event.accept()
+            return
         if self._press_pos is not None and not self._marking_mode:
             dx = float(event.position().x() - self._press_pos.x())
             dy = float(event.position().y() - self._press_pos.y())
@@ -5794,6 +6290,18 @@ class ClickableImageLabel(QLabel):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._crop_selection_mode:
+            start_pos = self._crop_start_pos
+            end_pos = event.position()
+            self._crop_start_pos = None
+            self._crop_current_pos = None
+            start = self._widget_to_pixmap_point(start_pos, clamp=True) if start_pos is not None else None
+            end = self._widget_to_pixmap_point(end_pos, clamp=True)
+            self.set_crop_selection_mode(False)
+            if start is not None and end is not None:
+                self.crop_selected.emit(float(start[0]), float(start[1]), float(end[0]), float(end[1]))
+            event.accept()
+            return
         if event.button() == Qt.LeftButton and self._press_pos is not None:
             was_dragging = self._dragging
             press_pos = self._press_pos
@@ -5801,7 +6309,7 @@ class ClickableImageLabel(QLabel):
             self._last_drag_pos = None
             self._last_drag_global = None
             self._dragging = False
-            self.setCursor(Qt.CrossCursor if self._marking_mode else Qt.OpenHandCursor)
+            self.setCursor(self._interaction_cursor())
             if not self._marking_mode:
                 self.drag_finished.emit()
             if was_dragging:
@@ -5822,7 +6330,7 @@ class ClickableImageLabel(QLabel):
                     self.image_clicked.emit(px, py)
                     event.accept()
                     return
-        self.setCursor(Qt.CrossCursor if self._marking_mode else Qt.OpenHandCursor)
+        self.setCursor(self._interaction_cursor())
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
@@ -5836,8 +6344,21 @@ class ClickableImageLabel(QLabel):
 
     def leaveEvent(self, event):
         if not self._dragging:
-            self.setCursor(Qt.CrossCursor if self._marking_mode else Qt.OpenHandCursor)
+            self.setCursor(self._interaction_cursor())
         super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._crop_selection_mode or self._crop_start_pos is None or self._crop_current_pos is None:
+            return
+        rect = QRectF(self._crop_start_pos, self._crop_current_pos).normalized()
+        if rect.width() < 2 or rect.height() < 2:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.fillRect(rect, QColor(80, 160, 255, 45))
+        painter.setPen(QPen(QColor(140, 205, 255), 2, Qt.DashLine))
+        painter.drawRect(rect)
 
     def _legacy_mousePressEvent(self, event):
         pixmap = self.pixmap()
@@ -6214,15 +6735,11 @@ class StackWorker(QThread):
             ("Konvertuji z Bayer masky", "Converting from Bayer pattern"),
             ("Vyřazuji bez platného star alignmentu", "Rejecting frame without valid star alignment"),
             ("Vyřazuji černý snímek bez hvězd", "Rejecting black frame without stars"),
-            ("Vyřazuji bez postupného star alignmentu", "Rejecting frame without sequential star alignment"),
-            ("Postupné zarovnání", "Sequential alignment"),
             ("Mozaika: vytvářím plátno", "Mosaic: creating canvas"),
             ("Mozaika: převádím snímky na plátno", "Mosaic: warping frames to canvas"),
             ("Mozaika: skládám paralelně na CPU po blocích RAM", "Mosaic: stacking in parallel on CPU in RAM tiles"),
             ("Mozaika by vytvořila podezřele velké plátno", "Mosaic would create a suspiciously large canvas"),
             ("Zkontroluj alignment nebo sniž maximální drift hvězd.", "Check alignment or reduce the maximum star drift."),
-            ("vpřed", "forward"),
-            ("zpět", "backward"),
             ("GPU vypocet selhal", "GPU computation failed"),
             ("pokracuji na CPU", "continuing on CPU"),
             ("skladam na CPU", "stacking on CPU"),
@@ -6230,7 +6747,6 @@ class StackWorker(QThread):
             ("CuPy nelze nacist", "CuPy cannot be loaded"),
             ("Hotovo", "Done"),
             ("Žádný snímek neprošel zarovnáním. Zkontroluj, zda složka Light neobsahuje Dark/Bias snímky nebo zda jsou ve snímcích detekovatelné hvězdy.", "No frame passed alignment. Check whether the Light folder contains Dark/Bias frames or whether detectable stars are present."),
-            ("Žádný snímek neprošel postupným zarovnáním.", "No frame passed sequential alignment."),
             ("Star + Comet výstupy vyžadují označení komety v prvním i posledním snímku.", "Star + Comet outputs require marking the comet in both the first and last frame."),
             ("Ve složce nejsou žádné FIT/FITS ani RAW snímky. Vypni volbu Pouze RAW, pokud chceš skládat i PNG/JPG/TIFF/BMP.", "The folder contains no FIT/FITS or RAW frames. Disable RAW only if you also want to stack PNG/JPG/TIFF/BMP files."),
             ("Ve složce nejsou žádné podporované obrázky. Podporované formáty zahrnují FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG a BMP.", "The folder contains no supported images. Supported formats include FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG and BMP."),
@@ -6294,6 +6810,40 @@ class FrameAnalysisWorker(QThread):
             self.failed.emit(message)
 
 
+class UpdateCheckWorker(QThread):
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, api_url: str, current_version: str, timeout_s: float = 6.0):
+        super().__init__()
+        self.api_url = api_url
+        self.current_version = current_version
+        self.timeout_s = float(timeout_s)
+
+    def run(self):
+        try:
+            request = urllib.request.Request(
+                self.api_url,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": f"Astro-Stacker/{APP_VERSION}",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            tag = str(payload.get("tag_name") or payload.get("name") or "").strip()
+            self.finished_ok.emit(
+                {
+                    "tag": tag,
+                    "url": str(payload.get("html_url") or GITHUB_RELEASES_PAGE_URL),
+                    "body": str(payload.get("body") or ""),
+                    "is_newer": is_newer_version(tag, self.current_version),
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class AstroStackerWindow(QMainWindow):
     TRANSLATIONS = {
         "cz": {
@@ -6310,8 +6860,6 @@ class AstroStackerWindow(QMainWindow):
             "review_frames": "Zkontrolovat snímky před skládáním",
             "manual_reference": "Použít aktuální snímek jako referenci",
             "manual_reference_tooltip": "Ručně zvolený referenční snímek. Automatická reference je vypnutá.",
-            "sequential_alignment": "Postupné zarovnání",
-            "sequential_alignment_tooltip": "Zarovnává sousední snímky postupně a skládá transformace k referenci. Pomáhá při velkém driftu mezi začátkem a koncem sekvence.",
             "mosaic_mode": "Mozaika - rozšířit plátno",
             "mosaic_mode_tooltip": "Rozšíří výsledné plátno podle polohy všech zarovnaných snímků. Vhodné pro mozaikové sekvence chytrých dalekohledů. Při zapnuté GPU volbě se mozaika skládá po dlaždicích VRAM; jinak použije paralelní CPU cestu.",
             "keep": "Ponechat", "max_star_drift": "Max. drift hvězd", "max_comet_move": "Max. pohyb komety",
@@ -6319,6 +6867,7 @@ class AstroStackerWindow(QMainWindow):
             "comet_search": "Hledání komety", "ignore_edge": "Ignorovat okraj",
             "strict_stars": "Přísný filtr hvězd", "bayer_fit": "Bayer FIT",
             "satellite_trail_filter": "Satelitní stopa",
+            "satellite_trail_tooltip": "Detekuje dlouhé rovné satelitní stopy, při skládání zamaskuje jejich pixely a podezřelé snímky označí v tabulce kvality.",
             "mark_comet_start": "Kometa první", "mark_comet_end": "Kometa poslední",
             "clear_comet_marks": "Kometa smaž",
             "clear_comet_marks_done": "Poloha komety byla smazána.",
@@ -6349,6 +6898,17 @@ class AstroStackerWindow(QMainWindow):
             "show_stacked": "Zobraz složený obraz",
             "show_stacked_tooltip": "Vrátí do náhledu původní složený obraz bez ořezu, neutralizace a vizuálních úprav.",
             "show_stacked_done": "Zobrazen původní složený obraz bez úprav.",
+            "undo": "Zpět",
+            "undo_tooltip": "Vrátí poslední úpravu náhledu zpět. Uchovává poslední dva kroky.",
+            "undo_empty": "Není co vrátit.",
+            "undo_done": "Vrácen předchozí stav náhledu.",
+            "check_updates": "Zkontrolovat aktualizace…",
+            "update_available_title": "Je dostupná nová verze",
+            "update_available_message": "Je dostupná nová verze Astro Stacker {version}.\n\nAktuální verze: {current}\n\nOtevřít stránku stažení?",
+            "update_current_title": "Astro Stacker je aktuální",
+            "update_current_message": "Používáš aktuální verzi Astro Stacker {current}.",
+            "update_failed_title": "Kontrola aktualizace selhala",
+            "update_failed_message": "Nepodařilo se zkontrolovat novou verzi:\n{error}",
             "clear_cache": "Smazat cache",
             "clear_cache_title": "Smazat cache",
             "clear_cache_message": "Smazat cache kvality a zarovnaných snímků?",
@@ -6358,6 +6918,10 @@ class AstroStackerWindow(QMainWindow):
             "clear_cache_done": "Cache smazána: {files} souborů",
             "clear_cache_failed": "; nepodařilo se smazat {failed} položek",
             "clear_cache_tooltip": "Smaže pouze adresáře astro_stacker_cache. Snímky ve složce zůstanou nedotčené.",
+            "hide_left_panel": "Skrýt levý panel",
+            "show_left_panel": "Zobrazit levý panel",
+            "hide_right_panel": "Skrýt pravý panel",
+            "show_right_panel": "Zobrazit pravý panel",
             "curves": "Křivky / barvy / kontrast", "highlight": "Komprese jasů",
             "highlight_tooltip": "10 = bez komprese; směrem k 0 se jasné oblasti více potlačí.",
             "auto_stretch": "Balance",
@@ -6367,7 +6931,7 @@ class AstroStackerWindow(QMainWindow):
             "synthetic_flat": "Umělý flat",
             "color_background": "Korekce barevného pozadí",
             "astro_denoise": "Astro odšumění",
-            "astro_denoise_tooltip": "Jemné odšumění náhledu/exportu s ochranou hvězd a struktur mlhovin. Lineární FIT výstup zůstává beze změny.",
+            "astro_denoise_tooltip": "Jemné odšumění náhledu/exportu s ochranou hvězd a struktur mlhovin. Potlačuje luminanční i barevný chroma šum. Lineární FIT výstup zůstává beze změny.",
             "contrast": "Kontrast", "saturation": "Saturace", "red": "Červená", "green": "Zelená", "blue": "Modrá",
             "histogram": "Histogram L/R/G/B", "neutralize": "Neutralizovat pozadí",
             "clear_neutralize": "Zrušit neutralizaci", "flip_h": "Flip H",
@@ -6375,6 +6939,7 @@ class AstroStackerWindow(QMainWindow):
             "preview_view": "Zobrazení náhledu", "fit": "Přizpůsobit",
             "reset": "Reset úprav", "starting": "Startuji…", "cancel_requested": "Zastavuji po dokončení aktuálního kroku…",
             "cancelled": "Skládání zastaveno.", "done_edit": "Složeno. Nyní můžeš ladit křivky, barvy a kontrast.",
+            "auto_rotated": "Automaticky pootočeno {angle:+.2f}°.",
             "failed": "Chyba při skládání.",
             "preview_prompt": "Vyber složku a spusť skládání.",
             "max_images_suffix": " snímků; 0 = vše",
@@ -6432,11 +6997,16 @@ class AstroStackerWindow(QMainWindow):
             "gradient_removed": "Gradient pozadí byl odstraněn pouze pro náhled a PNG/TIFF export.",
             "gradient_cleared": "Odstranění gradientu bylo zrušeno.",
             "gradient_tooltip": "Odhadne hladký gradient pozadí robustním 2D polynomem. Lineární FIT výstup zůstává beze změny.",
-            "crop_edges": "Oříznout okraje",
+            "crop_edges": "Turn angle",
+            "crop_select": "Výběr",
             "auto_wb": "Auto WB",
-            "crop_amount": "Ořez",
-            "crop_tooltip": "Ořízne zadané procento z každého okraje aktuálního snímku. Neutralizaci pozadí pak proveď až po ořezu.",
-            "crop_applied": "Oříznuto {percent} % z každého okraje. Nový rozměr: {w} × {h}.",
+            "crop_amount": "Úhel",
+            "crop_tooltip": "Pootočí aktuální snímek o zadaný úhel ve stupních. Kladná hodnota otáčí proti směru hodinových ručiček.",
+            "crop_select_tooltip": "Zapne ruční ořez: v náhledu myší označ oblast, která má zůstat.",
+            "crop_select_status": "Myší označ v náhledu obdélník, který má zůstat po ořezu.",
+            "crop_applied": "Pootočeno o {angle:+.1f}°. Nový rozměr: {w} × {h}.",
+            "crop_selection_applied": "Oříznuto podle výběru. Nový rozměr: {w} × {h}.",
+            "crop_too_small": "Vybraný ořez je příliš malý.",
             "awb_rgb_required": "AWB očekává RGB obraz.",
             "awb_not_enough_neutral": "Nepodařilo se najít dost neutrálních pixelů pro vyvážení bílé.",
             "awb_source_open": "otevřený obrázek",
@@ -6457,8 +7027,6 @@ class AstroStackerWindow(QMainWindow):
             "review_frames": "Review frames before stacking",
             "manual_reference": "Use current frame as reference",
             "manual_reference_tooltip": "Manually selected reference frame. Automatic reference is disabled.",
-            "sequential_alignment": "Sequential alignment",
-            "sequential_alignment_tooltip": "Aligns neighboring frames sequentially and composes transforms back to the reference. Helps with large drift across a sequence.",
             "mosaic_mode": "Mosaic - expand canvas",
             "mosaic_mode_tooltip": "Expands the output canvas to include all aligned frames. Useful for smart telescope mosaic sequences. With GPU enabled, mosaic integration uses VRAM tiles; otherwise it uses the parallel CPU path.",
             "keep": "Keep", "max_star_drift": "Max. star drift", "max_comet_move": "Max. comet motion",
@@ -6466,6 +7034,7 @@ class AstroStackerWindow(QMainWindow):
             "comet_search": "Comet search", "ignore_edge": "Ignore border",
             "strict_stars": "Strict star filter", "bayer_fit": "Bayer FIT",
             "satellite_trail_filter": "Satellite trail",
+            "satellite_trail_tooltip": "Detects long straight satellite trails, masks their pixels during stacking, and marks suspect frames in the quality table.",
             "mark_comet_start": "Comet First", "mark_comet_end": "Comet Last",
             "clear_comet_marks": "Comet Clear",
             "clear_comet_marks_done": "Comet position cleared.",
@@ -6496,6 +7065,17 @@ class AstroStackerWindow(QMainWindow):
             "show_stacked": "Show stacked image",
             "show_stacked_tooltip": "Returns the preview to the original stacked image without crop, neutralization, or visual adjustments.",
             "show_stacked_done": "Original stacked image shown without adjustments.",
+            "undo": "Undo",
+            "undo_tooltip": "Undo the last preview adjustment. Keeps the last two steps.",
+            "undo_empty": "Nothing to undo.",
+            "undo_done": "Previous preview state restored.",
+            "check_updates": "Check for updates…",
+            "update_available_title": "New version available",
+            "update_available_message": "Astro Stacker {version} is available.\n\nCurrent version: {current}\n\nOpen the download page?",
+            "update_current_title": "Astro Stacker is up to date",
+            "update_current_message": "You are using the current Astro Stacker version {current}.",
+            "update_failed_title": "Update check failed",
+            "update_failed_message": "Could not check for a new version:\n{error}",
             "clear_cache": "Clear cache",
             "clear_cache_title": "Clear cache",
             "clear_cache_message": "Clear quality and aligned-frame cache?",
@@ -6505,6 +7085,10 @@ class AstroStackerWindow(QMainWindow):
             "clear_cache_done": "Cache cleared: {files} files",
             "clear_cache_failed": "; failed to delete {failed} items",
             "clear_cache_tooltip": "Deletes only astro_stacker_cache folders. Images in the folder are not touched.",
+            "hide_left_panel": "Hide left panel",
+            "show_left_panel": "Show left panel",
+            "hide_right_panel": "Hide right panel",
+            "show_right_panel": "Show right panel",
             "curves": "Curves / color / contrast", "highlight": "Highlight compression",
             "highlight_tooltip": "10 = no compression; moving toward 0 suppresses bright areas more strongly.",
             "auto_stretch": "Balance",
@@ -6514,7 +7098,7 @@ class AstroStackerWindow(QMainWindow):
             "synthetic_flat": "Synthetic flat",
             "color_background": "Color background correction",
             "astro_denoise": "Astro Denoise",
-            "astro_denoise_tooltip": "Gentle preview/export denoise with star and nebula-structure protection. Linear FIT output is unchanged.",
+            "astro_denoise_tooltip": "Gentle preview/export denoise with star and nebula-structure protection. Reduces luminance and color chroma noise. Linear FIT output is unchanged.",
             "contrast": "Contrast", "saturation": "Saturation", "red": "Red", "green": "Green", "blue": "Blue",
             "histogram": "Histogram L/R/G/B", "neutralize": "Neutralize background",
             "clear_neutralize": "Clear neutralization", "flip_h": "Flip H",
@@ -6522,6 +7106,7 @@ class AstroStackerWindow(QMainWindow):
             "preview_view": "Preview view", "fit": "Fit",
             "reset": "Reset adjustments", "starting": "Starting…", "cancel_requested": "Stopping after the current step…",
             "cancelled": "Stacking stopped.", "done_edit": "Stacked. You can now adjust curves, color, and contrast.",
+            "auto_rotated": "Auto-rotated {angle:+.2f}°.",
             "failed": "Stacking failed.",
             "preview_prompt": "Choose a folder and start stacking.",
             "max_images_suffix": " frames; 0 = all",
@@ -6579,11 +7164,16 @@ class AstroStackerWindow(QMainWindow):
             "gradient_removed": "Background gradient removed for preview and PNG/TIFF export only.",
             "gradient_cleared": "Gradient removal cleared.",
             "gradient_tooltip": "Estimates a smooth background gradient with a robust 2D polynomial. Linear FIT output remains unchanged.",
-            "crop_edges": "Crop edges",
+            "crop_edges": "Turn angle",
+            "crop_select": "Select",
             "auto_wb": "Auto WB",
-            "crop_amount": "Crop",
-            "crop_tooltip": "Crops the selected percentage from each edge of the current image. Run background neutralization after cropping.",
-            "crop_applied": "Cropped {percent}% from each edge. New size: {w} × {h}.",
+            "crop_amount": "Angle",
+            "crop_tooltip": "Rotates the current image by the selected angle in degrees. Positive values rotate counterclockwise.",
+            "crop_select_tooltip": "Manual crop: drag a rectangle in the preview to keep that area.",
+            "crop_select_status": "Drag a rectangle in the preview to keep that area after cropping.",
+            "crop_applied": "Rotated by {angle:+.1f}°. New size: {w} × {h}.",
+            "crop_selection_applied": "Cropped to the selected area. New size: {w} × {h}.",
+            "crop_too_small": "The selected crop area is too small.",
             "awb_rgb_required": "AWB requires an RGB image.",
             "awb_not_enough_neutral": "Could not find enough neutral pixels for white balance.",
             "awb_source_open": "opened image",
@@ -6624,6 +7214,8 @@ class AstroStackerWindow(QMainWindow):
         self.preview_display_cache: Optional[np.ndarray] = None
         self.preview_display_cache_source_id: Optional[int] = None
         self.preview_display_cache_neutralized: bool = False
+        self.neutralized_preview_layer: Optional[np.ndarray] = None
+        self.neutralized_preview_base_source_id: Optional[int] = None
         self.gradient_preview_layer: Optional[np.ndarray] = None
         self.gradient_preview_base_source_id: Optional[int] = None
         self.preview_display_cache_edge: int = 0
@@ -6645,6 +7237,9 @@ class AstroStackerWindow(QMainWindow):
         self.preview_pan_inertia_timer = QTimer(self)
         self.preview_pan_inertia_timer.setInterval(16)
         self.preview_pan_inertia_timer.timeout.connect(self.run_preview_pan_inertia)
+        self.preview_undo_stack: List[Dict[str, Any]] = []
+        self.preview_undo_limit: int = 2
+        self.restoring_preview_undo: bool = False
         self.preview_pan_velocity = (0.0, 0.0)
         self.awaiting_comet_click: bool = False
         self.comet_click_mode: Optional[str] = None  # "start" | "end"
@@ -6663,6 +7258,8 @@ class AstroStackerWindow(QMainWindow):
         self.manual_excluded_paths: set[str] = set()
         self.review_ready: bool = False
         self.analysis_worker: Optional[FrameAnalysisWorker] = None
+        self.update_check_worker: Optional[UpdateCheckWorker] = None
+        self.update_check_manual: bool = False
         self.manual_reference_path: Optional[str] = None
         self.manual_comet_xy: Optional[Tuple[float, float]] = None
         self.manual_comet_reference_path: Optional[str] = None
@@ -6673,6 +7270,49 @@ class AstroStackerWindow(QMainWindow):
         self._build_menu()
         self.apply_language()
         QTimer.singleShot(0, self.show_intro_preview)
+        QTimer.singleShot(3500, lambda: self.check_for_updates(manual=False))
+
+    def _panel_toggle_button(self, text: str, tooltip: str) -> QPushButton:
+        button = QPushButton(text)
+        button.setFixedSize(24, 24)
+        button.setToolTip(tooltip)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setStyleSheet("font-weight: bold; padding: 0;")
+        return button
+
+    def _make_panel_rail(self, button: QPushButton) -> QFrame:
+        rail = QFrame()
+        rail.setFrameShape(QFrame.StyledPanel)
+        rail.setFixedWidth(30)
+        rail_layout = QVBoxLayout(rail)
+        rail_layout.setContentsMargins(2, 8, 2, 2)
+        rail_layout.setSpacing(0)
+        rail_layout.addWidget(button, 0, Qt.AlignTop | Qt.AlignHCenter)
+        rail_layout.addStretch(1)
+        return rail
+
+    def _refresh_preview_after_panel_toggle(self):
+        if hasattr(self, "image_label"):
+            if self.linear_result is not None or self.preview_override is not None:
+                QTimer.singleShot(0, self.update_preview)
+            elif getattr(self, "showing_intro_preview", False):
+                QTimer.singleShot(0, self.show_intro_preview)
+
+    def set_left_panel_collapsed(self, collapsed: bool):
+        self.left_panel_collapsed = bool(collapsed)
+        if hasattr(self, "left_panel_scroll"):
+            self.left_panel_scroll.setVisible(not collapsed)
+        if hasattr(self, "left_panel_rail"):
+            self.left_panel_rail.setVisible(collapsed)
+        self._refresh_preview_after_panel_toggle()
+
+    def set_right_panel_collapsed(self, collapsed: bool):
+        self.right_panel_collapsed = bool(collapsed)
+        if hasattr(self, "right_panel_scroll"):
+            self.right_panel_scroll.setVisible(not collapsed)
+        if hasattr(self, "right_panel_rail"):
+            self.right_panel_rail.setVisible(collapsed)
+        self._refresh_preview_after_panel_toggle()
 
     def _build_menu(self):
         self.file_menu = self.menuBar().addMenu("Soubor")
@@ -6740,6 +7380,10 @@ class AstroStackerWindow(QMainWindow):
         self.user_guide_action.triggered.connect(self.show_user_guide_dialog)
         help_menu.addAction(self.user_guide_action)
 
+        self.check_updates_action = QAction("Zkontrolovat aktualizace…", self)
+        self.check_updates_action.triggered.connect(lambda: self.check_for_updates(manual=True))
+        help_menu.addAction(self.check_updates_action)
+
         help_menu.addSeparator()
 
         self.help_about_action = QAction("O programu…", self)
@@ -6767,6 +7411,14 @@ class AstroStackerWindow(QMainWindow):
 
         side_content_width = 370
         side_scroll_width = 400
+        self.left_panel_collapsed = False
+        self.right_panel_collapsed = False
+
+        self.left_expand_btn = self._panel_toggle_button("▶", self.tr_ui("show_left_panel"))
+        self.left_expand_btn.clicked.connect(lambda: self.set_left_panel_collapsed(False))
+        self.left_panel_rail = self._make_panel_rail(self.left_expand_btn)
+        self.left_panel_rail.hide()
+        layout.addWidget(self.left_panel_rail)
 
         left = QFrame()
         left.setFrameShape(QFrame.StyledPanel)
@@ -6779,13 +7431,23 @@ class AstroStackerWindow(QMainWindow):
         left_panel_scroll.setWidget(left)
         left_panel_scroll.setFixedWidth(side_scroll_width)
         layout.addWidget(left_panel_scroll)
+        self.left_panel_scroll = left_panel_scroll
 
         title = QLabel("Nastavení")
         self.title_label = title
         title.setAlignment(Qt.AlignCenter)
         title.setWordWrap(True)
         title.setStyleSheet("font-size: 18px; font-weight: bold;")
-        left_layout.addWidget(title)
+
+        left_header = QHBoxLayout()
+        left_header.setContentsMargins(0, 0, 0, 0)
+        left_header.setSpacing(4)
+        self.left_collapse_btn = self._panel_toggle_button("◀", self.tr_ui("hide_left_panel"))
+        self.left_collapse_btn.clicked.connect(lambda: self.set_left_panel_collapsed(True))
+        left_header.addWidget(self.left_collapse_btn, 0, Qt.AlignTop)
+        left_header.addWidget(title, 1)
+        left_header.addSpacing(24)
+        left_layout.addLayout(left_header)
 
         self.folder_label = QLabel("Složka: nevybrána")
         self.folder_label.setWordWrap(True)
@@ -6857,6 +7519,7 @@ class AstroStackerWindow(QMainWindow):
         self.align_combo.addItem("Star alignment — hvězdy + RANSAC", "star_affine")
         self.align_combo.addItem("Comet alignment — skládat na kometu", "comet")
         self.align_combo.addItem("Star + Comet — uložit zvlášť hvězdy a kometu", "comet_merge")
+        self.align_combo.setCurrentIndex(self.align_combo.findData("star_affine"))
 
         self.stack_combo = ArrowComboBox()
         self.stack_combo.setMinimumContentsLength(18)
@@ -6865,6 +7528,7 @@ class AstroStackerWindow(QMainWindow):
         self.stack_combo.addItem("Průměr s odmítnutím jasných pixelů", "high_rejection")
         self.stack_combo.addItem("Průměr", "mean")
         self.stack_combo.addItem("Medián", "median")
+        self.stack_combo.setCurrentIndex(self.stack_combo.findData("median"))
 
         self.max_images_spin = ArrowSpinBox()
         self.max_images_spin.setRange(0, 100000)
@@ -6908,10 +7572,6 @@ class AstroStackerWindow(QMainWindow):
 
         self.manual_reference_btn = QPushButton("Použít aktuální snímek jako referenci")
         self.manual_reference_btn.clicked.connect(self.set_current_preview_as_reference)
-
-        self.sequential_alignment_check = QCheckBox("Postupné zarovnání")
-        self.sequential_alignment_check.setChecked(False)
-        self.sequential_alignment_check.setToolTip(self.tr_ui("sequential_alignment_tooltip"))
 
         self.mosaic_mode_check = QCheckBox("Mozaika - rozšířit plátno")
         self.mosaic_mode_check.setChecked(False)
@@ -6963,7 +7623,7 @@ class AstroStackerWindow(QMainWindow):
 
         self.satellite_trail_check = QCheckBox("Satelitní stopa")
         self.satellite_trail_check.setChecked(False)
-        self.satellite_trail_check.setToolTip("Detects long straight satellite trails during frame quality scoring. Suspect frames are marked in the quality table.")
+        self.satellite_trail_check.setToolTip(self.tr_ui("satellite_trail_tooltip"))
 
         self.bayer_combo = ArrowComboBox()
         self.bayer_combo.setMinimumContentsLength(20)
@@ -7017,7 +7677,6 @@ class AstroStackerWindow(QMainWindow):
         add_form_row("", self.auto_reference_check)
         add_form_row("", self.review_frames_check, advanced=True)
         add_form_row("", self.manual_reference_btn, advanced=True)
-        add_form_row("", self.sequential_alignment_check, advanced=True)
         add_form_row("", self.mosaic_mode_check, advanced=True)
         add_form_row("", self.quality_filter_check, advanced=True)
         add_form_row("Ponechat", self.keep_percent_spin, advanced=True)
@@ -7097,9 +7756,18 @@ class AstroStackerWindow(QMainWindow):
         right_panel_layout.setSpacing(8)
 
         self.calib_title = QLabel("Kalibrace")
-        self.calib_title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.calib_title.setAlignment(Qt.AlignCenter)
         self.calib_title.setStyleSheet("font-size: 18px; font-weight: bold; margin: 0; padding: 0;")
-        right_panel_layout.addWidget(self.calib_title)
+
+        right_header = QHBoxLayout()
+        right_header.setContentsMargins(0, 0, 0, 0)
+        right_header.setSpacing(4)
+        self.right_collapse_btn = self._panel_toggle_button("▶", self.tr_ui("hide_right_panel"))
+        self.right_collapse_btn.clicked.connect(lambda: self.set_right_panel_collapsed(True))
+        right_header.addWidget(self.right_collapse_btn, 0, Qt.AlignTop)
+        right_header.addWidget(self.calib_title, 1)
+        right_header.addSpacing(28)
+        right_panel_layout.addLayout(right_header)
 
         flat_row = QHBoxLayout()
         self.flat_label = QLabel("Flat: nepoužit")
@@ -7218,7 +7886,7 @@ class AstroStackerWindow(QMainWindow):
         self.scnr_green_slider = QSlider(Qt.Horizontal)
 
 
-        self.scnr_green_slider.setRange(0, 5)
+        self.scnr_green_slider.setRange(0, 10)
 
 
         self.scnr_green_slider.setValue(0)
@@ -7277,18 +7945,24 @@ class AstroStackerWindow(QMainWindow):
         self.awb_btn.clicked.connect(self.auto_white_balance)
         awb_crop_row.addWidget(self.awb_btn)
 
-        self.crop_edges_btn = QPushButton("Oříznout okraje")
+        self.crop_edges_btn = QPushButton("Turn angle")
         self.crop_edges_btn.setToolTip(self.tr_ui("crop_tooltip"))
-        self.crop_edges_btn.clicked.connect(self.crop_current_image_edges)
+        self.crop_edges_btn.clicked.connect(self.rotate_current_image_by_crop_angle)
         awb_crop_row.addWidget(self.crop_edges_btn)
 
-        self.crop_percent_spin = ArrowSpinBox()
-        self.crop_percent_spin.setRange(1, 40)
-        self.crop_percent_spin.setValue(10)
-        self.crop_percent_spin.setSuffix(" %")
-        self.crop_percent_spin.setToolTip(self.tr_ui("crop_tooltip"))
-        self.crop_percent_spin.setMinimumWidth(64)
-        awb_crop_row.addWidget(self.crop_percent_spin)
+        self.crop_angle_spin = ArrowSpinBox()
+        self.crop_angle_spin.setRange(-15, 15)
+        self.crop_angle_spin.setValue(0)
+        self.crop_angle_spin.setSuffix("°")
+        self.crop_angle_spin.setToolTip(self.tr_ui("crop_tooltip"))
+        self.crop_angle_spin.setMinimumWidth(64)
+        awb_crop_row.addWidget(self.crop_angle_spin)
+
+        self.crop_select_btn = QPushButton("Výběr")
+        self.crop_select_btn.setMinimumWidth(58)
+        self.crop_select_btn.setToolTip(self.tr_ui("crop_select_tooltip"))
+        self.crop_select_btn.clicked.connect(self.start_manual_crop_selection)
+        awb_crop_row.addWidget(self.crop_select_btn)
         awb_crop_row_widget = QWidget()
         awb_crop_row_widget.setLayout(awb_crop_row)
         compact_button_block.addWidget(awb_crop_row_widget)
@@ -7370,9 +8044,19 @@ class AstroStackerWindow(QMainWindow):
         preview_view_row.addWidget(self.zoom_label)
         right_panel_layout.addLayout(preview_view_row)
 
+        reset_row = QHBoxLayout()
+        reset_row.setContentsMargins(0, 0, 0, 0)
+        reset_row.setSpacing(4)
+        self.undo_btn = QPushButton("Zpět")
+        self.undo_btn.setToolTip(self.tr_ui("undo_tooltip"))
+        self.undo_btn.clicked.connect(self.undo_preview_adjustment)
+        reset_row.addWidget(self.undo_btn, 1)
+        self.update_undo_button_state()
+
         self.reset_btn = QPushButton("Reset úprav")
         self.reset_btn.clicked.connect(self.reset_stretch)
-        right_panel_layout.addWidget(self.reset_btn)
+        reset_row.addWidget(self.reset_btn, 1)
+        right_panel_layout.addLayout(reset_row)
         right_panel_layout.addStretch()
 
         right = QVBoxLayout()
@@ -7384,6 +8068,7 @@ class AstroStackerWindow(QMainWindow):
         self.image_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.image_label.setStyleSheet("background: #111; color: #ddd; font-size: 18px;")
         self.image_label.image_clicked.connect(self.on_preview_clicked)
+        self.image_label.crop_selected.connect(self.on_preview_crop_selected)
         self.image_label.image_double_clicked.connect(self.open_fullscreen_preview)
         self.image_label.wheel_zoomed.connect(self.on_preview_wheel_zoom)
         self.image_label.drag_started.connect(self.on_preview_drag_started)
@@ -7456,6 +8141,12 @@ class AstroStackerWindow(QMainWindow):
         right_panel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         right_panel_scroll.setWidget(right_panel)
         right_panel_scroll.setFixedWidth(side_scroll_width)
+        self.right_expand_btn = self._panel_toggle_button("◀", self.tr_ui("show_right_panel"))
+        self.right_expand_btn.clicked.connect(lambda: self.set_right_panel_collapsed(False))
+        self.right_panel_rail = self._make_panel_rail(self.right_expand_btn)
+        self.right_panel_rail.hide()
+        layout.addWidget(self.right_panel_rail)
+        self.right_panel_scroll = right_panel_scroll
         layout.addWidget(right_panel_scroll)
         self.apply_ui_mode()
 
@@ -7491,7 +8182,144 @@ class AstroStackerWindow(QMainWindow):
         layout.addWidget(value_label)
         return row
 
+    def _undo_array(self, arr: Optional[np.ndarray], copy_pixels: bool = False) -> Optional[np.ndarray]:
+        if arr is None:
+            return None
+        return np.array(arr, copy=True) if copy_pixels else arr
+
+    def _stretch_slider_values(self) -> Dict[str, int]:
+        values = {
+            "black": self.black_slider.value(),
+            "white": self.white_slider.value(),
+            "gamma": self.gamma_slider.value(),
+            "contrast": self.contrast_slider.value(),
+            "saturation": self.saturation_slider.value(),
+            "red": self.red_slider.value(),
+            "green": self.green_slider.value(),
+            "blue": self.blue_slider.value(),
+        }
+        optional = {
+            "highlight_compression": "highlight_compression_slider",
+            "vignette_removal": "vignette_removal_slider",
+            "synthetic_flat": "synthetic_flat_slider",
+            "color_background": "color_background_slider",
+            "denoise": "denoise_slider",
+            "scnr_green": "scnr_green_slider",
+        }
+        for key, attr in optional.items():
+            slider = getattr(self, attr, None)
+            if slider is not None:
+                values[key] = slider.value()
+        return values
+
+    def _restore_stretch_slider_values(self, values: Dict[str, int]):
+        mapping = {
+            "black": "black_slider",
+            "white": "white_slider",
+            "gamma": "gamma_slider",
+            "contrast": "contrast_slider",
+            "saturation": "saturation_slider",
+            "red": "red_slider",
+            "green": "green_slider",
+            "blue": "blue_slider",
+            "highlight_compression": "highlight_compression_slider",
+            "vignette_removal": "vignette_removal_slider",
+            "synthetic_flat": "synthetic_flat_slider",
+            "color_background": "color_background_slider",
+            "denoise": "denoise_slider",
+            "scnr_green": "scnr_green_slider",
+        }
+        for key, attr in mapping.items():
+            slider = getattr(self, attr, None)
+            if slider is None or key not in values:
+                continue
+            slider.blockSignals(True)
+            slider.setValue(int(values[key]))
+            slider.blockSignals(False)
+            self.update_slider_value_label(slider)
+
+    def push_preview_undo_state(self, copy_pixels: bool = False):
+        if getattr(self, "restoring_preview_undo", False):
+            return
+        source = self.preview_override if self.preview_override is not None else self.linear_result
+        state = {
+            "linear_result": self._undo_array(self.linear_result, copy_pixels),
+            "preview_override": self._undo_array(self.preview_override, copy_pixels),
+            "preview_override_path": getattr(self, "preview_override_path", None),
+            "preview_source_shape": self.preview_source_shape,
+            "neutralized_preview_layer": self._undo_array(getattr(self, "neutralized_preview_layer", None), copy_pixels),
+            "gradient_preview_layer": self._undo_array(getattr(self, "gradient_preview_layer", None), copy_pixels),
+            "neutralized_matches_source": (
+                getattr(self, "neutralized_preview_layer", None) is not None
+                and source is not None
+                and getattr(self, "neutralized_preview_base_source_id", None) == id(source)
+            ),
+            "gradient_matches_source": (
+                getattr(self, "gradient_preview_layer", None) is not None
+                and source is not None
+                and getattr(self, "gradient_preview_base_source_id", None) == id(source)
+            ),
+            "flip_horizontal": bool(getattr(self, "flip_horizontal", False)),
+            "flip_vertical": bool(getattr(self, "flip_vertical", False)),
+            "preview_rotation_degrees": int(getattr(self, "preview_rotation_degrees", 0)),
+            "preview_display_limits": self.preview_display_limits,
+            "stretch": self._stretch_slider_values(),
+        }
+        stack = getattr(self, "preview_undo_stack", [])
+        stack.append(state)
+        limit = max(1, int(getattr(self, "preview_undo_limit", 2)))
+        if len(stack) > limit:
+            del stack[:-limit]
+        self.preview_undo_stack = stack
+        self.update_undo_button_state()
+
+    def update_undo_button_state(self):
+        button = getattr(self, "undo_btn", None)
+        if button is not None:
+            button.setEnabled(bool(getattr(self, "preview_undo_stack", [])))
+
+    def undo_preview_adjustment(self):
+        stack = getattr(self, "preview_undo_stack", [])
+        if not stack:
+            self.status_label.setText(self.tr_ui("undo_empty"))
+            return
+        state = stack.pop()
+        self.preview_undo_stack = stack
+        self.restoring_preview_undo = True
+        try:
+            self.linear_result = state.get("linear_result")
+            self.preview_override = state.get("preview_override")
+            self.preview_override_path = state.get("preview_override_path")
+            self.preview_source_shape = state.get("preview_source_shape")
+            self.neutralized_preview_layer = state.get("neutralized_preview_layer")
+            self.gradient_preview_layer = state.get("gradient_preview_layer")
+            source = self.preview_override if self.preview_override is not None else self.linear_result
+            self.neutralized_preview_base_source_id = (
+                id(source) if self.neutralized_preview_layer is not None and state.get("neutralized_matches_source") and source is not None else None
+            )
+            self.gradient_preview_base_source_id = (
+                id(source) if self.gradient_preview_layer is not None and state.get("gradient_matches_source") and source is not None else None
+            )
+            self.flip_horizontal = bool(state.get("flip_horizontal", False))
+            self.flip_vertical = bool(state.get("flip_vertical", False))
+            self.preview_rotation_degrees = int(state.get("preview_rotation_degrees", 0))
+            self.preview_display_limits = state.get("preview_display_limits")
+            self._restore_stretch_slider_values(state.get("stretch", {}))
+        finally:
+            self.restoring_preview_undo = False
+        self.invalidate_preview_cache()
+        self.update_undo_button_state()
+        path_text = getattr(self, "preview_override_path", None)
+        if path_text:
+            try:
+                self.update_metadata_panel(Path(path_text), self.preview_override)
+            except Exception:
+                pass
+        self.status_label.setText(self.tr_ui("undo_done"))
+        self.update_preview()
+
     def _connect_preview_slider(self, slider: QSlider):
+        slider.sliderPressed.connect(lambda s=slider: self.push_preview_undo_state(copy_pixels=False))
         slider.sliderPressed.connect(self._preview_slider_pressed)
         slider.sliderReleased.connect(self._preview_slider_released)
         slider.valueChanged.connect(self.schedule_preview_update)
@@ -8239,6 +9067,7 @@ class AstroStackerWindow(QMainWindow):
             QMessageBox.information(self, self.tr_ui("missing_image_title"), self.tr_ui("missing_image_message"))
             return
 
+        self.push_preview_undo_state(copy_pixels=True)
         self.linear_result = original
         self.preview_override = None
         self.preview_override_path = None
@@ -8251,7 +9080,7 @@ class AstroStackerWindow(QMainWindow):
         self.flip_horizontal = False
         self.flip_vertical = False
         self.preview_rotation_degrees = 0
-        self.reset_stretch()
+        self.reset_stretch(push_undo=False)
         self.status_label.setText(self.tr_ui("show_stacked_done"))
 
     def find_pixinsight_wrapper_script(self) -> Optional[Path]:
@@ -8629,7 +9458,6 @@ class AstroStackerWindow(QMainWindow):
             "auto_reference_check": "auto_ref",
             "review_frames_check": "review_frames",
             "manual_reference_btn": "manual_reference",
-            "sequential_alignment_check": "sequential_alignment",
             "mosaic_mode_check": "mosaic_mode",
             "quality_filter_check": "quality_filter",
             "comet_refine_check": "comet_refine",
@@ -8643,9 +9471,11 @@ class AstroStackerWindow(QMainWindow):
             "clear_calib_btn": "reset_calib",
             "show_stacked_btn": "show_stacked",
             "clear_cache_btn": "clear_cache",
+            "undo_btn": "undo",
             "hist_title": "histogram",
             "auto_stretch_btn": "auto_stretch",
             "crop_edges_btn": "crop_edges",
+            "crop_select_btn": "crop_select",
             "awb_btn": "auto_wb",
             "neutral_bg_btn": "neutralize",
             "clear_neutral_bg_btn": "clear_neutralize",
@@ -8667,14 +9497,24 @@ class AstroStackerWindow(QMainWindow):
             self.pixinsight_btn.setToolTip(self.tr_ui("pixinsight_tooltip"))
         if hasattr(self, "show_stacked_btn"):
             self.show_stacked_btn.setToolTip(self.tr_ui("show_stacked_tooltip"))
+        if hasattr(self, "undo_btn"):
+            self.undo_btn.setToolTip(self.tr_ui("undo_tooltip"))
         if hasattr(self, "clear_cache_btn"):
             self.clear_cache_btn.setToolTip(self.tr_ui("clear_cache_tooltip"))
+        if hasattr(self, "left_collapse_btn"):
+            self.left_collapse_btn.setToolTip(self.tr_ui("hide_left_panel"))
+        if hasattr(self, "left_expand_btn"):
+            self.left_expand_btn.setToolTip(self.tr_ui("show_left_panel"))
+        if hasattr(self, "right_collapse_btn"):
+            self.right_collapse_btn.setToolTip(self.tr_ui("hide_right_panel"))
+        if hasattr(self, "right_expand_btn"):
+            self.right_expand_btn.setToolTip(self.tr_ui("show_right_panel"))
         if hasattr(self, "stack_btn") and getattr(self, "review_ready", False):
             self.stack_btn.setText(self.tr_ui("continue_stack"))
-        if hasattr(self, "sequential_alignment_check"):
-            self.sequential_alignment_check.setToolTip(self.tr_ui("sequential_alignment_tooltip"))
         if hasattr(self, "mosaic_mode_check"):
             self.mosaic_mode_check.setToolTip(self.tr_ui("mosaic_mode_tooltip"))
+        if hasattr(self, "satellite_trail_check"):
+            self.satellite_trail_check.setToolTip(self.tr_ui("satellite_trail_tooltip"))
         if hasattr(self, "max_comet_shift_spin"):
             self.max_comet_shift_spin.setToolTip(self.tr_ui("max_comet_tooltip"))
         if hasattr(self, "comet_refine_check"):
@@ -8694,8 +9534,10 @@ class AstroStackerWindow(QMainWindow):
             self.auto_stretch_btn.setToolTip(self.tr_ui("auto_stretch_tooltip"))
         if hasattr(self, "crop_edges_btn"):
             self.crop_edges_btn.setToolTip(self.tr_ui("crop_tooltip"))
-        if hasattr(self, "crop_percent_spin"):
-            self.crop_percent_spin.setToolTip(self.tr_ui("crop_tooltip"))
+        if hasattr(self, "crop_angle_spin"):
+            self.crop_angle_spin.setToolTip(self.tr_ui("crop_tooltip"))
+        if hasattr(self, "crop_select_btn"):
+            self.crop_select_btn.setToolTip(self.tr_ui("crop_select_tooltip"))
         if hasattr(self, "denoise_slider"):
             self.denoise_slider.setToolTip(self.tr_ui("astro_denoise_tooltip"))
         if hasattr(self, "highlight_compression_slider"):
@@ -8723,7 +9565,9 @@ class AstroStackerWindow(QMainWindow):
                 "comet_end_action": "Označit kometu v posledním snímku…", "fit_action": "Přizpůsobit",
                 "actual_action": "Zobrazit 1:1", "zoom_in_action": "Přiblížit",
                 "zoom_out_action": "Oddálit",
-                "user_guide_action": "Nápověda k programu…", "help_about_action": "About...",
+                "user_guide_action": "Nápověda k programu…",
+                "check_updates_action": "Zkontrolovat aktualizace…",
+                "help_about_action": "About...",
                 "open_log_action": "Zobrazit / smazat logy…", "quit_action": "Konec",
             },
             "en": {
@@ -8734,7 +9578,9 @@ class AstroStackerWindow(QMainWindow):
                 "comet_end_action": "Mark comet in last frame…", "fit_action": "Fit",
                 "actual_action": "Show 1:1", "zoom_in_action": "Zoom in",
                 "zoom_out_action": "Zoom out",
-                "user_guide_action": "User guide…", "help_about_action": "About...",
+                "user_guide_action": "User guide…",
+                "check_updates_action": "Check for updates…",
+                "help_about_action": "About...",
                 "open_log_action": "View / delete logs…", "quit_action": "Quit",
             },
         }
@@ -8816,7 +9662,7 @@ class AstroStackerWindow(QMainWindow):
                 "<ol>"
                 "<li>Choose a folder with Light frames. If you have Flat/Bias/Dark folders next to them, the app can use them automatically.</li>"
                 "<li>Enable <b>RAW only</b> if the folder also contains JPG/PNG/BMP/TIFF preview files that should not be stacked. FIT/FITS and camera RAW files are kept.</li>"
-                "<li>Keep <b>Star alignment + RANSAC</b>, <b>Sigma-clipped mean</b>, <b>Auto reference</b>, and <b>Use only best frames</b> enabled for a normal deep-sky stack.</li>"
+                "<li>For a normal deep-sky stack, use <b>Star alignment + RANSAC</b> and <b>Median</b>. Enable <b>Auto reference</b>; use the quality filter only when needed.</li>"
                 "<li>Click <b>Start stacking</b>. Progress and any warnings are shown in the status line and diagnostic logs.</li>"
                 "<li>After stacking, adjust black/white point, gamma, color, background neutralization, vignette removal, or synthetic flat.</li>"
                 "<li>Export FITS for linear data, or PNG/TIFF for the stretched visual result.</li>"
@@ -8827,6 +9673,7 @@ class AstroStackerWindow(QMainWindow):
                 "<li><b>Open image/FIT</b> opens one standalone image for inspection without changing the stack folder.</li>"
                 "<li>The preview list shows Light/Flat/Bias/Dark frames. After stacking, <b>*</b> marks the reference frame and <b>x</b> marks frames rejected by the quality filter.</li>"
                 "<li>The metadata panel shows camera/FITS/RAW details such as exposure, gain, temperature, filter, binning, Bayer pattern, dimensions, and file information when available.</li>"
+                "<li>The left and right panels can be collapsed with the small arrow in the top-left corner. The remaining arrow rail shows the panel again and gives more room to the preview and Frame quality table.</li>"
                 "</ul>"
                 "<h3>Stacking workflow</h3>"
                 "<ul>"
@@ -8835,7 +9682,7 @@ class AstroStackerWindow(QMainWindow):
                 "<li><b>Auto reference</b> chooses the sharpest/best frame. <b>Use only best frames</b> keeps the selected percentage and marks rejected frames in the preview list.</li>"
                 "<li>The <b>Frame quality</b> heading shows the total number of input Lights, Darks, Flats, and Biases. Saved masters, cache files, and program outputs are not counted.</li>"
                 "<li><b>FWHM px</b> in the Frame quality table is a relative stellar-size measurement in pixels of the reduced quality preview, not an arcsecond value.</li>"
-                "<li><b>Satellite trail</b> adds an optional frame-quality check for long straight satellite or aircraft trails. Suspect frames are marked in the Frame quality table and can be removed during manual review.</li>"
+                "<li><b>Satellite trail</b> detects long straight satellite or aircraft trails. Suspect frames are marked in the Frame quality table and the detected trail pixels are masked during stacking, so the unaffected part of each frame is still used.</li>"
                 "<li><b>Mosaic - expand canvas</b> preserves aligned image areas outside the reference frame and creates a larger output canvas. It is useful for mosaic sequences from smart telescopes such as Vespera. With GPU enabled, mosaic integration uses VRAM tiles while correctly ignoring partially covered edges. If GPU processing is unavailable, Astro Stacker uses the parallel tiled CPU path.</li>"
                 "<li><b>CPU processes</b> can run in Auto mode or Manual mode. Auto keeps the system responsive while using most CPU cores.</li>"
                 "<li><b>GPU</b> enables CUDA/CuPy on NVIDIA or Apple Metal/MPS through PyTorch for the final stacking step. Aligned frames are sent to the GPU in row tiles, avoiding a second full-stack RAM copy. If GPU processing fails, the app falls back to CPU.</li>"
@@ -8858,7 +9705,8 @@ class AstroStackerWindow(QMainWindow):
                 "<ul>"
                 "<li>Mouse wheel zooms around the cursor. Dragging pans the image, including a subtle inertial glide.</li>"
                 "<li>Double-click opens a full-screen preview with the same zoom and pan behavior. Esc closes it.</li>"
-                "<li>Curves, crop edges, black/white point, gamma, highlight compression, vignette removal, synthetic flat, contrast, saturation, RGB balance, SCNR Green, AWB, background neutralization, polynomial gradient removal, and flips affect the visual preview and PNG/TIFF export.</li>"
+                "<li>Curves, Turn angle, manual Select crop, black/white point, gamma, highlight compression, vignette removal, synthetic flat, contrast, saturation, RGB balance, SCNR Green, AWB, background neutralization, polynomial gradient removal, and flips affect the visual preview and PNG/TIFF export.</li>"
+                "<li><b>Select crop</b> lets you drag a rectangle directly in the preview. The selected area is kept and everything outside it is removed.</li>"
                 "<li><b>Remove gradient</b> is intended mainly for smooth light-pollution gradients around galaxies. Use it carefully with large nebulae, where faint real structures can be mistaken for background.</li>"
                 "<li>The L/R/G/B histogram includes a subtle 0-100 brightness ruler.</li>"
                 "</ul>"
@@ -8878,7 +9726,7 @@ class AstroStackerWindow(QMainWindow):
                 "<ol>"
                 "<li>Vyber složku s Light snímky. Pokud máš vedle ní složky Flat/Bias/Dark, aplikace je umí použít automaticky.</li>"
                 "<li>Zapni <b>Pouze RAW</b>, pokud jsou ve složce také JPG/PNG/BMP/TIFF náhledy, které se nemají skládat. FIT/FITS a foto RAW soubory zůstanou povolené.</li>"
-                "<li>Pro běžné deep-sky skládání nech zapnuté <b>Star alignment + RANSAC</b>, <b>Sigma-clipped průměr</b>, <b>Automatickou referenci</b> a <b>Použít jen nejlepší snímky</b>.</li>"
+                "<li>Pro běžné deep-sky skládání použij <b>Star alignment + RANSAC</b> a <b>Medián</b>. Zapni <b>Automatickou referenci</b>; filtr kvality používej podle potřeby.</li>"
                 "<li>Klikni na <b>Spustit skládání</b>. Průběh a případná varování jsou ve stavovém řádku a v diagnostických lozích.</li>"
                 "<li>Po složení dolaď black/white point, gamma, barvy, neutralizaci pozadí, vinětaci nebo umělý flat.</li>"
                 "<li>Exportuj FITS pro lineární data, nebo PNG/TIFF pro vizuálně upravený výsledek.</li>"
@@ -8889,6 +9737,7 @@ class AstroStackerWindow(QMainWindow):
                 "<li><b>Otevřít obrázek/FIT</b> otevře jeden samostatný snímek pro kontrolu bez změny složky stacku.</li>"
                 "<li>Seznam náhledů ukazuje Light/Flat/Bias/Dark. Po složení značí <b>*</b> referenční snímek a <b>x</b> snímek vyřazený filtrem kvality.</li>"
                 "<li>Panel metadata zobrazuje dostupné informace z FITS/RAW/kamery: expozici, gain, teplotu, filtr, binning, Bayer masku, rozměry a informace o souboru.</li>"
+                "<li>Levý i pravý panel lze schovat malou šipkou v levém horním rohu. Zůstane jen úzký proužek se šipkou pro návrat a náhled i tabulka Frame quality získají více místa.</li>"
                 "</ul>"
                 "<h3>Skládání</h3>"
                 "<ul>"
@@ -8897,7 +9746,7 @@ class AstroStackerWindow(QMainWindow):
                 "<li><b>Automatická reference</b> vybere nejlepší snímek. <b>Použít jen nejlepší snímky</b> ponechá zvolené procento a vyřazené snímky označí v seznamu.</li>"
                 "<li>Nadpis <b>Frame quality</b> ukazuje celkový počet vstupních Lights, Darks, Flats a Biases. Uložené mastery, cache ani výsledné výstupy programu se nezapočítávají.</li>"
                 "<li><b>FWHM px</b> v tabulce Frame quality je relativní velikost hvězd v pixelech zmenšeného náhledu pro hodnocení kvality, nikoliv hodnota v úhlových vteřinách.</li>"
-                "<li><b>Satelitní stopa</b> přidá volitelnou kontrolu dlouhých rovných stop družic nebo letadel. Podezřelé snímky se označí v tabulce Frame quality a lze je vyřadit při ruční kontrole.</li>"
+                "<li><b>Satelitní stopa</b> detekuje dlouhé rovné stopy družic nebo letadel. Podezřelé snímky označí v tabulce Frame quality a při skládání zamaskuje pouze pixely nalezené stopy, takže nepoškozená část snímku zůstane využita.</li>"
                 "<li><b>Mozaika - rozšířit plátno</b> zachová zarovnané části snímků mimo referenční obraz a vytvoří větší výstupní plátno. Hodí se pro mozaikové sekvence chytrých dalekohledů, například Vespera. Mozaika používá CPU skládání, aby byly správně zpracované částečně pokryté okraje.</li>"
                 "<li><b>CPU procesy</b> umí režim Auto nebo Ručně. Auto využije většinu CPU, ale nechá systém a GUI dýchat.</li>"
                 "<li><b>GPU</b> zapne CUDA/CuPy na NVIDIA nebo Apple Metal/MPS přes PyTorch pro finální skládání. Zarovnané snímky se posílají do GPU po řádkových dlaždicích, takže nevzniká druhá kopie celého stacku v RAM. Při problému program bezpečně spadne zpět na CPU.</li>"
@@ -8920,7 +9769,8 @@ class AstroStackerWindow(QMainWindow):
                 "<ul>"
                 "<li>Kolečko myši zoomuje od kurzoru. Tažením se posouvá obraz včetně jemné setrvačnosti.</li>"
                 "<li>Dvojklik otevře celoobrazovkový náhled se stejným zoomem a posunem. Esc ho zavře.</li>"
-                "<li>Křivky, ořez okrajů, black/white point, gamma, komprese jasů, odstranění vinětace, umělý flat, kontrast, saturace, RGB balance, SCNR Green, AWB, neutralizace pozadí, polynomické odstranění gradientu a otočení ovlivňují vizuální náhled a PNG/TIFF export.</li>"
+                "<li>Křivky, Turn angle, ruční crop výběrem, black/white point, gamma, komprese jasů, odstranění vinětace, umělý flat, kontrast, saturace, RGB balance, SCNR Green, AWB, neutralizace pozadí, polynomické odstranění gradientu a otočení ovlivňují vizuální náhled a PNG/TIFF export.</li>"
+                "<li><b>Výběr / Select crop</b> umožní natáhnout obdélník přímo v náhledu. Vybraná oblast zůstane a vše mimo ni se odstraní.</li>"
                 "<li><b>Odstranit gradient</b> je určené hlavně pro hladké světelné gradienty okolo galaxií. Používej opatrně u rozsáhlých mlhovin, kde může za pozadí považovat reálné slabé struktury.</li>"
                 "<li>Histogram L/R/G/B obsahuje jemné pravítko jasu 0-100.</li>"
                 "</ul>"
@@ -9032,6 +9882,51 @@ class AstroStackerWindow(QMainWindow):
             f"<p><b>{author_label}:</b> Josef Ladra</p>"
         )
         QMessageBox.about(self, title, text)
+
+    def check_for_updates(self, manual: bool = False):
+        worker = getattr(self, "update_check_worker", None)
+        if worker is not None and worker.isRunning():
+            return
+        if manual and hasattr(self, "check_updates_action"):
+            self.check_updates_action.setEnabled(False)
+        self.update_check_manual = bool(manual)
+        self.update_check_worker = UpdateCheckWorker(GITHUB_RELEASES_API_URL, APP_VERSION)
+        self.update_check_worker.finished_ok.connect(self.on_update_check_finished)
+        self.update_check_worker.failed.connect(self.on_update_check_failed)
+        self.update_check_worker.finished.connect(self.on_update_check_thread_finished)
+        self.update_check_worker.start()
+
+    def on_update_check_thread_finished(self):
+        if hasattr(self, "check_updates_action"):
+            self.check_updates_action.setEnabled(True)
+
+    def on_update_check_failed(self, error: str):
+        if getattr(self, "update_check_manual", False):
+            QMessageBox.warning(
+                self,
+                self.tr_ui("update_failed_title"),
+                self.tr_ui("update_failed_message").format(error=error),
+            )
+
+    def on_update_check_finished(self, info: Dict[str, Any]):
+        latest = display_version(str(info.get("tag") or ""))
+        url = str(info.get("url") or GITHUB_RELEASES_PAGE_URL)
+        if info.get("is_newer"):
+            reply = QMessageBox.information(
+                self,
+                self.tr_ui("update_available_title"),
+                self.tr_ui("update_available_message").format(version=latest, current=APP_VERSION),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                QDesktopServices.openUrl(QUrl(url))
+        elif getattr(self, "update_check_manual", False):
+            QMessageBox.information(
+                self,
+                self.tr_ui("update_current_title"),
+                self.tr_ui("update_current_message").format(current=APP_VERSION),
+            )
 
     def _html_escape(self, text: str) -> str:
         return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -9201,7 +10096,6 @@ class AstroStackerWindow(QMainWindow):
                 "processes": self.processes_spin.value(),
                 "auto_reference": self.auto_reference_check.isChecked(),
                 "manual_reference_path": self.manual_reference_path,
-                "sequential_alignment": self.sequential_alignment_check.isChecked(),
                 "mosaic_mode": self.mosaic_mode_check.isChecked() if hasattr(self, "mosaic_mode_check") else False,
                 "quality_filter": self.quality_filter_check.isChecked(),
                 "review_frames": self.review_frames_check.isChecked(),
@@ -9288,8 +10182,6 @@ class AstroStackerWindow(QMainWindow):
         self.update_process_mode()
         set_check(self.auto_reference_check, "auto_reference", stack)
         self.manual_reference_path = stack.get("manual_reference_path")
-        if hasattr(self, "sequential_alignment_check"):
-            set_check(self.sequential_alignment_check, "sequential_alignment", stack)
         if hasattr(self, "mosaic_mode_check"):
             set_check(self.mosaic_mode_check, "mosaic_mode", stack)
         set_check(self.quality_filter_check, "quality_filter", stack)
@@ -9394,7 +10286,6 @@ class AstroStackerWindow(QMainWindow):
             normalize_background=self.normalize_check.isChecked(),
             auto_reference=self.auto_reference_check.isChecked(),
             manual_reference_path=self.manual_reference_path,
-            sequential_alignment=self.sequential_alignment_check.isChecked() if hasattr(self, "sequential_alignment_check") else False,
             mosaic_mode=self.mosaic_mode_check.isChecked() if hasattr(self, "mosaic_mode_check") else False,
             quality_filter=self.quality_filter_check.isChecked(),
             keep_percent=self.keep_percent_spin.value(),
@@ -9943,9 +10834,16 @@ class AstroStackerWindow(QMainWindow):
             self.image_label.setPixmap(pixmap)
             self.image_label.resize(pixmap.size())
             self.image_label.setMinimumSize(pixmap.size())
-            hbar.setValue(int(round(center_rel_x * float(pixmap.width()) - float(viewport.width()) / 2.0)))
-            vbar.setValue(int(round(center_rel_y * float(pixmap.height()) - float(viewport.height()) / 2.0)))
-            self.preview_pan_scroll = (float(hbar.value()), float(vbar.value()))
+            target_h = int(round(center_rel_x * float(pixmap.width()) - float(viewport.width()) / 2.0))
+            target_v = int(round(center_rel_y * float(pixmap.height()) - float(viewport.height()) / 2.0))
+
+            def apply_scroll_position():
+                hbar.setValue(target_h)
+                vbar.setValue(target_v)
+                self.preview_pan_scroll = (float(hbar.value()), float(vbar.value()))
+
+            apply_scroll_position()
+            QTimer.singleShot(0, apply_scroll_position)
             self.update_zoom_status_label()
 
     def zoom_status_text(self) -> str:
@@ -10167,7 +11065,74 @@ class AstroStackerWindow(QMainWindow):
         vy = 0.0 if hit_y_edge else vy * 0.88
         self.preview_pan_velocity = (vx, vy)
 
-    def crop_current_image_edges(self):
+    def start_manual_crop_selection(self):
+        source = self.preview_override if self.preview_override is not None else self.linear_result
+        if source is None:
+            QMessageBox.information(self, self.tr_ui("missing_image_title"), self.tr_ui("missing_image_message"))
+            return
+        self.awaiting_comet_click = False
+        self.comet_click_mode = None
+        if hasattr(self, "image_label"):
+            self.image_label.set_marking_mode(False)
+            self.image_label.set_crop_selection_mode(True)
+        self.stop_preview_pan_inertia()
+        self.status_label.setText(self.tr_ui("crop_select_status"))
+
+    def preview_point_to_source_point(self, x: float, y: float, final_w: int, final_h: int, source_w: int, source_h: int) -> Tuple[float, float]:
+        rotation = int(getattr(self, "preview_rotation_degrees", 0)) % 360
+        if rotation in (90, 270):
+            base_h, base_w = final_w, final_h
+        else:
+            base_h, base_w = final_h, final_w
+
+        bx = float(x)
+        by = float(y)
+        if rotation == 90:
+            bx, by = float(base_w - 1) - by, bx
+        elif rotation == 180:
+            bx, by = float(base_w - 1) - bx, float(base_h - 1) - by
+        elif rotation == 270:
+            bx, by = by, float(base_h - 1) - bx
+
+        if getattr(self, "flip_vertical", False):
+            by = float(base_h - 1) - by
+        if getattr(self, "flip_horizontal", False):
+            bx = float(base_w - 1) - bx
+
+        scale = max(1e-6, float(getattr(self, "preview_display_scale", 1.0) or 1.0))
+        sx = bx / scale
+        sy = by / scale
+        sx = max(0.0, min(float(source_w - 1), sx))
+        sy = max(0.0, min(float(source_h - 1), sy))
+        return sx, sy
+
+    def on_preview_crop_selected(self, pixmap_x0: float, pixmap_y0: float, pixmap_x1: float, pixmap_y1: float):
+        source = self.preview_override if self.preview_override is not None else self.linear_result
+        pixmap = self.image_label.pixmap() if hasattr(self, "image_label") else None
+        preview = getattr(self, "preview_render_array", None)
+        if source is None or pixmap is None or pixmap.isNull() or preview is None:
+            return
+
+        final_h, final_w = preview.shape[:2]
+        source_h, source_w = source.shape[:2]
+        px_scale_x = float(final_w) / max(1.0, float(pixmap.width()))
+        px_scale_y = float(final_h) / max(1.0, float(pixmap.height()))
+        x0 = float(pixmap_x0) * px_scale_x
+        x1 = float(pixmap_x1) * px_scale_x
+        y0 = float(pixmap_y0) * px_scale_y
+        y1 = float(pixmap_y1) * px_scale_y
+
+        corners = [
+            self.preview_point_to_source_point(x0, y0, final_w, final_h, source_w, source_h),
+            self.preview_point_to_source_point(x1, y0, final_w, final_h, source_w, source_h),
+            self.preview_point_to_source_point(x0, y1, final_w, final_h, source_w, source_h),
+            self.preview_point_to_source_point(x1, y1, final_w, final_h, source_w, source_h),
+        ]
+        xs = [p[0] for p in corners]
+        ys = [p[1] for p in corners]
+        self.crop_current_image_rect(min(xs), min(ys), max(xs), max(ys), manual=True)
+
+    def crop_current_image_rect(self, x0: float, y0: float, x1: float, y1: float, manual: bool = False):
         source = self.preview_override if self.preview_override is not None else self.linear_result
         if source is None:
             QMessageBox.information(self, self.tr_ui("missing_image_title"), self.tr_ui("missing_image_message"))
@@ -10175,21 +11140,22 @@ class AstroStackerWindow(QMainWindow):
 
         arr = np.asarray(source, dtype=np.float32)
         h, w = arr.shape[:2]
-        percent = int(self.crop_percent_spin.value()) if hasattr(self, "crop_percent_spin") else 10
-        dx = int(round(w * percent / 100.0))
-        dy = int(round(h * percent / 100.0))
-        if dx <= 0 and dy <= 0:
-            return
-        if dx * 2 >= w - 2 or dy * 2 >= h - 2:
-            QMessageBox.warning(
-                self,
-                self.tr_ui("missing_image_title"),
-                "Ořez je příliš velký." if self.language == "cz" else "The crop amount is too large.",
-            )
+        left = int(math.floor(min(x0, x1)))
+        right = int(math.ceil(max(x0, x1)))
+        top = int(math.floor(min(y0, y1)))
+        bottom = int(math.ceil(max(y0, y1)))
+        left = max(0, min(w - 1, left))
+        right = max(left + 1, min(w, right))
+        top = max(0, min(h - 1, top))
+        bottom = max(top + 1, min(h, bottom))
+
+        if right - left < 16 or bottom - top < 16:
+            QMessageBox.warning(self, self.tr_ui("missing_image_title"), self.tr_ui("crop_too_small"))
             return
 
+        self.push_preview_undo_state(copy_pixels=True)
         old_source_id = id(source)
-        cropped = np.ascontiguousarray(arr[dy:h - dy, dx:w - dx, ...].astype(np.float32))
+        cropped = np.ascontiguousarray(arr[top:bottom, left:right, ...].astype(np.float32))
         cropped_neutralized = None
         if (
             getattr(self, "neutralized_preview_layer", None) is not None
@@ -10197,7 +11163,7 @@ class AstroStackerWindow(QMainWindow):
         ):
             layer = np.asarray(self.neutralized_preview_layer, dtype=np.float32)
             if layer.shape[:2] == (h, w):
-                cropped_neutralized = np.ascontiguousarray(layer[dy:h - dy, dx:w - dx, ...].astype(np.float32))
+                cropped_neutralized = np.ascontiguousarray(layer[top:bottom, left:right, ...].astype(np.float32))
         cropped_gradient = None
         if (
             getattr(self, "gradient_preview_layer", None) is not None
@@ -10205,7 +11171,7 @@ class AstroStackerWindow(QMainWindow):
         ):
             layer = np.asarray(self.gradient_preview_layer, dtype=np.float32)
             if layer.shape[:2] == (h, w):
-                cropped_gradient = np.ascontiguousarray(layer[dy:h - dy, dx:w - dx, ...].astype(np.float32))
+                cropped_gradient = np.ascontiguousarray(layer[top:bottom, left:right, ...].astype(np.float32))
 
         if self.preview_override is not None:
             self.preview_override = cropped
@@ -10219,7 +11185,56 @@ class AstroStackerWindow(QMainWindow):
         self.gradient_preview_layer = cropped_gradient
         self.gradient_preview_base_source_id = id(new_source) if cropped_gradient is not None else None
         self.invalidate_preview_cache()
-        self.status_label.setText(self.tr_ui("crop_applied").format(percent=percent, w=cropped.shape[1], h=cropped.shape[0]))
+        if manual:
+            self.status_label.setText(self.tr_ui("crop_selection_applied").format(w=cropped.shape[1], h=cropped.shape[0]))
+        else:
+            self.status_label.setText(self.tr_ui("crop_selection_applied").format(w=cropped.shape[1], h=cropped.shape[0]))
+        self.update_preview()
+
+    def rotate_current_image_by_crop_angle(self):
+        source = self.preview_override if self.preview_override is not None else self.linear_result
+        if source is None:
+            QMessageBox.information(self, self.tr_ui("missing_image_title"), self.tr_ui("missing_image_message"))
+            return
+
+        arr = np.asarray(source, dtype=np.float32)
+        angle = float(self.crop_angle_spin.value()) if hasattr(self, "crop_angle_spin") else 0.0
+        if abs(angle) < 1e-6:
+            return
+
+        self.push_preview_undo_state(copy_pixels=True)
+        old_source_id = id(source)
+        rotated = rotate_image_expand(arr, angle)
+        rotated_neutralized = None
+        if (
+            getattr(self, "neutralized_preview_layer", None) is not None
+            and getattr(self, "neutralized_preview_base_source_id", None) == old_source_id
+        ):
+            layer = np.asarray(self.neutralized_preview_layer, dtype=np.float32)
+            if layer.shape[:2] == arr.shape[:2]:
+                rotated_neutralized = rotate_image_expand(layer, angle)
+        rotated_gradient = None
+        if (
+            getattr(self, "gradient_preview_layer", None) is not None
+            and getattr(self, "gradient_preview_base_source_id", None) == old_source_id
+        ):
+            layer = np.asarray(self.gradient_preview_layer, dtype=np.float32)
+            if layer.shape[:2] == arr.shape[:2]:
+                rotated_gradient = rotate_image_expand(layer, angle)
+
+        if self.preview_override is not None:
+            self.preview_override = rotated
+            new_source = self.preview_override
+        else:
+            self.linear_result = rotated
+            new_source = self.linear_result
+        self.preview_source_shape = rotated.shape[:2]
+        self.neutralized_preview_layer = rotated_neutralized
+        self.neutralized_preview_base_source_id = id(new_source) if rotated_neutralized is not None else None
+        self.gradient_preview_layer = rotated_gradient
+        self.gradient_preview_base_source_id = id(new_source) if rotated_gradient is not None else None
+        self.invalidate_preview_cache()
+        self.status_label.setText(self.tr_ui("crop_applied").format(angle=angle, w=rotated.shape[1], h=rotated.shape[0]))
         self.update_preview()
 
 
@@ -10233,6 +11248,7 @@ class AstroStackerWindow(QMainWindow):
         if img.ndim != 3 or img.shape[2] < 3:
             QMessageBox.information(self, self.tr_ui("neutralize_not_possible_title"), self.tr_ui("neutralize_rgb_required"))
             return
+        self.push_preview_undo_state(copy_pixels=False)
         corrected = apply_polynomial_gradient_removal(img)
         self.gradient_preview_layer = make_display_preview_base(corrected)
         self.gradient_preview_base_source_id = id(source)
@@ -10242,6 +11258,8 @@ class AstroStackerWindow(QMainWindow):
 
     def clear_background_gradient(self):
         """Clear the preview/export-only background-gradient correction."""
+        if self.gradient_preview_layer is not None:
+            self.push_preview_undo_state(copy_pixels=False)
         self.gradient_preview_layer = None
         self.gradient_preview_base_source_id = None
         self.invalidate_preview_cache()
@@ -10265,6 +11283,7 @@ class AstroStackerWindow(QMainWindow):
         result = self.build_neutralized_preview_layer(source, show_errors=True)
         if result is None:
             return
+        self.push_preview_undo_state(copy_pixels=False)
         corrected, status = result
 
         # Ulož jako dočasnou display vrstvu. update_preview ji použije místo
@@ -10429,6 +11448,8 @@ class AstroStackerWindow(QMainWindow):
 
     def clear_background_neutralization(self):
         """Zruší dočasnou neutralizaci pozadí."""
+        if self.neutralized_preview_layer is not None:
+            self.push_preview_undo_state(copy_pixels=False)
         self.neutralized_preview_layer = None
         self.neutralized_preview_base_source_id = None
         self.invalidate_preview_cache()
@@ -10438,18 +11459,22 @@ class AstroStackerWindow(QMainWindow):
 
 
     def toggle_flip_horizontal(self):
+        self.push_preview_undo_state(copy_pixels=False)
         self.flip_horizontal = not bool(getattr(self, "flip_horizontal", False))
         self.update_preview()
 
     def toggle_flip_vertical(self):
+        self.push_preview_undo_state(copy_pixels=False)
         self.flip_vertical = not bool(getattr(self, "flip_vertical", False))
         self.update_preview()
 
     def rotate_preview_left(self):
+        self.push_preview_undo_state(copy_pixels=False)
         self.preview_rotation_degrees = (int(getattr(self, "preview_rotation_degrees", 0)) + 90) % 360
         self.update_preview()
 
     def rotate_preview_right(self):
+        self.push_preview_undo_state(copy_pixels=False)
         self.preview_rotation_degrees = (int(getattr(self, "preview_rotation_degrees", 0)) - 90) % 360
         self.update_preview()
 
@@ -10489,6 +11514,7 @@ class AstroStackerWindow(QMainWindow):
             QMessageBox.warning(self, "AWB", self.tr_ui("awb_not_enough_neutral"))
             return
 
+        self.push_preview_undo_state(copy_pixels=False)
         med = np.median(img[mask], axis=0).astype(np.float32)
         med = np.maximum(med, 1e-6)
         target = float(np.mean(med))
@@ -10515,7 +11541,9 @@ class AstroStackerWindow(QMainWindow):
         self.status_label.setText(self.tr_ui("awb_status").format(source=source_label, r=gains[0], g=gains[1], b=gains[2]))
         self.update_preview()
 
-    def reset_stretch(self):
+    def reset_stretch(self, push_undo: bool = True):
+        if push_undo:
+            self.push_preview_undo_state(copy_pixels=False)
         self.black_slider.setValue(0)
         self.white_slider.setValue(65535)
         self.gamma_slider.setValue(100)
@@ -10546,6 +11574,7 @@ class AstroStackerWindow(QMainWindow):
             )
             return
 
+        self.push_preview_undo_state(copy_pixels=False)
         neutralized = self.build_neutralized_preview_layer(source, show_errors=False)
         if neutralized is not None:
             display, _status = neutralized
@@ -10564,6 +11593,19 @@ class AstroStackerWindow(QMainWindow):
         values = values[np.isfinite(values)]
         if values.size < 32:
             return
+        positive = values[values > 1e-6]
+        if positive.size >= 32:
+            center = np.asarray(lum, dtype=np.float32)
+            center = center[center.shape[0] // 4: (3 * center.shape[0]) // 4, center.shape[1] // 4: (3 * center.shape[1]) // 4]
+            center = center[np.isfinite(center)]
+            center_positive = center[center > 1e-6]
+            if center_positive.size >= 32:
+                empty_threshold = max(1e-6, float(np.median(center_positive)) * 0.03)
+            else:
+                empty_threshold = max(1e-6, float(np.percentile(positive, 1.0)) * 0.5)
+            non_empty = values[values > empty_threshold]
+            if non_empty.size >= 32:
+                values = non_empty
 
         lo = float(np.percentile(values, 0.2))
         hi = float(np.percentile(values, 99.5))

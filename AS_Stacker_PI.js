@@ -38,7 +38,7 @@ function defaultSettings()
       outputDir: "",
       outputName: "AS_stack.fit",
       align: 0,
-      stack: 0,
+      stack: 1,
       bayer: 0,
       sigma: 2.5,
       maxImages: 0,
@@ -50,7 +50,9 @@ function defaultSettings()
       autoRef: true,
       quality: false,
       strictStars: true,
+      satelliteTrail: false,
       normalize: true,
+      mosaic: false,
       gpu: false
    };
 }
@@ -547,9 +549,19 @@ function ASStackerDialog()
    this.strictStarsCheck.text = "Strict star filter";
    this.strictStarsCheck.checked = saved.strictStars;
 
+   this.satelliteTrailCheck = new CheckBox( this );
+   this.satelliteTrailCheck.text = "Satellite trail";
+   this.satelliteTrailCheck.toolTip = "Detect long straight satellite or aircraft trails and mask only their pixels during stacking.";
+   this.satelliteTrailCheck.checked = saved.satelliteTrail;
+
    this.normalizeCheck = new CheckBox( this );
    this.normalizeCheck.text = "Normalize background";
    this.normalizeCheck.checked = saved.normalize;
+
+   this.mosaicCheck = new CheckBox( this );
+   this.mosaicCheck.text = "Mosaic canvas";
+   this.mosaicCheck.toolTip = "Expand the output canvas to include all aligned frames. With GPU enabled, mosaic integration uses VRAM tiles; otherwise it uses the parallel CPU path.";
+   this.mosaicCheck.checked = saved.mosaic;
 
    this.gpuCheck = new CheckBox( this );
    this.gpuCheck.text = "Use GPU";
@@ -644,6 +656,10 @@ function ASStackerDialog()
          args.push( "--quality-filter" );
       if ( !this.dialog.strictStarsCheck.checked )
          args.push( "--no-strict-star-filter" );
+      if ( this.dialog.satelliteTrailCheck.checked )
+         args.push( "--satellite-trail" );
+      if ( this.dialog.mosaicCheck.checked )
+         args.push( "--mosaic" );
 
       saveSettings( {
          python: python,
@@ -664,7 +680,9 @@ function ASStackerDialog()
          autoRef: this.dialog.autoRefCheck.checked,
          quality: this.dialog.qualityCheck.checked,
          strictStars: this.dialog.strictStarsCheck.checked,
+         satelliteTrail: this.dialog.satelliteTrailCheck.checked,
          normalize: this.dialog.normalizeCheck.checked,
+         mosaic: this.dialog.mosaicCheck.checked,
          gpu: this.dialog.gpuCheck.checked
       } );
 
@@ -735,7 +753,9 @@ function ASStackerDialog()
    checks.add( this.autoRefCheck );
    checks.add( this.qualityCheck );
    checks.add( this.strictStarsCheck );
+   checks.add( this.satelliteTrailCheck );
    checks.add( this.normalizeCheck );
+   checks.add( this.mosaicCheck );
    checks.add( this.gpuCheck );
    checks.addStretch();
    this.sizer.add( checks );

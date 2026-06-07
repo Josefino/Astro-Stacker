@@ -9,7 +9,7 @@ import traceback
 import unicodedata
 from pathlib import Path
 
-CLI_VERSION = "2.5"
+CLI_VERSION = "2.7"
 
 
 def ascii_text(text: str) -> str:
@@ -38,6 +38,14 @@ def english_progress_message(message: str) -> str:
         ("CPU alignment procesy", "CPU alignment processes"),
         ("Skládám snímky na GPU", "Stacking frames on GPU"),
         ("Skladam snimky na GPU", "Stacking frames on GPU"),
+        ("Posilam stack po blocich primo do GPU", "Sending stack tiles directly to GPU"),
+        ("Skladam na GPU po blocich VRAM", "Stacking on GPU in VRAM tiles"),
+        ("Skladam na GPU po blocich sdilene pameti", "Stacking on GPU in shared-memory tiles"),
+        ("Mozaika: posilam stack po blocich primo do GPU", "Mosaic: sending stack tiles directly to GPU"),
+        ("Mozaika: skládám paralelně na CPU po blocích RAM", "Mosaic: stacking in parallel on CPU in RAM tiles"),
+        ("Mozaika: skladam paralelne na CPU po blocich RAM", "Mosaic: stacking in parallel on CPU in RAM tiles"),
+        ("Mozaika: převádím snímky na plátno", "Mosaic: warping frames to canvas"),
+        ("Mozaika: prevadim snimky na platno", "Mosaic: warping frames to canvas"),
         ("Skladam prumer na CPU po blocich RAM", "Stacking mean on CPU in RAM tiles"),
         ("Skladam prumer prubezne", "Stacking mean incrementally"),
         ("Skladam na CPU po blocich RAM", "Stacking on CPU in RAM tiles"),
@@ -73,15 +81,10 @@ def english_progress_message(message: str) -> str:
         ("PyTorch/MPS nelze nacist", "PyTorch/MPS cannot be loaded"),
         ("Vyřazuji bez platného star alignmentu", "Rejecting frame without valid star alignment"),
         ("Vyřazuji černý snímek bez hvězd", "Rejecting black frame without stars"),
-        ("Vyřazuji bez postupného star alignmentu", "Rejecting frame without sequential star alignment"),
-        ("Postupné zarovnání", "Sequential alignment"),
-        ("vpřed", "forward"),
-        ("zpět", "backward"),
         ("vlaken", "threads"),
         ("radku", "rows"),
         ("Hotovo", "Done"),
         ("Žádný snímek neprošel zarovnáním. Zkontroluj, zda složka Light neobsahuje Dark/Bias snímky nebo zda jsou ve snímcích detekovatelné hvězdy.", "No frame passed alignment. Check whether the Light folder contains Dark/Bias frames or whether detectable stars are present."),
-        ("Žádný snímek neprošel postupným zarovnáním.", "No frame passed sequential alignment."),
         ("Star + Comet výstupy vyžadují označení komety v prvním i posledním snímku.", "Star + Comet outputs require marking the comet in both the first and last frame."),
         ("Ve složce nejsou žádné FIT/FITS ani RAW snímky. Vypni volbu Pouze RAW, pokud chceš skládat i PNG/JPG/TIFF/BMP.", "The folder contains no FIT/FITS or RAW frames. Disable RAW only if you also want to stack PNG/JPG/TIFF/BMP files."),
         ("Ve složce nejsou žádné podporované obrázky. Podporované formáty zahrnují FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG a BMP.", "The folder contains no supported images. Supported formats include FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG and BMP."),
@@ -141,6 +144,7 @@ def build_settings(args: argparse.Namespace, stack_settings_cls):
         "max_star_shift": args.max_star_shift,
         "star_border_margin": args.star_border_margin,
         "strict_star_filter": not args.no_strict_star_filter,
+        "satellite_trail_filter": args.satellite_trail,
         "bayer_pattern": args.bayer,
         "flat_frame_path": str(args.flat) if args.flat else None,
         "bias_frame_path": str(args.bias) if args.bias else None,
@@ -182,7 +186,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None, help="Output folder. Default: input/astro_stacker_output.")
     parser.add_argument("--output-name", default="AS_stack.fit", help="Output FIT/FITS name. AS_ prefix is added automatically.")
     parser.add_argument("--align", choices=["translation", "ecc_affine", "star_affine", "calibration"], default="star_affine")
-    parser.add_argument("--stack", choices=["mean", "median", "sigma", "high_rejection"], default="sigma")
+    parser.add_argument("--stack", choices=["mean", "median", "sigma", "high_rejection"], default="median")
     parser.add_argument("--sigma", type=float, default=2.5)
     parser.add_argument("--max-images", type=int, default=0)
     parser.add_argument("--raw-only", action="store_true", help="Use only FIT/FITS and camera RAW files; ignore JPG/PNG/BMP/TIFF previews.")
@@ -202,6 +206,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quality-filter", action="store_true", help="Use only the best frames. Default: off.")
     parser.add_argument("--no-quality-filter", action="store_true", help="Compatibility option; quality filter is already off by default.")
     parser.add_argument("--no-strict-star-filter", action="store_true")
+    parser.add_argument("--satellite-trail", action="store_true", help="Detect satellite trails and mask their pixels during stacking.")
     return parser.parse_args()
 
 
@@ -225,6 +230,7 @@ def main() -> int:
                 f"auto_ref={settings.auto_reference}, quality_filter={settings.quality_filter}, "
                 f"raw_only={getattr(settings, 'raw_only', False)}, keep={settings.keep_percent}, max_star_shift={settings.max_star_shift}, "
                 f"border={settings.star_border_margin}, strict={settings.strict_star_filter}, "
+                f"satellite_trail={getattr(settings, 'satellite_trail_filter', False)}, "
                 f"mosaic={getattr(settings, 'mosaic_mode', False)}, "
                 f"bayer={settings.bayer_pattern}, normalize={settings.normalize_background}, "
                 f"processes={processes}")
@@ -263,6 +269,7 @@ def main() -> int:
         f"max_star_shift={settings.max_star_shift}",
         f"star_border_margin={settings.star_border_margin}",
         f"strict_star_filter={settings.strict_star_filter}",
+        f"satellite_trail_filter={getattr(settings, 'satellite_trail_filter', False)}",
         f"bayer={settings.bayer_pattern}",
         f"normalize_background={settings.normalize_background}",
         f"processes={processes}",

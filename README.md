@@ -4,11 +4,11 @@ Astro Stacker is a desktop application for astronomical image stacking, calibrat
 
 The application focuses on a practical workflow: load a folder of light frames, optionally apply calibration frames, align the sequence, stack it, inspect rejected frames, and export either a linear FIT/FITS result or a stretched visual image.
 
-Current application version: **2.5**
+Current application version: **2.7**
 
 ## Main Features
 
-- Light-frame stacking with translation, ECC affine, star alignment + RANSAC, sequential alignment, comet alignment, optional expanded-canvas mosaic mode, and calibration-frame stacking.
+- Light-frame stacking with translation, ECC affine, star alignment + RANSAC, comet alignment, optional expanded-canvas mosaic mode, and calibration-frame stacking.
 - Mean, median, and sigma-clipped mean stacking.
 - Robust star alignment with frame rejection when alignment fails.
 - Automatic or manual reference-frame selection.
@@ -87,12 +87,15 @@ For most workflows, this preserves image brightness while correcting vignetting 
 ## Preview and Post-Processing
 
 The right panel changes the visual preview and visual exports, not the linear FIT output.
+Both side panels can be collapsed with the small arrow in the top-left corner of
+each panel, leaving more room for the preview and Frame Quality table.
 
 Important tools:
 
 - **Balance**: automatic preview stretch and background balance.
 - **Auto WB**: automatic white balance.
 - **Crop edges**: crop border artifacts after alignment.
+- **Select crop**: drag a rectangle in the preview and keep only the selected area.
 - **Neutralize background**: reduce color cast in the background.
 - **Remove gradient**: subtract a smooth polynomial background model. This works especially well for galaxies; use it carefully with large nebulae.
 - **Synthetic flat**: approximate smooth background correction when no real flat is available.
