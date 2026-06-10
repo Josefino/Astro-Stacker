@@ -5,3 +5,6 @@ astropy
 rawpy
 PySide6
 xisf==0.9.6
+lz4
+zstandard
+pyinstaller

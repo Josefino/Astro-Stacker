@@ -1,6 +1,8 @@
 // Astro Stacker PixInsight wrapper
 // Runs astro_stacker_cli.py and writes FITS outputs with AS_ prefix.
 
+var AS_STACKER_WRAPPER_VERSION = "2.8";
+
 #include <pjsr/StdButton.jsh>
 #include <pjsr/StdDialogCode.jsh>
 #include <pjsr/FrameStyle.jsh>
@@ -10,7 +12,7 @@
 #include <pjsr/NumericControl.jsh>
 
 #feature-id    Utilities > AS_Stacker
-#feature-info  Astro Stacker wrapper for PixInsight. Calls the external Python CLI engine.
+#feature-info  Astro Stacker 2.8 wrapper for PixInsight. Calls the external Python CLI engine.
 
 var AS_STACKER_SETTINGS_ID = "AS_Stacker/settings";
 var AS_STACKER_SCRIPT_DIR = File.extractDrive( #__FILE__ ) + File.extractDirectory( #__FILE__ );
@@ -430,7 +432,7 @@ function ASStackerDialog()
    this.__base__ = Dialog;
    this.__base__();
 
-   this.windowTitle = "AS_Stacker - PixInsight Wrapper";
+   this.windowTitle = "AS_Stacker " + AS_STACKER_WRAPPER_VERSION + " - PixInsight Wrapper";
    this.labelWidth = this.font.width( "Star border margin:" ) + 12;
    var saved = loadSettings();
 
@@ -534,7 +536,7 @@ function ASStackerDialog()
 
    this.rawOnlyCheck = new CheckBox( this );
    this.rawOnlyCheck.text = "RAW only";
-   this.rawOnlyCheck.toolTip = "Use only FIT/FITS and camera RAW files. JPG/PNG/BMP/TIFF previews are ignored, including in automatic Flat/Bias/Dark folders.";
+   this.rawOnlyCheck.toolTip = "Use only XISF, FIT/FITS and camera RAW files. JPG/PNG/BMP/TIFF previews are ignored, including in automatic Flat/Bias/Dark folders.";
    this.rawOnlyCheck.checked = saved.rawOnly;
 
    this.autoRefCheck = new CheckBox( this );

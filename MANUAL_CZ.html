@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>Astro Stacker 2.7 - uživatelský manuál</title>
+<title>Astro Stacker 2.8 - uživatelský manuál</title>
 <style>
 @page { margin: 18mm 16mm; }
 body {
@@ -41,13 +41,13 @@ strong { color: #111827; }
 </style>
 </head>
 <body>
-<h1>Astro Stacker 2.7 - uživatelský manuál</h1>
+<h1>Astro Stacker 2.8 - uživatelský manuál</h1>
 <p>Astro Stacker slouží ke skládání astronomických snímků z DSLR, bezzrcadlovek, astronomických kamer a chytrých dalekohledů. Umí načíst sekvenci Light snímků, volitelně použít Flat/Bias/Dark kalibraci, zarovnat snímky podle hvězd nebo komety, složit výsledek a nabídnout základní úpravy náhledu pro kontrolu a export.</p>
-<p>Program pracuje tak, aby lineární FIT výstup zůstal vhodný pro další zpracování. Většina úprav v pravém panelu ovlivňuje hlavně náhled a export do obrazových formátů, ne původní lineární data.</p>
+<p>Program pracuje tak, aby lineární XISF/FIT výstup zůstal vhodný pro další zpracování. Většina úprav v pravém panelu ovlivňuje hlavně náhled a export do obrazových formátů, ne původní lineární data.</p>
 <h2>1. Co program umí</h2>
 <ul>
 <li>Skládání Light snímků ze složky.</li>
-<li>Podpora FIT/FITS, běžných RAW formátů fotoaparátů a obrazových formátů.</li>
+<li>Podpora PixInsight XISF, FIT/FITS, běžných RAW formátů fotoaparátů a obrazových formátů.</li>
 <li>Volitelná kalibrace pomocí Flat, Bias a Dark snímků.</li>
 <li>Zarovnání posunem, ECC afinně, podle hvězd přes RANSAC, perspektivně podle hvězd nebo podle komety.</li>
 <li>Automatický nebo ruční výběr referenčního snímku.</li>
@@ -56,7 +56,7 @@ strong { color: #111827; }
 <li>Detekce satelitních stop a maskování pouze zasažených pixelů při skládání.</li>
 <li>Uložení a načtení profilů nastavení.</li>
 <li>Náhled s histogramem, křivkami, barvami, vyvážením pozadí a funkcí Balance.</li>
-<li>Export lineárního FIT nebo vizuálně upraveného PNG/TIFF.</li>
+<li>Export lineárního XISF/FIT nebo vizuálně upraveného PNG/TIFF.</li>
 <li>Spuštění wrapperu pro PixInsight.</li>
 </ul>
 <h2>2. Rychlý postup pro běžné skládání</h2>
@@ -90,8 +90,9 @@ strong { color: #111827; }
 </ul>
 <p>Rozbalovací seznam slouží také k rychlé kontrole jednotlivých snímků.</p>
 <h3>RAW only / Pouze RAW</h3>
-<p>Tato volba při stackování ponechá FIT/FITS a foto RAW soubory, například ARW, CR2, CR3 apod. Vynechá JPG, PNG, BMP a TIFF. Hodí se, když chytrý dalekohled nebo fotoaparát ukládá do složky současně pracovní snímky i náhledy.</p>
-<p>U Bayer FIT/FITS sekvencí se kalibrace aplikuje na senzorovou mozaiku před debayeringem. Hlavičky velkých FITů se kontrolují bez načítání celého obrazu a vlastní načtení, debayering a alignment běží při zapnutém multiprocessingu v paralelních pracovních procesech.</p>
+<p>Tato volba při stackování ponechá XISF, FIT/FITS a foto RAW soubory, například ARW, CR2, CR3 apod. Vynechá JPG, PNG, BMP a TIFF. Hodí se, když chytrý dalekohled nebo fotoaparát ukládá do složky současně pracovní snímky i náhledy.</p>
+<p>XISF soubory z PixInsightu lze použít jako Light i kalibrační snímky. Podporovány jsou také komprimované XISF soubory. XISF bez explicitních CFA/Bayer metadat se považuje za monochromatický; CFA XISF se debayeruje automaticky nebo podle ručně zvolené Bayer masky.</p>
+<p>U Bayer XISF/FIT/FITS sekvencí se kalibrace aplikuje na senzorovou mozaiku před debayeringem. Hlavičky velkých FITů se kontrolují bez načítání celého obrazu a vlastní načtení, debayering a alignment běží při zapnutém multiprocessingu v paralelních pracovních procesech.</p>
 <h3>Zarovnání</h3>
 <p><strong>Translation / Pouze posun</strong></p>
 <p>Rychlé zarovnání pouze posunem. Vhodné pro malé drifty bez rotace.</p>
@@ -194,6 +195,7 @@ strong { color: #111827; }
 <li><strong>File &gt; Save settings profile / Soubor &gt; Uložit profil nastavení</strong></li>
 <li><strong>File &gt; Load settings profile / Soubor &gt; Načíst profil nastavení</strong></li>
 </ul>
+<p>Po výběru pracovní složky přes <strong>Choose folder / Vybrat složku</strong> se dialog pro uložení výsledku i profilu nastavení otevře přímo v této složce.</p>
 <p>Profil ukládá nastavení stackování, kalibrace, komety i pravého panelu. Hodí se například pro různé typy dat:</p>
 <ul>
 <li>DSLR RAW,</li>
@@ -203,7 +205,8 @@ strong { color: #111827; }
 <li>čistý lineární FIT workflow.</li>
 </ul>
 <h2>8. Pravý panel - náhled a úpravy</h2>
-<p>Pravý panel slouží ke kontrole a vizuálním úpravám výsledku. Tyto úpravy jsou určené hlavně pro náhled a export do PNG/TIFF. Lineární FIT výstup zůstává vhodný pro další zpracování.</p>
+<p>Pravý panel slouží ke kontrole a vizuálním úpravám výsledku. Tyto úpravy jsou určené hlavně pro náhled a export do PNG/TIFF. Lineární XISF/FIT výstup zůstává vhodný pro další zpracování.</p>
+<p>Po dokončení se stack zobrazí lineárně, takže může působit téměř černě. Tlačítko <strong>Balance</strong> provede stretch pouze pro náhled; lineární data nezmění.</p>
 <p>Malou šipkou v levém horním rohu lze pravý panel dočasně schovat. Kliknutím na</p>
 <p>zbývající úzký proužek se šipkou se panel znovu zobrazí.</p>
 <h3>Show stacked image / Zobraz složený obraz</h3>
@@ -224,8 +227,9 @@ strong { color: #111827; }
 <li><strong>White point</strong> určuje světlý bod.</li>
 <li><strong>Gamma</strong> mění střední tóny.</li>
 </ul>
-<h3>Highlight compression / Komprese jasů</h3>
-<p>Potlačuje přepaly jasných hvězd a jader objektů. Hodí se pro náhled snímků s velmi jasnými hvězdami.</p>
+<p>Black point a White point lze nastavovat jemně po <strong>0,05</strong>, například na hodnotu 2,25.</p>
+<h3>STF strength / Síla STF</h3>
+<p>Nastavuje intenzitu Screen Transfer Function pouze pro náhled a vizuální PNG/TIFF export. Hodnota <strong>0</strong> poskytne jemnější, tmavší STF s vyšším kontrastem, <strong>5</strong> odpovídá standardnímu náhledu a <strong>10</strong> silně vytáhne velmi slabé struktury. Černý a bílý bod zůstávají zachované; lineární XISF/FIT export se nemění.</p>
 <h3>Vignette removal / Odstranění vinětace</h3>
 <p>Jemně zesvětlí okraje a rohy. Není to náhrada skutečného Flat snímku, ale může pomoci pro rychlý vizuální náhled.</p>
 <h3>Synthetic flat / Umělý flat</h3>
@@ -253,7 +257,7 @@ strong { color: #111827; }
 <h3>Auto White Balance</h3>
 <p>Pokusí se automaticky vyvážit bílé/šedé oblasti. U některých astrofotografií může být vhodnější ruční úprava RGB nebo korekce barevného pozadí.</p>
 <h3>Neutralize background / Neutralizovat pozadí</h3>
-<p>Snaží se srovnat barvu pozadí. Nejlépe funguje, když je v obraze dost neutrálního pozadí bez mlhovin a bez špatných okrajů.</p>
+<p>Snaží se srovnat barvu pozadí. Pozadí vybírá podle geometrie, jasu a absence hvězd, nikoli podle podobné síly RGB kanálů. Zvládne proto lépe také snímky s velmi slabou modrou nebo jinou barevnou složkou. Používá aditivní posuny, aby slabý kanál zbytečně nezesiloval svůj šum. Nejlépe funguje, když je v obraze dost skutečného pozadí bez rozsáhlé mlhoviny.</p>
 <h3>Flip horizontal / vertical</h3>
 <p>Překlopí náhled horizontálně nebo vertikálně.</p>
 <h3>Fit a 1:1</h3>
@@ -264,7 +268,7 @@ strong { color: #111827; }
 <h2>9. PixInsight wrapper</h2>
 <p>Tlačítko <strong>PixInsight</strong> otevře PixInsight a spustí AS_Stacker wrapper, pokud je správně dostupný. Wrapper umožňuje spustit CLI verzi stackeru přímo z PixInsightu a po dokončení otevřít výsledný FIT v PixInsightu.</p>
 <p>Pro wrapper je potřeba nastavit Python prostředí, ve kterém jsou nainstalované potřebné balíčky.</p>
-<p>Wrapper ve verzi 2.7 nabízí také volbu <strong>Satellite trail</strong> a pro nové nastavení používá jako výchozí Star alignment + RANSAC a Median.</p>
+<p>Wrapper ve verzi 2.8 nabízí také volbu <strong>Satellite trail</strong> a pro nové nastavení používá jako výchozí Star alignment + RANSAC a Median.</p>
 <h2>10. Doporučené postupy</h2>
 <h3>Běžná deep-sky sekvence</h3>
 <ul>

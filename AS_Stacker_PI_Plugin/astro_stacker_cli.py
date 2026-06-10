@@ -9,7 +9,7 @@ import traceback
 import unicodedata
 from pathlib import Path
 
-CLI_VERSION = "2.7"
+CLI_VERSION = "2.8"
 
 
 def ascii_text(text: str) -> str:
@@ -87,7 +87,8 @@ def english_progress_message(message: str) -> str:
         ("Žádný snímek neprošel zarovnáním. Zkontroluj, zda složka Light neobsahuje Dark/Bias snímky nebo zda jsou ve snímcích detekovatelné hvězdy.", "No frame passed alignment. Check whether the Light folder contains Dark/Bias frames or whether detectable stars are present."),
         ("Star + Comet výstupy vyžadují označení komety v prvním i posledním snímku.", "Star + Comet outputs require marking the comet in both the first and last frame."),
         ("Ve složce nejsou žádné FIT/FITS ani RAW snímky. Vypni volbu Pouze RAW, pokud chceš skládat i PNG/JPG/TIFF/BMP.", "The folder contains no FIT/FITS or RAW frames. Disable RAW only if you also want to stack PNG/JPG/TIFF/BMP files."),
-        ("Ve složce nejsou žádné podporované obrázky. Podporované formáty zahrnují FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG a BMP.", "The folder contains no supported images. Supported formats include FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG and BMP."),
+        ("Ve složce nejsou žádné podporované obrázky. Podporované formáty zahrnují XISF, FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG a BMP.", "The folder contains no supported images. Supported formats include XISF, FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG and BMP."),
+        ("Pro XISF podporu nainstaluj", "Install for XISF support"),
         ("Ve složce nezbyly žádné light snímky. Zkontroluj, zda nejsou soubory označené jako Dark/Bias/Flat.", "No light frames remain in the folder. Check whether files are marked as Dark/Bias/Flat."),
         ("Pro FITS podporu nainstaluj", "Install for FITS support"),
         ("RAW podpora vyžaduje rawpy. Nainstaluj", "RAW support requires rawpy. Install"),
@@ -189,7 +190,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stack", choices=["mean", "median", "sigma", "high_rejection"], default="median")
     parser.add_argument("--sigma", type=float, default=2.5)
     parser.add_argument("--max-images", type=int, default=0)
-    parser.add_argument("--raw-only", action="store_true", help="Use only FIT/FITS and camera RAW files; ignore JPG/PNG/BMP/TIFF previews.")
+    parser.add_argument("--raw-only", action="store_true", help="Use only XISF, FIT/FITS and camera RAW files; ignore JPG/PNG/BMP/TIFF previews.")
     parser.add_argument("--keep-percent", type=int, default=80)
     parser.add_argument("--max-star-shift", type=int, default=180)
     parser.add_argument("--star-border-margin", type=int, default=120)

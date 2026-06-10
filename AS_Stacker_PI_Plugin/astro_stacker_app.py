@@ -2,7 +2,7 @@
 Astro Stacker GUI - desktop application for astronomical image stacking.
 
 English overview:
-- loads image sequences and standalone preview files: FIT/FITS, camera RAW,
+- loads image sequences and standalone preview files: XISF, FIT/FITS, camera RAW,
   TIFF, PNG, JPG, and BMP
 - aligns frames by translation, affine ECC, stars + RANSAC, or a moving comet
 - stacks with mean, median, sigma-clipped mean, or high-rejection mean
@@ -12,15 +12,15 @@ English overview:
   raw sensor data are available
 - accepts automatic calibration subfolders, arbitrary manually selected
   calibration folders, or finished Master files
-- handles monochrome and Bayer FIT/FITS data; Auto mode debayers only when an
-  explicit Bayer/CFA pattern is present in the FIT header
+- handles monochrome and Bayer XISF/FIT/FITS data; Auto mode debayers only
+  when explicit Bayer/CFA metadata are present
 - provides preview adjustments, background tools, zoom, flips, rotations,
   visual PNG/TIFF export, and linear unstretched FIT/FITS export
 - supports CPU multiprocessing and optional NVIDIA CUDA/CuPy or Apple
   Metal/MPS acceleration with an automatic CPU fallback
 
 Cesky prehled:
-- nacita sekvence snimku i samostatne nahledy: FIT/FITS, foto RAW, TIFF, PNG,
+- nacita sekvence snimku i samostatne nahledy: XISF, FIT/FITS, foto RAW, TIFF, PNG,
   JPG a BMP
 - zarovnava snimky posunem, afinnim ECC, podle hvezd + RANSAC nebo na kometu
 - sklada prumerem, medianem, sigma-clipped prumerem nebo high-rejection mean
@@ -30,15 +30,15 @@ Cesky prehled:
   jsou dostupna raw senzorova data
 - umi automaticke kalibracni podslozky, libovolne rucne vybrane kalibracni
   slozky i hotove Master soubory
-- rozlisuje monochromaticke a Bayer FIT/FITS snimky; rezim Auto debayeruje jen
-  pri nalezeni explicitni Bayer/CFA masky v FIT hlavicce
+- rozlisuje monochromaticke a Bayer XISF/FIT/FITS snimky; rezim Auto
+  debayeruje jen pri nalezeni explicitnich Bayer/CFA metadat
 - nabizi upravy nahledu, nastroje pro pozadi, zoom, flipy, rotace, vizualni
   PNG/TIFF export a linearni nestretchovany FIT/FITS export
 - podporuje CPU multiprocessing a volitelnou NVIDIA CUDA/CuPy nebo Apple
   Metal/MPS akceleraci s automatickym fallbackem na CPU
 
 Installation / Instalace:
-    pip install PySide6 opencv-python numpy pillow astropy rawpy
+    pip install PySide6 opencv-python numpy pillow astropy rawpy xisf
     optional NVIDIA GPU acceleration / volitelna NVIDIA GPU akcelerace:
     pip install cupy-cuda12x
     optional Apple Silicon Metal/MPS acceleration / volitelna Apple Metal/MPS akcelerace:
@@ -76,7 +76,7 @@ from PIL import Image
 
 
 LOG_PATH: Optional[Path] = None
-APP_VERSION = "2.7"
+APP_VERSION = "2.8"
 GITHUB_RELEASES_API_URL = "https://api.github.com/repos/Josefino/Astro-Stacker/releases/latest"
 GITHUB_RELEASES_PAGE_URL = "https://github.com/Josefino/Astro-Stacker/releases/latest"
 
@@ -164,6 +164,9 @@ def bundled_file_path(filename: str) -> Optional[Path]:
     return None
 
 
+_CUDA_DLL_DIRECTORY_HANDLES = []
+
+
 def configure_cuda_runtime_path() -> None:
     """Make CUDA Toolkit DLLs visible to CuPy on Windows before importing cupy."""
     log_debug("=" * 72)
@@ -207,6 +210,42 @@ def configure_cuda_runtime_path() -> None:
     if root.exists():
         candidates.extend(sorted(root.glob("v*"), reverse=True))
 
+    # CUDA wheels installed through cupy-cuda12x[ctk] keep individual runtime
+    # DLL groups in separate nvidia/*/bin directories. PyInstaller preserves
+    # this layout, so every directory containing a CUDA DLL must remain in the
+    # Windows DLL search path for the lifetime of the process.
+    if getattr(sys, "frozen", False):
+        dll_patterns = (
+            "cudart*.dll",
+            "nvrtc*.dll",
+            "nvJitLink*.dll",
+            "cublas*.dll",
+        )
+        dll_dirs = set()
+        for frozen_root in candidates[:2]:
+            if not frozen_root.exists():
+                continue
+            for pattern in dll_patterns:
+                try:
+                    dll_dirs.update(path.parent for path in frozen_root.rglob(pattern))
+                except OSError:
+                    continue
+
+        for dll_dir in sorted(dll_dirs, key=lambda path: str(path).lower()):
+            dll_dir_text = str(dll_dir)
+            path_parts = os.environ.get("PATH", "").split(os.pathsep)
+            if dll_dir_text not in path_parts:
+                os.environ["PATH"] = dll_dir_text + os.pathsep + os.environ.get("PATH", "")
+            try:
+                handle = os.add_dll_directory(dll_dir_text)
+                _CUDA_DLL_DIRECTORY_HANDLES.append(handle)
+                log_debug(f"added bundled CUDA DLL directory: {dll_dir}")
+            except Exception:
+                log_debug(f"add bundled DLL directory failed for {dll_dir}:\n{traceback.format_exc()}")
+
+        if dll_dirs:
+            log_debug(f"bundled CUDA DLL directories found: {len(dll_dirs)}")
+
     for cuda_root in candidates:
         bin_dir = cuda_root / "bin"
         if not bin_dir.exists() and any(cuda_root.glob("nvrtc*.dll")):
@@ -222,7 +261,8 @@ def configure_cuda_runtime_path() -> None:
         if str(bin_dir) not in path_parts:
             os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
         try:
-            os.add_dll_directory(str(bin_dir))
+            handle = os.add_dll_directory(str(bin_dir))
+            _CUDA_DLL_DIRECTORY_HANDLES.append(handle)
             log_debug(f"added DLL directory: {bin_dir}")
         except Exception:
             log_debug(f"add_dll_directory failed for {bin_dir}:\n{traceback.format_exc()}")
@@ -271,7 +311,12 @@ try:
     import rawpy
 except ImportError:
     rawpy = None
-from PySide6.QtCore import QPoint, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal
+
+try:
+    from xisf import XISF
+except ImportError:
+    XISF = None
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDesktopServices, QIcon, QImage, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
@@ -303,15 +348,18 @@ from PySide6.QtWidgets import (
 )
 
 RAW_EXTENSIONS = {".cr2", ".cr3", ".raw", ".nef", ".arw", ".dng", ".orf", ".rw2", ".raf"}
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".fits", ".fit"} | RAW_EXTENSIONS
+XISF_EXTENSIONS = {".xisf"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".fits", ".fit"} | XISF_EXTENSIONS | RAW_EXTENSIONS
 FITS_EXTENSIONS = {".fits", ".fit"}
-RAW_STACK_EXTENSIONS = FITS_EXTENSIONS | RAW_EXTENSIONS
+LINEAR_ASTRO_EXTENSIONS = FITS_EXTENSIONS | XISF_EXTENSIONS
+RAW_STACK_EXTENSIONS = LINEAR_ASTRO_EXTENSIONS | RAW_EXTENSIONS
 
 LAST_STACK_SELECTION: Dict[str, Any] = {}
 ALIGNMENT_CACHE_VERSION = "aligned-v8-full-satellite-mask"
 QUALITY_CACHE_VERSION = "quality-v15-star-shape-reference"
 CALIBRATION_SIGNATURE_CACHE: Dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
 MP_WORKER_CONTEXT: Dict[str, Any] = {}
+GRADIENT_REMOVAL_ALGORITHM_VERSION = "gradient-v2-robust-polynomial"
 
 
 class ArrowComboBox(QComboBox):
@@ -405,7 +453,7 @@ class StackSettings:
     stack_mode: str = "sigma"        # mean | median | sigma | high_rejection
     sigma: float = 2.5
     max_images: int = 0               # 0 = all
-    raw_only: bool = False            # při skládání použije jen FIT/FITS a foto RAW; vynechá JPG/PNG/BMP/TIFF
+    raw_only: bool = False            # použije XISF, FIT/FITS a foto RAW; vynechá JPG/PNG/BMP/TIFF
     fit_only: bool = False            # zpětná kompatibilita se starými profily
     downscale_for_alignment: float = 0.5
     normalize_background: bool = True
@@ -446,7 +494,7 @@ class StretchSettings:
     black: int = 0
     white: int = 65535
     gamma: float = 1.0
-    highlight_compression: float = 0.0
+    stf_strength: float = 5.0
     vignette_removal: float = 0.0
     synthetic_flat: float = 0.0
     color_background_correction: float = 0.0
@@ -485,11 +533,18 @@ def normalize_array_to_float(arr: np.ndarray) -> np.ndarray:
     return np.clip(arr, 0, 1).astype(np.float32)
 
 
-def display_preview_limits(img: np.ndarray) -> Tuple[float, float]:
+def midtones_transfer(m: float, x: np.ndarray) -> np.ndarray:
+    x = np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0)
+    m = float(np.clip(m, 1e-5, 0.99999))
+    denom = (2.0 * m - 1.0) * x - m
+    return np.clip(((m - 1.0) * x) / np.where(np.abs(denom) < 1e-6, -1e-6, denom), 0.0, 1.0).astype(np.float32)
+
+
+def display_preview_limits(img: np.ndarray) -> Tuple[float, ...]:
     arr = np.asarray(img, dtype=np.float32)
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     if arr.size == 0:
-        return 0.0, 1.0
+        return 0.0, 1.0, 0.25, 0.16, 0.85, 0.55
 
     if arr.ndim == 3 and arr.shape[2] == 3:
         lum = 0.2126 * arr[..., 0] + 0.7152 * arr[..., 1] + 0.0722 * arr[..., 2]
@@ -498,25 +553,88 @@ def display_preview_limits(img: np.ndarray) -> Tuple[float, float]:
 
     finite = lum[np.isfinite(lum)]
     if finite.size < 10:
-        return 0.0, 1.0
+        return 0.0, 1.0, 0.25, 0.16, 0.85, 0.55
 
-    lo = float(np.percentile(finite, 0.25))
-    hi = float(np.percentile(finite, 99.85))
+    lo = float(np.percentile(finite, 0.1))
+    hi = float(np.max(np.asarray(img, dtype=np.float32)[np.isfinite(img)]))
     if hi <= lo:
-        lo = float(np.min(finite))
         hi = float(np.max(finite))
     if hi <= lo:
-        return lo, lo + 1.0
-    return lo, hi
+        return 0.0, 1.0, 0.25, 0.16, 0.85, 0.55
+
+    norm_lum = np.clip((finite - lo) / (hi - lo), 0.0, 1.0)
+    median = float(np.median(norm_lum[np.isfinite(norm_lum)]))
+    # Moderate linked STF: a compromise between the restrained display and
+    # the brighter arcsinh preview variant.
+    target = 0.16
+    if median <= 1e-6:
+        mtf = 0.25
+    else:
+        denom = 2.0 * median * target - target - median
+        mtf = median * (target - 1.0) / denom if abs(denom) > 1e-8 else 0.25
+    mtf = float(np.clip(mtf, 1e-4, 0.999))
+    knee = float(np.percentile(finite, 99.85))
+    if knee <= lo:
+        knee = float(np.percentile(finite, 99.0))
+    knee = float(np.clip(knee, lo + 1e-6, hi))
+    return lo, hi, mtf, target, knee, 0.55
 
 
-def apply_display_preview_limits(img: np.ndarray, limits: Tuple[float, float]) -> np.ndarray:
+def apply_display_preview_limits(img: np.ndarray, limits: Tuple[float, ...]) -> np.ndarray:
     arr = np.asarray(img, dtype=np.float32)
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-    lo, hi = float(limits[0]), float(limits[1])
-    if hi <= lo:
+    if len(limits) >= 6:
+        lo, hi, mtf, _target, knee, stf_weight = map(float, limits[:6])
+        if hi <= lo:
+            return np.zeros_like(arr, dtype=np.float32)
+        x = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+        stf = midtones_transfer(mtf, x)
+
+        knee_level = 0.78
+        fits_base = np.clip((arr - lo) / max(knee - lo, 1e-6), 0.0, None) * knee_level
+        if hi > knee:
+            tail = np.clip((arr - knee) / (hi - knee), 0.0, 1.0)
+            strength = 12.0
+            tail = np.arcsinh(strength * tail) / np.arcsinh(strength)
+            fits_base = np.where(
+                arr > knee,
+                knee_level + (1.0 - knee_level) * tail,
+                fits_base,
+            )
+        fits_base = np.clip(fits_base, 0.0, 1.0).astype(np.float32)
+        return np.clip(
+            stf_weight * stf + (1.0 - stf_weight) * fits_base,
+            0.0,
+            1.0,
+        ).astype(np.float32)
+    elif len(limits) >= 4:
+        lo, hi, mtf, _target = map(float, limits[:4])
+        if hi <= lo:
+            return np.zeros_like(arr, dtype=np.float32)
+        x = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+        return midtones_transfer(mtf, x)
+    elif len(limits) >= 3:
+        lo, knee, hi = map(float, limits[:3])
+    else:
+        # Backward compatibility with profiles/Undo states created earlier.
+        lo, hi = float(limits[0]), float(limits[1])
+        knee = hi
+    if knee <= lo:
         return np.zeros_like(arr, dtype=np.float32)
-    out = (arr - lo) / (hi - lo)
+
+    # Leave a little more headroom for galaxy nuclei and bright stellar cores.
+    # The highlight tail still reaches white smoothly, but starts lower so its
+    # internal structure remains easier to see in previews and visual exports.
+    knee_level = 0.78
+    low = (arr - lo) / (knee - lo)
+    out = low * knee_level
+    if hi > knee:
+        tail = np.clip((arr - knee) / (hi - knee), 0.0, 1.0)
+        # Rise toward white gradually. A power shoulder preserves separation
+        # inside bright galaxy nuclei instead of making the lower highlight
+        # tail brighter, as the previous logarithmic mapping did.
+        tail = np.power(tail, 1.45)
+        out = np.where(arr > knee, knee_level + (1.0 - knee_level) * tail, out)
     return np.clip(out, 0, 1).astype(np.float32)
 
 
@@ -682,6 +800,71 @@ def detect_bayer_pattern_from_header(header) -> Optional[str]:
     return None
 
 
+def xisf_image_metadata(path: Path) -> Dict[str, Any]:
+    """Read metadata for the first image block without decoding image pixels."""
+    if XISF is None:
+        raise RuntimeError("Pro XISF podporu nainstaluj: pip install xisf")
+    reader = XISF(str(path))
+    metadata = reader.get_images_metadata()
+    if not metadata:
+        raise ValueError(f"XISF soubor neobsahuje obrazová data: {Path(path).name}")
+    return dict(metadata[0])
+
+
+def xisf_metadata_values(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Flatten XISF FITS keywords and properties for metadata/CFA detection."""
+    flattened: Dict[str, Any] = {}
+    if not isinstance(metadata, dict):
+        return flattened
+
+    fits_keywords = metadata.get("FITSKeywords", {})
+    if isinstance(fits_keywords, dict):
+        for key, entries in fits_keywords.items():
+            value = entries
+            if isinstance(entries, list) and entries:
+                first = entries[0]
+                value = first.get("value") if isinstance(first, dict) else first
+            elif isinstance(entries, dict):
+                value = entries.get("value")
+            flattened[str(key).upper()] = value
+
+    properties = metadata.get("XISFProperties", {})
+    if isinstance(properties, dict):
+        for key, prop in properties.items():
+            value = prop.get("value") if isinstance(prop, dict) else prop
+            flattened[str(key).upper()] = value
+    return flattened
+
+
+def bayer_pattern_from_xisf_metadata(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    override = get_bayer_pattern_override()
+    if str(override).upper() in BAYER_PATTERNS:
+        return str(override).upper()
+    if str(override).lower() == "mono":
+        return None
+
+    values = xisf_metadata_values(metadata)
+    direct_keys = (
+        "BAYERPAT", "BAYER_PATTERN", "BAYER", "CFA", "CFA_PAT",
+        "CFA_PATTERN", "CFAPAT", "COLORTYP", "COLORTYPE",
+        "FILTERPAT", "FILTER_PATTERN", "PCL:CFASOURCEPATTERN",
+        "PCL:CFAPATTERN",
+    )
+    for key in direct_keys:
+        if key in values:
+            pattern = normalize_bayer_pattern_value(values[key])
+            if pattern:
+                return pattern
+
+    for key, value in values.items():
+        key_upper = str(key).upper()
+        if any(token in key_upper for token in ("BAYER", "CFA", "FILTERPAT")):
+            pattern = normalize_bayer_pattern_value(value)
+            if pattern:
+                return pattern
+    return None
+
+
 def bayer_pattern_for_fits_path(path: Path, override: Optional[str] = None) -> Optional[str]:
     """Rychle zjistí, jestli se FIT/FITS bude debayerovat.
 
@@ -692,7 +875,19 @@ def bayer_pattern_for_fits_path(path: Path, override: Optional[str] = None) -> O
     sekvenci ještě před multiprocessingem a načtení každého velkého FITu by
     vytvořilo zbytečnou sériovou fázi před paralelním debayeringem.
     """
-    if fits is None or Path(path).suffix.lower() not in {".fits", ".fit"}:
+    suffix = Path(path).suffix.lower()
+    if suffix in XISF_EXTENSIONS:
+        selected = str(override if override is not None else get_bayer_pattern_override()).strip()
+        if selected.upper() in BAYER_PATTERNS:
+            return selected.upper()
+        if selected.lower() == "mono":
+            return None
+        try:
+            return bayer_pattern_from_xisf_metadata(xisf_image_metadata(path))
+        except Exception:
+            return None
+
+    if fits is None or suffix not in FITS_EXTENSIONS:
         return None
 
     selected = str(override if override is not None else get_bayer_pattern_override()).strip()
@@ -768,6 +963,10 @@ def linear_array_to_uint16_for_demosaic(arr: np.ndarray) -> np.ndarray:
     Převod je lineární, bez percentilového stretche.
     """
     original = np.asarray(arr)
+    if original.dtype == np.uint16:
+        return np.ascontiguousarray(original)
+    if original.dtype == np.uint8:
+        return np.ascontiguousarray(original.astype(np.uint16) * np.uint16(257))
     if np.issubdtype(original.dtype, np.integer):
         info = np.iinfo(original.dtype)
         data = original.astype(np.float32)
@@ -792,35 +991,40 @@ def debayer_fits_to_rgb_float(raw: np.ndarray, pattern: str) -> np.ndarray:
     """
     pattern = (pattern or "").upper()
     code_map = {
-        "RGGB": cv2.COLOR_BayerRG2RGB,
-        "BGGR": cv2.COLOR_BayerBG2RGB,
-        "GRBG": cv2.COLOR_BayerGR2RGB,
-        "GBRG": cv2.COLOR_BayerGB2RGB,
+        # These OpenCV aliases preserve the same RGB channel order as the
+        # previous RGB conversion followed by a channel reversal.
+        "RGGB": cv2.COLOR_BayerRG2BGR,
+        "BGGR": cv2.COLOR_BayerBG2BGR,
+        "GRBG": cv2.COLOR_BayerGR2BGR,
+        "GBRG": cv2.COLOR_BayerGB2BGR,
     }
     if pattern not in code_map:
         raise ValueError(f"Nepodporovaný Bayer pattern: {pattern}")
 
     raw16 = linear_array_to_uint16_for_demosaic(raw)
     rgb16 = cv2.cvtColor(raw16, code_map[pattern])
-    rgb16 = rgb16[..., ::-1]
-    return normalize_fits_linear_to_float(rgb16)
+    return np.ascontiguousarray(rgb16.astype(np.float32) * np.float32(1.0 / 65535.0))
 
 
 def debayer_sensor_mosaic_to_rgb_float(raw: np.ndarray, pattern: str) -> np.ndarray:
     """Debayer an already normalized 2D sensor mosaic without rescaling it."""
     pattern = (pattern or "").upper()
     code_map = {
-        "RGGB": cv2.COLOR_BayerRG2RGB,
-        "BGGR": cv2.COLOR_BayerBG2RGB,
-        "GRBG": cv2.COLOR_BayerGR2RGB,
-        "GBRG": cv2.COLOR_BayerGB2RGB,
+        "RGGB": cv2.COLOR_BayerRG2BGR,
+        "BGGR": cv2.COLOR_BayerBG2BGR,
+        "GRBG": cv2.COLOR_BayerGR2BGR,
+        "GBRG": cv2.COLOR_BayerGB2BGR,
     }
     if pattern not in code_map:
         raise ValueError(f"Nepodporovaný Bayer pattern: {pattern}")
-    raw16 = (np.clip(np.asarray(raw, dtype=np.float32), 0, 1) * 65535.0).astype(np.uint16)
+    source = np.asarray(raw, dtype=np.float32)
+    work = np.empty_like(source, dtype=np.float32)
+    np.clip(source, 0, 1, out=work)
+    np.multiply(work, np.float32(65535.0), out=work)
+    raw16 = work.astype(np.uint16)
+    del work
     rgb16 = cv2.cvtColor(raw16, code_map[pattern])
-    rgb16 = rgb16[..., ::-1]
-    return np.ascontiguousarray((rgb16.astype(np.float32) / 65535.0).astype(np.float32))
+    return np.ascontiguousarray(rgb16.astype(np.float32) * np.float32(1.0 / 65535.0))
 
 
 def normalize_sensor_mosaic_to_float(arr: np.ndarray) -> np.ndarray:
@@ -901,6 +1105,75 @@ def load_fits_as_float(path: Path) -> np.ndarray:
         raise ValueError(f"Nepodporovaný FITS rozměr {data.ndim}D v souboru {path.name}")
 
     return np.ascontiguousarray(img.astype(np.float32))
+
+
+def load_xisf_data_and_metadata(path: Path) -> Tuple[np.ndarray, Dict[str, Any]]:
+    if XISF is None:
+        raise RuntimeError("Pro XISF podporu nainstaluj: pip install xisf")
+    metadata: Dict[str, Any] = {}
+    try:
+        data = XISF.read(str(path), n=0, image_metadata=metadata)
+    except Exception as exc:
+        log_debug(f"XISF load failed: {path}\n{traceback.format_exc()}")
+        raise RuntimeError(f"XISF se nepodařilo načíst: {exc}") from exc
+    if data is None:
+        raise ValueError(f"XISF soubor neobsahuje obrazová data: {path.name}")
+    return np.asarray(data), metadata
+
+
+def normalize_xisf_linear_to_float(arr: np.ndarray) -> np.ndarray:
+    """Preserve native normalized XISF floats; scale integer samples by dtype."""
+    original = np.asarray(arr)
+    if original.size == 0:
+        raise ValueError("Prázdný obrazový soubor.")
+    if np.issubdtype(original.dtype, np.integer):
+        info = np.iinfo(original.dtype)
+        data = original.astype(np.float32)
+        data = (data - float(info.min)) / max(1.0, float(info.max - info.min))
+        return np.ascontiguousarray(np.clip(data, 0, 1).astype(np.float32))
+
+    data = np.nan_to_num(np.asarray(original, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    lo = float(np.min(data))
+    hi = float(np.max(data))
+    if lo >= 0.0 and hi <= 1.000001:
+        return np.ascontiguousarray(np.clip(data, 0, 1).astype(np.float32))
+    return np.ascontiguousarray(normalize_fits_linear_to_float(data))
+
+
+def load_xisf_as_float(path: Path) -> np.ndarray:
+    """Load the first XISF image as linear float32 RGB in the 0..1 range."""
+    data, metadata = load_xisf_data_and_metadata(path)
+    pattern = bayer_pattern_from_xisf_metadata(metadata)
+
+    if data.ndim == 2:
+        if pattern:
+            img = debayer_fits_to_rgb_float(data, pattern)
+        else:
+            mono = normalize_xisf_linear_to_float(data)
+            img = np.repeat(mono[..., None], 3, axis=2)
+    elif data.ndim == 3:
+        if data.shape[-1] == 1:
+            plane = data[..., 0]
+            if pattern:
+                img = debayer_fits_to_rgb_float(plane, pattern)
+            else:
+                mono = normalize_xisf_linear_to_float(plane)
+                img = np.repeat(mono[..., None], 3, axis=2)
+        elif data.shape[-1] in (3, 4):
+            img = normalize_xisf_linear_to_float(data[..., :3])
+        elif data.shape[0] in (3, 4):
+            img = normalize_xisf_linear_to_float(np.moveaxis(data[:3], 0, -1))
+        else:
+            plane = data[0]
+            if pattern and plane.ndim == 2:
+                img = debayer_fits_to_rgb_float(plane, pattern)
+            else:
+                mono = normalize_xisf_linear_to_float(plane)
+                img = np.repeat(mono[..., None], 3, axis=2)
+    else:
+        raise ValueError(f"Nepodporovaný XISF rozměr {data.ndim}D v souboru {path.name}")
+
+    return np.ascontiguousarray(np.asarray(img, dtype=np.float32))
 
 
 
@@ -998,12 +1271,22 @@ def load_fits_sensor_mosaic_as_float(path: Path) -> Optional[Tuple[np.ndarray, s
 
 
 def load_sensor_mosaic_as_float(path: Path) -> Optional[Tuple[np.ndarray, str]]:
-    """Return an undebayered sensor mosaic for RAW/Bayer FIT, otherwise None."""
+    """Return an undebayered sensor mosaic for RAW/Bayer FIT/XISF, otherwise None."""
     suffix = Path(path).suffix.lower()
     if suffix in RAW_EXTENSIONS:
         return load_raw_sensor_mosaic_as_float(path)
     if suffix in FITS_EXTENSIONS:
         return load_fits_sensor_mosaic_as_float(path)
+    if suffix in XISF_EXTENSIONS:
+        data, metadata = load_xisf_data_and_metadata(path)
+        pattern = bayer_pattern_from_xisf_metadata(metadata)
+        if not pattern:
+            return None
+        if data.ndim == 3 and data.shape[-1] == 1:
+            data = data[..., 0]
+        if data.ndim != 2:
+            return None
+        return np.ascontiguousarray(normalize_sensor_mosaic_to_float(data)), pattern
     return None
 
 
@@ -1128,6 +1411,9 @@ def load_image_as_float(path: Path) -> np.ndarray:
 
     if suffix in {".fits", ".fit"}:
         return load_fits_as_float(path)
+
+    if suffix in XISF_EXTENSIONS:
+        return load_xisf_as_float(path)
 
     if suffix in RAW_EXTENSIONS:
         return load_raw_as_float(path)
@@ -1396,8 +1682,18 @@ def load_manual_calibration_frame(path: Path) -> np.ndarray:
     FIT/FITS calibration masters must keep their exact linear 0..1 scale.
     Normal image formats are still loaded through the general image path.
     """
-    if Path(path).suffix.lower() in FITS_EXTENSIONS:
+    suffix = Path(path).suffix.lower()
+    if suffix in FITS_EXTENSIONS:
         return load_calibration_master_fit(path)
+    if suffix in XISF_EXTENSIONS:
+        data, _metadata = load_xisf_data_and_metadata(path)
+        if data.ndim == 3 and data.shape[-1] == 1:
+            data = data[..., 0]
+        if data.ndim == 3 and data.shape[0] in (3, 4) and data.shape[-1] not in (3, 4):
+            data = np.moveaxis(data[:3], 0, -1)
+        if data.ndim not in (2, 3):
+            raise ValueError(f"Nepodporovaný Master XISF rozměr: {data.shape}")
+        return normalize_xisf_linear_to_float(data)
     return load_image_as_float(path)
 
 
@@ -2956,6 +3252,22 @@ def cpu_stack_tile_worker_count(tile_temp_bytes: int, tile_count: int, available
     return max(1, min(desired, max_by_memory))
 
 
+def torch_masked_median(tensor, valid=None):
+    """NumPy-compatible masked median without torch.nanmedian() on Apple MPS."""
+    if valid is None:
+        valid = torch.isfinite(tensor)
+    counts = valid.sum(dim=0)
+    fill = torch.full((), float("inf"), dtype=tensor.dtype, device=tensor.device)
+    sorted_values = torch.sort(torch.where(valid, tensor, fill), dim=0).values
+    lower_indices = torch.clamp((counts - 1) // 2, min=0).unsqueeze(0)
+    upper_indices = torch.clamp(counts // 2, min=0).unsqueeze(0)
+    lower = torch.gather(sorted_values, 0, lower_indices).squeeze(0)
+    upper = torch.gather(sorted_values, 0, upper_indices).squeeze(0)
+    median = (lower + upper) * 0.5
+    zero = torch.zeros((), dtype=tensor.dtype, device=tensor.device)
+    return torch.where(counts > 0, median, zero)
+
+
 def stack_frames_torch_tensor(tensor, mode: str, sigma: float, require_majority_coverage: bool = False):
     valid = torch.isfinite(tensor)
     zero = torch.zeros((), dtype=tensor.dtype, device=tensor.device)
@@ -2973,13 +3285,14 @@ def stack_frames_torch_tensor(tensor, mode: str, sigma: float, require_majority_
         result = safe_tensor.sum(dim=0) / safe_counts
         return apply_min_coverage(torch.where(counts > 0, result, zero))
 
-    median = torch.nanmedian(tensor, dim=0).values
+    median = torch_masked_median(tensor, valid)
     median_safe = torch.nan_to_num(median, nan=0.0)
     if mode == "median":
         return apply_min_coverage(median_safe)
 
     if mode == "high_rejection":
-        robust_sigma = torch.nanmedian(torch.abs(tensor - median), dim=0).values * 1.4826
+        deviations = torch.where(valid, torch.abs(tensor - median), zero)
+        robust_sigma = torch_masked_median(deviations, valid) * 1.4826
         robust_sigma = torch.nan_to_num(robust_sigma, nan=0.0) + 1e-6
         keep = valid & (tensor <= median + max(0.5, float(sigma)) * robust_sigma)
         accepted_counts = keep.sum(dim=0)
@@ -3059,10 +3372,13 @@ def stack_frames_mps_tiled(arr: np.ndarray, mode: str, sigma: float, target_byte
             tile_result = torch.clamp(tile_result, 0, 1).to(dtype=torch.float32)
             result_cpu[y0:y1, ...] = tile_result.cpu().numpy()
             del tile, tile_result
-            try:
-                torch.mps.empty_cache()
-            except Exception:
-                pass
+
+    # Reuse Metal buffers between tiles; clearing per tile forces a costly
+    # synchronization and repeated allocations.
+    try:
+        torch.mps.empty_cache()
+    except Exception:
+        pass
 
     return result_cpu.astype(np.float32)
 
@@ -3134,7 +3450,7 @@ def stack_frames_gpu_tiled(arr: np.ndarray, mode: str, sigma: float, free_mem: i
     channels = int(np.prod(arr.shape[3:])) if arr.ndim > 3 else 1
     bytes_per_row = max(1, n * w * channels * np.dtype(np.float32).itemsize)
     temp_factor = 6.0 if mode in {"sigma", "high_rejection"} else 4.0 if mode == "median" else 2.0
-    target_bytes = min(256 * 1024 * 1024, int((free_mem or 512 * 1024 * 1024) * 0.22))
+    target_bytes = min(512 * 1024 * 1024, int((free_mem or 512 * 1024 * 1024) * 0.40))
     rows_per_tile = max(8, int(target_bytes / max(1, bytes_per_row * temp_factor)))
     rows_per_tile = min(h, rows_per_tile)
 
@@ -3176,10 +3492,13 @@ def stack_frames_gpu_tiled(arr: np.ndarray, mode: str, sigma: float, free_mem: i
             tile_result = cp.clip(cp.nan_to_num(tile_result, nan=0.0), 0, 1).astype(cp.float32)
             result_cpu[y0:y1, ...] = cp.asnumpy(tile_result)
             del tile, tile_result
-            try:
-                cp.get_default_memory_pool().free_all_blocks()
-            except Exception:
-                pass
+
+        # Let CuPy reuse tile buffers and release the pool once the operation
+        # is complete instead of synchronizing after every tile.
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
 
     return result_cpu.astype(np.float32)
 
@@ -3201,11 +3520,12 @@ def stack_frames_gpu_tiled_from_sequence(frames: List[np.ndarray], mode: str, si
         free_mem, _total_mem = cp.cuda.runtime.memGetInfo()
     except Exception:
         free_mem = 0
-    target_bytes = int((free_mem or 512 * 1024 * 1024) * 0.22)
+    target_bytes = min(512 * 1024 * 1024, int((free_mem or 512 * 1024 * 1024) * 0.40))
     rows_per_tile = max(8, int(target_bytes / max(1, bytes_per_row * temp_factor)))
     rows_per_tile = min(h, rows_per_tile)
     result_cpu = np.empty(first.shape, dtype=np.float32)
 
+    started_at = time.perf_counter()
     log_debug(
         f"GPU sequence tiles: mode={mode}, frames={n}, shape={first.shape}, "
         f"rows_per_tile={rows_per_tile}, free_mem={free_mem}"
@@ -3246,13 +3566,14 @@ def stack_frames_gpu_tiled_from_sequence(frames: List[np.ndarray], mode: str, si
             tile_result = cp.clip(cp.nan_to_num(tile_result, nan=0.0), 0, 1).astype(cp.float32)
             result_cpu[y0:y1, ...] = cp.asnumpy(tile_result)
             del host_tile, tile, tile_result
-            try:
-                cp.get_default_memory_pool().free_all_blocks()
-            except Exception:
-                pass
             if progress_callback:
                 tiles = max(1, int(math.ceil(h / rows_per_tile)))
                 progress_callback(min(98, 80 + int(tile_idx / tiles * 18)), f"Skladam na GPU po blocich VRAM ({tile_idx}/{tiles})...")
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+    log_debug(f"GPU sequence stack finished in {time.perf_counter() - started_at:.3f} s")
     return result_cpu.astype(np.float32)
 
 
@@ -3269,29 +3590,31 @@ def stack_frames_mps_tiled_from_sequence(frames: List[np.ndarray], mode: str, si
     channels = int(np.prod(first.shape[2:])) if first.ndim > 2 else 1
     bytes_per_row = max(1, n * w * channels * np.dtype(np.float32).itemsize)
     temp_factor = 6.0 if mode in {"sigma", "high_rejection"} else 4.0 if mode == "median" else 2.0
-    target_bytes = 256 * 1024 * 1024
+    target_bytes = 384 * 1024 * 1024
     rows_per_tile = max(8, int(target_bytes / max(1, bytes_per_row * temp_factor)))
     rows_per_tile = min(h, rows_per_tile)
     result_cpu = np.empty(first.shape, dtype=np.float32)
     device = torch.device("mps")
 
+    started_at = time.perf_counter()
     log_debug(f"MPS sequence tiles: mode={mode}, frames={n}, shape={first.shape}, rows_per_tile={rows_per_tile}")
     with torch.no_grad():
         for tile_idx, y0 in enumerate(range(0, h, rows_per_tile), start=1):
             y1 = min(h, y0 + rows_per_tile)
             host_tile = np.stack([np.asarray(frame[y0:y1, ...], dtype=np.float32) for frame in frames], axis=0)
-            tile = torch.from_numpy(np.ascontiguousarray(host_tile)).to(device)
+            tile = torch.from_numpy(host_tile).to(device)
             tile_result = stack_frames_torch_tensor(tile, mode, sigma, require_majority_coverage=require_majority_coverage)
             tile_result = torch.clamp(tile_result, 0, 1).to(dtype=torch.float32)
             result_cpu[y0:y1, ...] = tile_result.cpu().numpy()
             del host_tile, tile, tile_result
-            try:
-                torch.mps.empty_cache()
-            except Exception:
-                pass
             if progress_callback:
                 tiles = max(1, int(math.ceil(h / rows_per_tile)))
                 progress_callback(min(98, 80 + int(tile_idx / tiles * 18)), f"Skladam na GPU po blocich sdilene pameti ({tile_idx}/{tiles})...")
+    try:
+        torch.mps.empty_cache()
+    except Exception:
+        pass
+    log_debug(f"MPS sequence stack finished in {time.perf_counter() - started_at:.3f} s")
     return result_cpu.astype(np.float32)
 
 
@@ -4329,8 +4652,8 @@ def prepare_stack_paths(folder: Path, settings: StackSettings, progress_callback
         paths = paths[: settings.max_images]
     if not paths:
         if getattr(settings, "raw_only", False) or getattr(settings, "fit_only", False):
-            raise ValueError("Ve složce nejsou žádné FIT/FITS ani RAW snímky. Vypni volbu Pouze RAW, pokud chceš skládat i PNG/JPG/TIFF/BMP.")
-        raise ValueError("Ve složce nejsou žádné podporované obrázky. Podporované formáty zahrnují FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG a BMP.")
+            raise ValueError("Ve složce nejsou žádné XISF, FIT/FITS ani RAW snímky. Vypni volbu Pouze RAW, pokud chceš skládat i PNG/JPG/TIFF/BMP.")
+        raise ValueError("Ve složce nejsou žádné podporované obrázky. Podporované formáty zahrnují XISF, FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG a BMP.")
 
     all_paths = list(paths)
     if settings.align_mode != "calibration":
@@ -4911,6 +5234,43 @@ def save_stack_fits(
         hdu.writeto(str(path), overwrite=True)
 
 
+def save_stack_xisf(
+    path: Path,
+    img: np.ndarray,
+    stack_info: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Save a linear RGB stack as compressed 32-bit floating-point XISF."""
+    if XISF is None:
+        raise RuntimeError("Pro uložení XISF nainstaluj: pip install xisf")
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = np.asarray(img, dtype=np.float32)
+    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+    data = np.ascontiguousarray(np.clip(data, 0, 1).astype(np.float32))
+
+    fits_keywords: Dict[str, List[Dict[str, Any]]] = {}
+    keyword_map = {
+        "align_mode": "ASALIGN",
+        "stack_mode": "ASSTACK",
+        "sigma": "ASSIGMA",
+        "num_images": "ASCOUNT",
+        "bayer_pattern": "ASBAYER",
+    }
+    for source_key, keyword in keyword_map.items():
+        if stack_info and source_key in stack_info:
+            fits_keywords[keyword] = [{"value": str(stack_info[source_key]), "comment": "Astro Stacker"}]
+    image_metadata = {"FITSKeywords": fits_keywords} if fits_keywords else None
+    XISF.write(
+        str(path),
+        data,
+        creator_app=f"Astro Stacker {APP_VERSION}",
+        image_metadata=image_metadata,
+        codec="zstd",
+        shuffle=True,
+    )
+
+
 def stack_star_and_comet_two_outputs(folder: Path, settings: StackSettings, use_multiprocessing: bool = False, processes: int = 1, progress_callback=None) -> None:
     set_bayer_pattern_override(getattr(settings, "bayer_pattern", "auto"))
     """Režim Star + Comet: pouze uloží dva samostatné soubory.
@@ -5311,7 +5671,7 @@ def apply_color_background_correction(img: np.ndarray, strength: float = 0.0) ->
 
 
 def apply_polynomial_gradient_removal(img: np.ndarray) -> np.ndarray:
-    """Remove a smooth additive background gradient with a robust 2D model."""
+    """Remove a strong smooth RGB gradient with the validated production model."""
     arr = np.asarray(img, dtype=np.float32)
     if arr.ndim != 3 or arr.shape[2] < 3:
         return arr
@@ -5324,16 +5684,24 @@ def apply_polynomial_gradient_removal(img: np.ndarray) -> np.ndarray:
     if scale < 0.999:
         sw = max(48, int(round(w * scale)))
         sh = max(48, int(round(h * scale)))
-        work = cv2.resize(arr[..., :3], (sw, sh), interpolation=cv2.INTER_AREA).astype(np.float32)
+        work = cv2.resize(
+            arr[..., :3], (sw, sh), interpolation=cv2.INTER_AREA
+        ).astype(np.float32)
     else:
         work = arr[..., :3]
         sh, sw = h, w
 
-    lum = (0.2126 * work[..., 0] + 0.7152 * work[..., 1] + 0.0722 * work[..., 2]).astype(np.float32)
+    lum = (
+        0.2126 * work[..., 0]
+        + 0.7152 * work[..., 1]
+        + 0.0722 * work[..., 2]
+    ).astype(np.float32)
     finite = np.all(np.isfinite(work), axis=2) & np.isfinite(lum)
     if np.count_nonzero(finite) < 256:
         return arr
-    positive = finite & (np.min(work, axis=2) > max(1e-7, float(np.percentile(lum[finite], 1)) * 0.15))
+
+    low_lum = float(np.percentile(lum[finite], 1))
+    positive = finite & (np.min(work, axis=2) > max(1e-7, low_lum * 0.15))
     if np.count_nonzero(positive) < 256:
         positive = finite
 
@@ -5352,12 +5720,17 @@ def apply_polynomial_gradient_removal(img: np.ndarray) -> np.ndarray:
             cell_lum = lum[y0:y1, x0:x1][valid]
             lo = float(np.percentile(cell_lum, 12))
             hi = float(np.percentile(cell_lum, 48))
-            background = valid & (lum[y0:y1, x0:x1] >= lo) & (lum[y0:y1, x0:x1] <= hi)
+            local_lum = lum[y0:y1, x0:x1]
+            background = valid & (local_lum >= lo) & (local_lum <= hi)
             if np.count_nonzero(background) < 8:
                 continue
             cell = work[y0:y1, x0:x1]
-            samples_xy.append(((x0 + x1 - 1) * 0.5, (y0 + y1 - 1) * 0.5))
-            samples_rgb.append(np.median(cell[background], axis=0).astype(np.float32))
+            samples_xy.append(
+                ((x0 + x1 - 1) * 0.5, (y0 + y1 - 1) * 0.5)
+            )
+            samples_rgb.append(
+                np.median(cell[background], axis=0).astype(np.float32)
+            )
 
     if len(samples_xy) < 18:
         return arr
@@ -5366,7 +5739,9 @@ def apply_polynomial_gradient_removal(img: np.ndarray) -> np.ndarray:
     values = np.asarray(samples_rgb, dtype=np.float64)
     nx = coords[:, 0] / max(1.0, float(sw - 1)) * 2.0 - 1.0
     ny = coords[:, 1] / max(1.0, float(sh - 1)) * 2.0 - 1.0
-    design = np.stack([np.ones_like(nx), nx, ny, nx * nx, nx * ny, ny * ny], axis=1)
+    design = np.stack(
+        [np.ones_like(nx), nx, ny, nx * nx, nx * ny, ny * ny], axis=1
+    )
 
     coeffs = []
     for channel in range(3):
@@ -5376,23 +5751,54 @@ def apply_polynomial_gradient_removal(img: np.ndarray) -> np.ndarray:
         for _ in range(4):
             residual = channel_values - design @ coef
             center = float(np.median(residual[keep]))
-            mad = float(np.median(np.abs(residual[keep] - center))) * 1.4826 + 1e-8
+            mad = (
+                float(np.median(np.abs(residual[keep] - center))) * 1.4826
+                + 1e-8
+            )
             new_keep = np.abs(residual - center) <= 2.8 * mad
             if np.count_nonzero(new_keep) < 12:
                 break
             keep = new_keep
-            coef = np.linalg.lstsq(design[keep], channel_values[keep], rcond=None)[0]
+            coef = np.linalg.lstsq(
+                design[keep], channel_values[keep], rcond=None
+            )[0]
         coeffs.append(coef)
 
-    fx = (np.arange(w, dtype=np.float32)[None, :] / max(1.0, float(w - 1)) * 2.0 - 1.0)
-    fy = (np.arange(h, dtype=np.float32)[:, None] / max(1.0, float(h - 1)) * 2.0 - 1.0)
+    fx = (
+        np.arange(w, dtype=np.float32)[None, :]
+        / max(1.0, float(w - 1))
+        * 2.0
+        - 1.0
+    )
+    fy = (
+        np.arange(h, dtype=np.float32)[:, None]
+        / max(1.0, float(h - 1))
+        * 2.0
+        - 1.0
+    )
     corrected = arr[..., :3].copy()
     for channel, coef in enumerate(coeffs):
         c = np.asarray(coef, dtype=np.float32)
-        background = c[0] + c[1] * fx + c[2] * fy + c[3] * fx * fx + c[4] * fx * fy + c[5] * fy * fy
+        background = (
+            c[0]
+            + c[1] * fx
+            + c[2] * fy
+            + c[3] * fx * fx
+            + c[4] * fx * fy
+            + c[5] * fy * fy
+        )
         target = float(np.median(design @ coef))
         corrected[..., channel] -= background - target
-    return np.clip(np.nan_to_num(corrected, nan=0.0, posinf=1.0, neginf=0.0), 0, 1).astype(np.float32)
+
+    log_debug(
+        f"{GRADIENT_REMOVAL_ALGORITHM_VERSION}: "
+        f"samples={len(samples_xy)}, size={w}x{h}"
+    )
+    return np.clip(
+        np.nan_to_num(corrected, nan=0.0, posinf=1.0, neginf=0.0),
+        0.0,
+        1.0,
+    ).astype(np.float32)
 
 
 def apply_astro_denoise(img: np.ndarray, strength: float = 0.0) -> np.ndarray:
@@ -5497,28 +5903,18 @@ def apply_stretch(img: np.ndarray, s: StretchSettings) -> np.ndarray:
     gamma = max(0.05, s.gamma)
     out = np.power(out, 1.0 / gamma)
 
-    # Komprese jasů / highlight protection.
-    # Osvědčená varianta: komprese proběhne před filmic křivkou.
-    hc = max(0.0, float(getattr(s, "highlight_compression", 0.0)))
-    if hc > 0:
-        c = hc * hc * 0.15
-        out = out / (1.0 + c * out)
-
-    # Jemná filmic / S-curve komprese highlightů.
-    # Pomáhá proti přepáleným hvězdám a jádrům galaxií. Normalizace se nesmí
-    # počítat z aktuálního minima/maxima obrazu, protože po cropu by se tím
-    # změnil význam Black/White/Gamma jezdců.
-    k = 7.5
-    midpoint = 0.38
-    curve_min = 1.0 / (1.0 + math.exp(-k * (0.0 - midpoint)))
-    curve_input_max = 1.0
-    if hc > 0:
-        c = hc * hc * 0.15
-        curve_input_max = 1.0 / (1.0 + c)
-    curve_max = 1.0 / (1.0 + math.exp(-k * (curve_input_max - midpoint)))
-    out = 1.0 / (1.0 + np.exp(-k * (out - midpoint)))
-    out = (out - curve_min) / max(1e-6, (curve_max - curve_min))
-    out = np.clip(out, 0, 1)
+    # Adjustable STF strength. The hybrid FIT/STF display generated above is
+    # the neutral midpoint. Moving below 5 restrains the midtones; moving above
+    # 5 reveals progressively weaker structures while black and white stay
+    # fixed.
+    stf_strength = float(np.clip(getattr(s, "stf_strength", 5.0), 0.0, 10.0))
+    signed_strength = (stf_strength - 5.0) / 5.0
+    if abs(signed_strength) > 1e-6:
+        if signed_strength > 0:
+            mtf = 0.5 - 0.24 * np.power(signed_strength, 0.85)
+        else:
+            mtf = 0.5 + 0.18 * np.power(-signed_strength, 0.85)
+        out = midtones_transfer(float(mtf), out)
 
     out = (out - 0.5) * s.contrast + 0.5
     out = np.clip(out, 0, 1)
@@ -5532,11 +5928,14 @@ def apply_stretch(img: np.ndarray, s: StretchSettings) -> np.ndarray:
     # SCNR Green — astro potlačení zeleného nádechu po RGB balance.
     out = apply_scnr_green(out, getattr(s, "scnr_green_strength", 0))
 
-    # Saturation in HSV
-    hsv = cv2.cvtColor((out * 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+    # Saturation in floating-point HSV. Keep the processing pipeline at
+    # float32 precision; uint8 conversion belongs only to the final GUI/PNG
+    # output and would otherwise reduce even 16-bit TIFF exports to 256 levels.
+    hsv = cv2.cvtColor(np.ascontiguousarray(out.astype(np.float32)), cv2.COLOR_RGB2HSV)
     hsv[..., 1] *= s.saturation
-    hsv[..., 1] = np.clip(hsv[..., 1], 0, 255)
-    out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32) / 255.0
+    hsv[..., 1] = np.clip(hsv[..., 1], 0.0, 1.0)
+    out = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB).astype(np.float32)
+    out = np.clip(out, 0.0, 1.0)
     out = apply_astro_denoise(out, getattr(s, "denoise_strength", 0.0))
     return out
 
@@ -6201,7 +6600,17 @@ class ClickableImageLabel(QLabel):
         self._crop_selection_mode = False
         self._crop_start_pos = None
         self._crop_current_pos = None
+        self._overlay_markers = []
+        self._overlay_image_size = (1, 1)
         self.setCursor(Qt.OpenHandCursor)
+
+    def set_overlay_markers(self, markers, image_size):
+        self._overlay_markers = list(markers or [])
+        self._overlay_image_size = (
+            max(1, int(image_size[0])),
+            max(1, int(image_size[1])),
+        )
+        self.update()
 
     def _interaction_cursor(self):
         if self._marking_mode or self._crop_selection_mode:
@@ -6349,16 +6758,30 @@ class ClickableImageLabel(QLabel):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        if not self._crop_selection_mode or self._crop_start_pos is None or self._crop_current_pos is None:
-            return
-        rect = QRectF(self._crop_start_pos, self._crop_current_pos).normalized()
-        if rect.width() < 2 or rect.height() < 2:
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False)
-        painter.fillRect(rect, QColor(80, 160, 255, 45))
-        painter.setPen(QPen(QColor(140, 205, 255), 2, Qt.DashLine))
-        painter.drawRect(rect)
+        pixmap = self.pixmap()
+        if self._overlay_markers and pixmap is not None and not pixmap.isNull():
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            pw = float(pixmap.width())
+            ph = float(pixmap.height())
+            ox = max(0.0, (float(self.width()) - pw) / 2.0)
+            oy = max(0.0, (float(self.height()) - ph) / 2.0)
+            image_w, image_h = self._overlay_image_size
+            marker_scale = min(pw / float(image_w), ph / float(image_h))
+            for nx, ny, color, outer_radius, inner_radius in self._overlay_markers:
+                center = QPointF(ox + float(nx) * pw, oy + float(ny) * ph)
+                painter.setPen(QPen(QColor.fromRgbF(*color), 1.0))
+                painter.drawEllipse(center, max(7.0, outer_radius * marker_scale), max(7.0, outer_radius * marker_scale))
+                painter.drawEllipse(center, max(3.5, inner_radius * marker_scale), max(3.5, inner_radius * marker_scale))
+
+        if self._crop_selection_mode and self._crop_start_pos is not None and self._crop_current_pos is not None:
+            rect = QRectF(self._crop_start_pos, self._crop_current_pos).normalized()
+            if rect.width() >= 2 and rect.height() >= 2:
+                painter = QPainter(self)
+                painter.setRenderHint(QPainter.Antialiasing, False)
+                painter.fillRect(rect, QColor(80, 160, 255, 45))
+                painter.setPen(QPen(QColor(140, 205, 255), 2, Qt.DashLine))
+                painter.drawRect(rect)
 
     def _legacy_mousePressEvent(self, event):
         pixmap = self.pixmap()
@@ -6748,8 +7171,9 @@ class StackWorker(QThread):
             ("Hotovo", "Done"),
             ("Žádný snímek neprošel zarovnáním. Zkontroluj, zda složka Light neobsahuje Dark/Bias snímky nebo zda jsou ve snímcích detekovatelné hvězdy.", "No frame passed alignment. Check whether the Light folder contains Dark/Bias frames or whether detectable stars are present."),
             ("Star + Comet výstupy vyžadují označení komety v prvním i posledním snímku.", "Star + Comet outputs require marking the comet in both the first and last frame."),
-            ("Ve složce nejsou žádné FIT/FITS ani RAW snímky. Vypni volbu Pouze RAW, pokud chceš skládat i PNG/JPG/TIFF/BMP.", "The folder contains no FIT/FITS or RAW frames. Disable RAW only if you also want to stack PNG/JPG/TIFF/BMP files."),
-            ("Ve složce nejsou žádné podporované obrázky. Podporované formáty zahrnují FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG a BMP.", "The folder contains no supported images. Supported formats include FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG and BMP."),
+            ("Ve složce nejsou žádné XISF, FIT/FITS ani RAW snímky. Vypni volbu Pouze RAW, pokud chceš skládat i PNG/JPG/TIFF/BMP.", "The folder contains no XISF, FIT/FITS or RAW frames. Disable RAW only if you also want to stack PNG/JPG/TIFF/BMP files."),
+            ("Ve složce nejsou žádné podporované obrázky. Podporované formáty zahrnují XISF, FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG a BMP.", "The folder contains no supported images. Supported formats include XISF, FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG and BMP."),
+            ("Pro XISF podporu nainstaluj", "Install for XISF support"),
             ("Ve složce nezbyly žádné light snímky. Zkontroluj, zda nejsou soubory označené jako Dark/Bias/Flat.", "No light frames remain in the folder. Check whether files are marked as Dark/Bias/Flat."),
             ("Pro FITS podporu nainstaluj", "Install for FITS support"),
             ("RAW podpora vyžaduje rawpy. Nainstaluj", "RAW support requires rawpy. Install"),
@@ -6881,7 +7305,7 @@ class AstroStackerWindow(QMainWindow):
             "missing_folder_title": "Chybí složka",
             "missing_folder_message": "Nejdřív vyber složku se snímky.",
             "missing_frames_title": "Chybí snímky",
-            "missing_frames_message": "Ve složce nejsou žádné podporované obrázky. Podporované formáty zahrnují FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG a BMP.",
+            "missing_frames_message": "Ve složce nejsou žádné podporované obrázky. Podporované formáty zahrnují XISF, FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG a BMP.",
             "comet_not_marked_title": "Kometa není označena ve dvou snímcích",
             "comet_not_marked_message": "Pro tento typ dat označ kometu v prvním i posledním snímku. Jediný bod nestačí, protože slabé jádro za soumraku se v dalších snímcích nemusí automaticky najít.",
             "star_comet_done": "Hotovo — uloženo do astro_stacker_output: 01_star_stack.fit a 02_comet_stack.fit",
@@ -6922,8 +7346,8 @@ class AstroStackerWindow(QMainWindow):
             "show_left_panel": "Zobrazit levý panel",
             "hide_right_panel": "Skrýt pravý panel",
             "show_right_panel": "Zobrazit pravý panel",
-            "curves": "Křivky / barvy / kontrast", "highlight": "Komprese jasů",
-            "highlight_tooltip": "10 = bez komprese; směrem k 0 se jasné oblasti více potlačí.",
+            "curves": "Křivky / barvy / kontrast", "stf_strength": "Síla STF",
+            "stf_strength_tooltip": "0 = jemné STF; 5 = standardní náhled; 10 = silné STF pro velmi slabé snímky.",
             "auto_stretch": "Balance",
             "auto_stretch_tooltip": "Neutralizuje pozadí a nastaví black point/gamma pouze pro náhled. Lineární FIT výstup se nemění.",
             "auto_stretch_done": "Balance nastaven pouze pro náhled.",
@@ -6938,7 +7362,7 @@ class AstroStackerWindow(QMainWindow):
             "flip_v": "Flip V", "rotate_left": "Left 90", "rotate_right": "Right 90",
             "preview_view": "Zobrazení náhledu", "fit": "Přizpůsobit",
             "reset": "Reset úprav", "starting": "Startuji…", "cancel_requested": "Zastavuji po dokončení aktuálního kroku…",
-            "cancelled": "Skládání zastaveno.", "done_edit": "Složeno. Nyní můžeš ladit křivky, barvy a kontrast.",
+            "cancelled": "Skládání zastaveno.", "done_edit": "Složeno lineárně. Pro zviditelnění náhledu použij Balance.",
             "auto_rotated": "Automaticky pootočeno {angle:+.2f}°.",
             "failed": "Chyba při skládání.",
             "preview_prompt": "Vyber složku a spusť skládání.",
@@ -6990,7 +7414,7 @@ class AstroStackerWindow(QMainWindow):
             "not_enough_background_message": "Nepodařilo se najít dostatek neutrálního pozadí.",
             "background_too_dark_title": "Pozadí je příliš tmavé",
             "background_too_dark_message": "Pozadí má příliš nízký signál pro neutralizaci.",
-            "neutralization_applied": "Neutralizace pozadí aplikována: R×{r:.2f}, G×{g:.2f}, B×{b:.2f} (pozadí před: R {r_med:.3f}, G {g_med:.3f}, B {b_med:.3f})",
+            "neutralization_applied": "Neutralizace pozadí aplikována: posun R {r:+.4f}, G {g:+.4f}, B {b:+.4f} (pozadí před: R {r_med:.4f}, G {g_med:.4f}, B {b_med:.4f})",
             "neutralization_cleared": "Neutralizace pozadí zrušena.",
             "remove_gradient": "Odstranit gradient",
             "clear_gradient": "Zrušit gradient",
@@ -7048,7 +7472,7 @@ class AstroStackerWindow(QMainWindow):
             "missing_folder_title": "Missing folder",
             "missing_folder_message": "Choose an image folder first.",
             "missing_frames_title": "Missing frames",
-            "missing_frames_message": "No supported images were found in the folder. Supported formats include FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG, and BMP.",
+            "missing_frames_message": "No supported images were found in the folder. Supported formats include XISF, FIT/FITS, CR2/CR3/RAW, TIFF, PNG, JPG, and BMP.",
             "comet_not_marked_title": "Comet is not marked in two frames",
             "comet_not_marked_message": "For this data type, mark the comet in both the first and last frame. A single point is not enough because a weak nucleus may not be detected automatically in later frames.",
             "star_comet_done": "Done - saved to astro_stacker_output: 01_star_stack.fit and 02_comet_stack.fit",
@@ -7089,8 +7513,8 @@ class AstroStackerWindow(QMainWindow):
             "show_left_panel": "Show left panel",
             "hide_right_panel": "Hide right panel",
             "show_right_panel": "Show right panel",
-            "curves": "Curves / color / contrast", "highlight": "Highlight compression",
-            "highlight_tooltip": "10 = no compression; moving toward 0 suppresses bright areas more strongly.",
+            "curves": "Curves / color / contrast", "stf_strength": "STF strength",
+            "stf_strength_tooltip": "0 = gentle STF; 5 = standard preview; 10 = strong STF for very faint images.",
             "auto_stretch": "Balance",
             "auto_stretch_tooltip": "Neutralizes background and sets black point/gamma for preview only. Linear FIT output is unchanged.",
             "auto_stretch_done": "Balance applied to preview only.",
@@ -7105,7 +7529,7 @@ class AstroStackerWindow(QMainWindow):
             "flip_v": "Flip V", "rotate_left": "Rotate left", "rotate_right": "Rotate right",
             "preview_view": "Preview view", "fit": "Fit",
             "reset": "Reset adjustments", "starting": "Starting…", "cancel_requested": "Stopping after the current step…",
-            "cancelled": "Stacking stopped.", "done_edit": "Stacked. You can now adjust curves, color, and contrast.",
+            "cancelled": "Stacking stopped.", "done_edit": "Linear stack complete. Use Balance to stretch the preview.",
             "auto_rotated": "Auto-rotated {angle:+.2f}°.",
             "failed": "Stacking failed.",
             "preview_prompt": "Choose a folder and start stacking.",
@@ -7157,7 +7581,7 @@ class AstroStackerWindow(QMainWindow):
             "not_enough_background_message": "Could not find enough neutral background.",
             "background_too_dark_title": "Background is too dark",
             "background_too_dark_message": "The background signal is too low for neutralization.",
-            "neutralization_applied": "Background neutralization applied: R×{r:.2f}, G×{g:.2f}, B×{b:.2f} (background before: R {r_med:.3f}, G {g_med:.3f}, B {b_med:.3f})",
+            "neutralization_applied": "Background neutralization applied: offsets R {r:+.4f}, G {g:+.4f}, B {b:+.4f} (background before: R {r_med:.4f}, G {g_med:.4f}, B {b_med:.4f})",
             "neutralization_cleared": "Background neutralization cleared.",
             "remove_gradient": "Remove gradient",
             "clear_gradient": "Clear gradient",
@@ -7214,16 +7638,23 @@ class AstroStackerWindow(QMainWindow):
         self.preview_display_cache: Optional[np.ndarray] = None
         self.preview_display_cache_source_id: Optional[int] = None
         self.preview_display_cache_neutralized: bool = False
+        self.preview_display_cache_stretched: bool = True
         self.neutralized_preview_layer: Optional[np.ndarray] = None
         self.neutralized_preview_base_source_id: Optional[int] = None
         self.gradient_preview_layer: Optional[np.ndarray] = None
         self.gradient_preview_base_source_id: Optional[int] = None
         self.preview_display_cache_edge: int = 0
         self.preview_display_scale: float = 1.0
-        self.preview_display_limits: Optional[Tuple[float, float]] = None
+        self.preview_fast_display_cache: Optional[np.ndarray] = None
+        self.preview_fast_display_cache_key: Optional[Tuple[int, int]] = None
+        self.preview_display_limits: Optional[Tuple[float, ...]] = None
+        # A completed stack starts as a true linear preview. Balance enables
+        # the robust display-only stretch without modifying linear_result.
+        self.preview_auto_display_stretch: bool = True
         self.preview_heavy_cache: Optional[np.ndarray] = None
         self.preview_heavy_cache_key: Optional[Tuple[Any, ...]] = None
         self.preview_render_array: Optional[np.ndarray] = None
+        self.preview_fast_zoom_scale: float = 1.0
         self.showing_intro_preview: bool = False
         self.preview_interactive: bool = False
         self.preview_slider_zoom_state: Optional[Dict[str, Any]] = None
@@ -7541,7 +7972,7 @@ class AstroStackerWindow(QMainWindow):
 
         self.fit_only_check = QCheckBox("Pouze RAW")
         self.fit_only_check.setChecked(False)
-        self.fit_only_check.setToolTip("Při skládání použije pouze FIT/FITS a foto RAW soubory; ignoruje JPG/PNG/BMP/TIFF ve stejné složce.")
+        self.fit_only_check.setToolTip("Při skládání použije pouze XISF, FIT/FITS a foto RAW soubory; ignoruje JPG/PNG/BMP/TIFF ve stejné složce.")
         self.fit_only_check.stateChanged.connect(lambda _state: self.update_frame_quality_title())
 
         self.normalize_check = QCheckBox("Normalizovat pozadí")
@@ -7634,7 +8065,7 @@ class AstroStackerWindow(QMainWindow):
         self.bayer_combo.addItem("BGGR", "BGGR")
         self.bayer_combo.addItem("GRBG", "GRBG")
         self.bayer_combo.addItem("GBRG", "GBRG")
-        self.bayer_combo.setToolTip("Ruční override Bayer masky pro FIT/FITS. Auto použije hlavičku; Mono vynutí monochrom.")
+        self.bayer_combo.setToolTip("Ruční override Bayer masky pro XISF/FIT/FITS. Auto použije metadata; Mono vynutí monochrom.")
 
         form = QFormLayout()
 
@@ -7812,6 +8243,10 @@ class AstroStackerWindow(QMainWindow):
 
         self.black_slider = self._slider(0, 65535, 0)
         self.white_slider = self._slider(1, 65535, 65535)
+        curve_step = int(round(65535.0 * 0.05 / 10.0))
+        for curve_slider in (self.black_slider, self.white_slider):
+            curve_slider.setSingleStep(curve_step)
+            curve_slider.setPageStep(curve_step)
         self.gamma_slider = self._slider(10, 400, 100)
         self.contrast_slider = self._slider(10, 300, 100)
         self.saturation_slider = self._slider(0, 300, 100)
@@ -7843,16 +8278,16 @@ class AstroStackerWindow(QMainWindow):
         stretch_header.addSpacing(24)
         right_panel_layout.addLayout(stretch_header)
 
-        self.highlight_compression_slider = QSlider(Qt.Horizontal)
+        self.stf_strength_slider = QSlider(Qt.Horizontal)
 
-        self.highlight_compression_slider.setRange(0, 100)
+        self.stf_strength_slider.setRange(0, 100)
 
-        self.highlight_compression_slider.setValue(100)
+        self.stf_strength_slider.setValue(50)
 
-        self._connect_preview_slider(self.highlight_compression_slider)
-        self.highlight_compression_slider.setToolTip(self.tr_ui("highlight_tooltip"))
+        self._connect_preview_slider(self.stf_strength_slider)
+        self.stf_strength_slider.setToolTip(self.tr_ui("stf_strength_tooltip"))
 
-        add_stretch_row("Komprese jasů", self.slider_with_value(self.highlight_compression_slider), advanced=True)
+        add_stretch_row("Síla STF", self.slider_with_value(self.stf_strength_slider), advanced=True)
 
         self.vignette_removal_slider = QSlider(Qt.Horizontal)
         self.vignette_removal_slider.setRange(0, 100)
@@ -8160,7 +8595,17 @@ class AstroStackerWindow(QMainWindow):
     def slider_position_text(self, slider: QSlider) -> str:
         span = max(1, slider.maximum() - slider.minimum())
         value = (slider.value() - slider.minimum()) / span * 10.0
+        if slider in (getattr(self, "black_slider", None), getattr(self, "white_slider", None)):
+            value = round(value * 20.0) / 20.0
+            return f"{value:0.2f}"
         return f"{value:0.1f}"
+
+    def curve_slider_raw_value(self, slider: QSlider) -> int:
+        span = max(1, slider.maximum() - slider.minimum())
+        display_value = (slider.value() - slider.minimum()) / span * 10.0
+        display_value = round(display_value * 20.0) / 20.0
+        normalized = np.clip(display_value / 10.0, 0.0, 1.0)
+        return int(round(float(normalized) * 65535.0))
 
     def update_slider_value_label(self, slider: QSlider):
         label = getattr(self, "slider_value_labels", {}).get(slider)
@@ -8199,7 +8644,7 @@ class AstroStackerWindow(QMainWindow):
             "blue": self.blue_slider.value(),
         }
         optional = {
-            "highlight_compression": "highlight_compression_slider",
+            "stf_strength": "stf_strength_slider",
             "vignette_removal": "vignette_removal_slider",
             "synthetic_flat": "synthetic_flat_slider",
             "color_background": "color_background_slider",
@@ -8222,7 +8667,7 @@ class AstroStackerWindow(QMainWindow):
             "red": "red_slider",
             "green": "green_slider",
             "blue": "blue_slider",
-            "highlight_compression": "highlight_compression_slider",
+            "stf_strength": "stf_strength_slider",
             "vignette_removal": "vignette_removal_slider",
             "synthetic_flat": "synthetic_flat_slider",
             "color_background": "color_background_slider",
@@ -8263,6 +8708,7 @@ class AstroStackerWindow(QMainWindow):
             "flip_vertical": bool(getattr(self, "flip_vertical", False)),
             "preview_rotation_degrees": int(getattr(self, "preview_rotation_degrees", 0)),
             "preview_display_limits": self.preview_display_limits,
+            "preview_auto_display_stretch": bool(self.preview_auto_display_stretch),
             "stretch": self._stretch_slider_values(),
         }
         stack = getattr(self, "preview_undo_stack", [])
@@ -8304,6 +8750,7 @@ class AstroStackerWindow(QMainWindow):
             self.flip_vertical = bool(state.get("flip_vertical", False))
             self.preview_rotation_degrees = int(state.get("preview_rotation_degrees", 0))
             self.preview_display_limits = state.get("preview_display_limits")
+            self.preview_auto_display_stretch = bool(state.get("preview_auto_display_stretch", True))
             self._restore_stretch_slider_values(state.get("stretch", {}))
         finally:
             self.restoring_preview_undo = False
@@ -8799,6 +9246,7 @@ class AstroStackerWindow(QMainWindow):
         self.preview_override = img
         self.preview_override_path = str(path)
         self.preview_source_shape = img.shape[:2]
+        self.preview_auto_display_stretch = True
         self.reset_preview_display_limits()
         self.awaiting_comet_click = False
         self.comet_click_mode = None
@@ -8894,6 +9342,34 @@ class AstroStackerWindow(QMainWindow):
                 if extra:
                     lines.append("--- Other FITS ---")
                     lines.extend(extra)
+        elif suffix in XISF_EXTENSIONS:
+            try:
+                metadata = xisf_image_metadata(path)
+                geometry = metadata.get("geometry")
+                if geometry:
+                    lines.append(f"XISF geometry: {geometry}")
+                lines.append(f"XISF sample: {metadata.get('sampleFormat', metadata.get('dtype', 'unknown'))}")
+                values = xisf_metadata_values(metadata)
+                preferred = (
+                    "IMAGETYP", "EXPTIME", "EXPOSURE", "GAIN", "OFFSET",
+                    "CCD-TEMP", "INSTRUME", "TELESCOP", "OBJECT", "FILTER",
+                    "DATE-OBS", "BAYERPAT", "CFA", "PCL:CFASOURCEPATTERN",
+                )
+                shown = set()
+                for key in preferred:
+                    if key in values and values[key] not in (None, ""):
+                        lines.append(f"{key}: {values[key]}")
+                        shown.add(key)
+                extra = [
+                    f"{key}: {value}"
+                    for key, value in values.items()
+                    if key not in shown and value not in (None, "")
+                ]
+                if extra:
+                    lines.append("--- Other XISF ---")
+                    lines.extend(extra[:12])
+            except Exception as exc:
+                lines.append(f"XISF metadata error: {exc}")
         elif suffix in RAW_EXTENSIONS and rawpy is not None:
             try:
                 with rawpy.imread(str(path)) as raw:
@@ -8973,7 +9449,7 @@ class AstroStackerWindow(QMainWindow):
                 self,
                 f"Vybrat Master {kind}" if self.language == "cz" else f"Choose Master {kind}",
                 "",
-                "Obrázky/FIT/RAW (*.fits *.fit *.cr2 *.cr3 *.nef *.arw *.dng *.orf *.rw2 *.raf *.tif *.tiff *.png *.jpg *.jpeg *.bmp)",
+        "Obrázky/XISF/FIT/RAW (*.xisf *.fits *.fit *.cr2 *.cr3 *.nef *.arw *.dng *.orf *.rw2 *.raf *.tif *.tiff *.png *.jpg *.jpeg *.bmp)",
             )
         elif msg.clickedButton() is folder_btn:
             selected = QFileDialog.getExistingDirectory(
@@ -9076,6 +9552,7 @@ class AstroStackerWindow(QMainWindow):
         self.neutralized_preview_base_source_id = None
         self.gradient_preview_layer = None
         self.gradient_preview_base_source_id = None
+        self.preview_auto_display_stretch = False
         self.reset_preview_display_limits()
         self.flip_horizontal = False
         self.flip_vertical = False
@@ -9249,7 +9726,7 @@ class AstroStackerWindow(QMainWindow):
             self,
             self.tr_ui("open_image_title"),
             start_dir,
-            f"Images/FIT/RAW (*.fit *.fits *.cr2 *.cr3 *.raw *.nef *.arw *.dng *.orf *.rw2 *.raf *.tif *.tiff *.png *.jpg *.jpeg *.bmp);;RAW (*.cr2 *.cr3 *.raw *.nef *.arw *.dng *.orf *.rw2 *.raf);;FITS (*.fit *.fits);;TIFF (*.tif *.tiff);;{self.tr_ui('all_files')} (*)",
+            f"Images/XISF/FIT/RAW (*.xisf *.fit *.fits *.cr2 *.cr3 *.raw *.nef *.arw *.dng *.orf *.rw2 *.raf *.tif *.tiff *.png *.jpg *.jpeg *.bmp);;XISF (*.xisf);;RAW (*.cr2 *.cr3 *.raw *.nef *.arw *.dng *.orf *.rw2 *.raf);;FITS (*.fit *.fits);;TIFF (*.tif *.tiff);;{self.tr_ui('all_files')} (*)",
         )
         if not filename:
             return
@@ -9441,9 +9918,9 @@ class AstroStackerWindow(QMainWindow):
             self.dark_label.setText(self.tr_ui("dark_unused"))
         if hasattr(self, "fit_only_check"):
             self.fit_only_check.setToolTip(
-                "Při skládání použije pouze FIT/FITS a foto RAW soubory; ignoruje JPG/PNG/BMP/TIFF ve stejné složce."
+                "Při skládání použije pouze XISF, FIT/FITS a foto RAW soubory; ignoruje JPG/PNG/BMP/TIFF ve stejné složce."
                 if self.language == "cz"
-                else "Uses only FIT/FITS and camera RAW files for stacking; ignores JPG/PNG/BMP/TIFF files in the same folder."
+                else "Uses only XISF, FIT/FITS and camera RAW files for stacking; ignores JPG/PNG/BMP/TIFF files in the same folder."
             )
 
         direct = {
@@ -9540,8 +10017,8 @@ class AstroStackerWindow(QMainWindow):
             self.crop_select_btn.setToolTip(self.tr_ui("crop_select_tooltip"))
         if hasattr(self, "denoise_slider"):
             self.denoise_slider.setToolTip(self.tr_ui("astro_denoise_tooltip"))
-        if hasattr(self, "highlight_compression_slider"):
-            self.highlight_compression_slider.setToolTip(self.tr_ui("highlight_tooltip"))
+        if hasattr(self, "stf_strength_slider"):
+            self.stf_strength_slider.setToolTip(self.tr_ui("stf_strength_tooltip"))
         if hasattr(self, "remove_gradient_btn"):
             self.remove_gradient_btn.setToolTip(self.tr_ui("gradient_tooltip"))
         if hasattr(self, "clear_gradient_btn"):
@@ -9625,7 +10102,7 @@ class AstroStackerWindow(QMainWindow):
             "Hledání komety": "comet_search", "Comet search": "comet_search",
             "Ignorovat okraj": "ignore_edge", "Ignore border": "ignore_edge",
             "Bayer FIT": "bayer_fit",
-            "Komprese jasů": "highlight", "Highlight compression": "highlight",
+            "Síla STF": "stf_strength", "STF strength": "stf_strength",
             "Odstranění vinětace": "vignette", "Vignette removal": "vignette",
             "Umělý flat": "synthetic_flat", "Synthetic flat": "synthetic_flat",
             "Korekce barevného pozadí": "color_background", "Color background correction": "color_background",
@@ -9661,11 +10138,12 @@ class AstroStackerWindow(QMainWindow):
                 "<h3>Quick start</h3>"
                 "<ol>"
                 "<li>Choose a folder with Light frames. If you have Flat/Bias/Dark folders next to them, the app can use them automatically.</li>"
-                "<li>Enable <b>RAW only</b> if the folder also contains JPG/PNG/BMP/TIFF preview files that should not be stacked. FIT/FITS and camera RAW files are kept.</li>"
+                "<li>Enable <b>RAW only</b> if the folder also contains JPG/PNG/BMP/TIFF preview files that should not be stacked. XISF, FIT/FITS and camera RAW files are kept.</li>"
                 "<li>For a normal deep-sky stack, use <b>Star alignment + RANSAC</b> and <b>Median</b>. Enable <b>Auto reference</b>; use the quality filter only when needed.</li>"
                 "<li>Click <b>Start stacking</b>. Progress and any warnings are shown in the status line and diagnostic logs.</li>"
-                "<li>After stacking, adjust black/white point, gamma, color, background neutralization, vignette removal, or synthetic flat.</li>"
-                "<li>Export FITS for linear data, or PNG/TIFF for the stretched visual result.</li>"
+                "<li>The completed stack is shown linearly and may initially look black. Use <b>Balance</b> to stretch the preview only.</li>"
+                "<li>Then adjust black/white point, gamma, color, background neutralization, vignette removal, or synthetic flat.</li>"
+                "<li>Export FITS/XISF for linear data, or PNG/TIFF for the current visual result.</li>"
                 "</ol>"
                 "<h3>Input and browsing</h3>"
                 "<ul>"
@@ -9712,7 +10190,7 @@ class AstroStackerWindow(QMainWindow):
                 "</ul>"
                 "<h3>Export</h3>"
                 "<ul>"
-                "<li><b>FITS</b> export stays linear and does not bake in the visual stretch.</li>"
+                "<li><b>FITS/XISF</b> export stays linear and does not bake in the visual stretch.</li>"
                 "<li><b>PNG/TIFF</b> export uses the same visual stretch and color adjustments as the preview. External 16-bit TIFF files are loaded without reducing their tonal depth.</li>"
                 "<li>Settings profiles save and restore stack and stretch controls.</li>"
                 "</ul>"
@@ -9725,11 +10203,12 @@ class AstroStackerWindow(QMainWindow):
                 "<h3>Rychlý návod</h3>"
                 "<ol>"
                 "<li>Vyber složku s Light snímky. Pokud máš vedle ní složky Flat/Bias/Dark, aplikace je umí použít automaticky.</li>"
-                "<li>Zapni <b>Pouze RAW</b>, pokud jsou ve složce také JPG/PNG/BMP/TIFF náhledy, které se nemají skládat. FIT/FITS a foto RAW soubory zůstanou povolené.</li>"
+                "<li>Zapni <b>Pouze RAW</b>, pokud jsou ve složce také JPG/PNG/BMP/TIFF náhledy, které se nemají skládat. XISF, FIT/FITS a foto RAW soubory zůstanou povolené.</li>"
                 "<li>Pro běžné deep-sky skládání použij <b>Star alignment + RANSAC</b> a <b>Medián</b>. Zapni <b>Automatickou referenci</b>; filtr kvality používej podle potřeby.</li>"
                 "<li>Klikni na <b>Spustit skládání</b>. Průběh a případná varování jsou ve stavovém řádku a v diagnostických lozích.</li>"
-                "<li>Po složení dolaď black/white point, gamma, barvy, neutralizaci pozadí, vinětaci nebo umělý flat.</li>"
-                "<li>Exportuj FITS pro lineární data, nebo PNG/TIFF pro vizuálně upravený výsledek.</li>"
+                "<li>Hotový stack se zobrazí lineárně a může zpočátku vypadat černě. Tlačítkem <b>Balance</b> roztáhni pouze náhled.</li>"
+                "<li>Potom dolaď black/white point, gamma, barvy, neutralizaci pozadí, vinětaci nebo umělý flat.</li>"
+                "<li>Exportuj FITS/XISF pro lineární data, nebo PNG/TIFF pro aktuální vizuální výsledek.</li>"
                 "</ol>"
                 "<h3>Vstup a prohlížení</h3>"
                 "<ul>"
@@ -9776,7 +10255,7 @@ class AstroStackerWindow(QMainWindow):
                 "</ul>"
                 "<h3>Export</h3>"
                 "<ul>"
-                "<li><b>FITS</b> export zůstává lineární a neobsahuje vizuální stretch.</li>"
+                "<li><b>FITS/XISF</b> export zůstává lineární a neobsahuje vizuální stretch.</li>"
                 "<li><b>PNG/TIFF</b> export používá stejný vizuální stretch a barevné úpravy jako náhled. Externí 16bit TIFF soubory se načítají bez snížení tonální hloubky.</li>"
                 "<li>Profily nastavení ukládají a obnovují nastavení stacku a vizuálních úprav.</li>"
                 "</ul>"
@@ -10114,7 +10593,7 @@ class AstroStackerWindow(QMainWindow):
                 "black": self.black_slider.value(),
                 "white": self.white_slider.value(),
                 "gamma": self.gamma_slider.value(),
-                "highlight_compression": self.highlight_compression_slider.value() if hasattr(self, "highlight_compression_slider") else 0,
+                "stf_strength": self.stf_strength_slider.value() if hasattr(self, "stf_strength_slider") else 50,
                 "vignette_removal": self.vignette_removal_slider.value() if hasattr(self, "vignette_removal_slider") else 0,
                 "synthetic_flat": self.synthetic_flat_slider.value() if hasattr(self, "synthetic_flat_slider") else 0,
                 "color_background_correction": self.color_background_slider.value() if hasattr(self, "color_background_slider") else 0,
@@ -10202,8 +10681,11 @@ class AstroStackerWindow(QMainWindow):
         set_slider(self.black_slider, "black", stretch)
         set_slider(self.white_slider, "white", stretch)
         set_slider(self.gamma_slider, "gamma", stretch)
-        if hasattr(self, "highlight_compression_slider"):
-            set_slider(self.highlight_compression_slider, "highlight_compression", stretch)
+        if hasattr(self, "stf_strength_slider"):
+            if "stf_strength" in stretch:
+                set_slider(self.stf_strength_slider, "stf_strength", stretch)
+            elif "highlight_compression" in stretch:
+                self.stf_strength_slider.setValue(50)
         if hasattr(self, "vignette_removal_slider"):
             set_slider(self.vignette_removal_slider, "vignette_removal", stretch)
         if hasattr(self, "synthetic_flat_slider"):
@@ -10236,10 +10718,15 @@ class AstroStackerWindow(QMainWindow):
         self.update_preview()
 
     def save_settings_profile(self):
+        default_path = (
+            self.folder / "astro_stacker_profile.json"
+            if self.folder is not None
+            else Path("astro_stacker_profile.json")
+        )
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Uložit profil nastavení",
-            "astro_stacker_profile.json",
+            str(default_path),
             "Astro Stacker profil (*.json)",
         )
         if not filename:
@@ -10314,13 +10801,13 @@ class AstroStackerWindow(QMainWindow):
         )
 
     def current_stretch_settings(self) -> StretchSettings:
-        black = self.black_slider.value()
-        white = max(self.white_slider.value(), black + 1)
+        black = self.curve_slider_raw_value(self.black_slider)
+        white = max(self.curve_slider_raw_value(self.white_slider), black + 1)
         return StretchSettings(
             black=black,
             white=white,
             gamma=self.gamma_slider.value() / 100.0,
-            highlight_compression=(self.highlight_compression_slider.value()) / 10.0 if hasattr(self, "highlight_compression_slider") else 0.0,
+            stf_strength=(self.stf_strength_slider.value()) / 10.0 if hasattr(self, "stf_strength_slider") else 5.0,
             vignette_removal=(self.vignette_removal_slider.value() / 100.0 * 0.30) if hasattr(self, "vignette_removal_slider") else 0.0,
             synthetic_flat=(self.synthetic_flat_slider.value() / 100.0) if hasattr(self, "synthetic_flat_slider") else 0.0,
             color_background_correction=(self.color_background_slider.value() / 100.0) if hasattr(self, "color_background_slider") else 0.0,
@@ -10477,6 +10964,7 @@ class AstroStackerWindow(QMainWindow):
         self.linear_result = result
         self.original_linear_result = result
         self.preview_source_shape = result.shape[:2]
+        self.preview_auto_display_stretch = False
         self.invalidate_preview_cache()
         self.status_label.setText(self.tr_ui("done_edit"))
         self.auto_stretch_initial()
@@ -10520,8 +11008,8 @@ class AstroStackerWindow(QMainWindow):
         self.black_slider.setValue(0)
         self.white_slider.setValue(65535)
         self.gamma_slider.setValue(100)
-        if hasattr(self, "highlight_compression_slider"):
-            self.highlight_compression_slider.setValue(100)
+        if hasattr(self, "stf_strength_slider"):
+            self.stf_strength_slider.setValue(50)
         if hasattr(self, "vignette_removal_slider"):
             self.vignette_removal_slider.setValue(0)
         if hasattr(self, "synthetic_flat_slider"):
@@ -10542,8 +11030,11 @@ class AstroStackerWindow(QMainWindow):
         self.preview_display_cache = None
         self.preview_display_cache_source_id = None
         self.preview_display_cache_neutralized = False
+        self.preview_display_cache_stretched = True
         self.preview_display_cache_edge = 0
         self.preview_display_scale = 1.0
+        self.preview_fast_display_cache = None
+        self.preview_fast_display_cache_key = None
         self.preview_heavy_cache = None
         self.preview_heavy_cache_key = None
         self.preview_render_array = None
@@ -10553,6 +11044,23 @@ class AstroStackerWindow(QMainWindow):
         self.invalidate_preview_cache()
 
     def preview_display_base(self, source: np.ndarray, max_preview_edge: int = 2200) -> np.ndarray:
+        source_h, source_w = source.shape[:2]
+        source_scale = min(
+            1.0,
+            float(max_preview_edge) / float(max(source_h, source_w)),
+        )
+
+        def preview_sized_linear(image: np.ndarray) -> np.ndarray:
+            """Downsample linear data before expensive display-only STF work."""
+            arr = np.asarray(image, dtype=np.float32)
+            h, w = arr.shape[:2]
+            scale = min(1.0, float(max_preview_edge) / float(max(h, w)))
+            if scale >= 0.999:
+                return arr
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            return cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
         gradient_corrected = (
             getattr(self, "gradient_preview_layer", None) is not None
             and getattr(self, "gradient_preview_base_source_id", None) == id(source)
@@ -10567,6 +11075,7 @@ class AstroStackerWindow(QMainWindow):
             self.preview_display_cache is not None
             and self.preview_display_cache_source_id == cache_source_id
             and self.preview_display_cache_neutralized == corrected
+            and self.preview_display_cache_stretched == self.preview_auto_display_stretch
             and self.preview_display_cache_edge == max_preview_edge
         ):
             return self.preview_display_cache
@@ -10575,18 +11084,52 @@ class AstroStackerWindow(QMainWindow):
             self.preview_display_cache is not None
             and self.preview_display_cache_source_id == cache_source_id
             and self.preview_display_cache_neutralized == corrected
+            and self.preview_display_cache_stretched == self.preview_auto_display_stretch
             and self.preview_display_cache_edge >= max_preview_edge
         ):
             base = self.preview_display_cache
+            fast_key = (id(base), int(max_preview_edge))
+            h, w = base.shape[:2]
+            scale_from_cache = min(1.0, float(max_preview_edge) / float(max(h, w)))
+            source_h, source_w = source.shape[:2]
+            self.preview_display_scale = min(
+                1.0,
+                float(max_preview_edge) / float(max(source_h, source_w)),
+            )
+            if self.preview_fast_display_cache is not None and self.preview_fast_display_cache_key == fast_key:
+                return self.preview_fast_display_cache
+            if scale_from_cache < 0.999:
+                new_w = max(1, int(round(w * scale_from_cache)))
+                new_h = max(1, int(round(h * scale_from_cache)))
+                base = cv2.resize(base, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            fast_base = np.ascontiguousarray(base.astype(np.float32))
+            self.preview_fast_display_cache = fast_base
+            self.preview_fast_display_cache_key = fast_key
+            return fast_base
         else:
-            if gradient_corrected:
-                base = self.gradient_preview_layer
-            elif neutralized:
+            if neutralized:
                 base = self.neutralized_preview_layer
+            elif gradient_corrected:
+                base = preview_sized_linear(self.gradient_preview_layer)
+                if self.preview_auto_display_stretch:
+                    base = make_display_preview_base(base)
             else:
-                if self.preview_display_limits is None:
-                    self.preview_display_limits = display_preview_limits(source)
-                base = apply_display_preview_limits(source, self.preview_display_limits)
+                preview_source = preview_sized_linear(source)
+                if self.preview_auto_display_stretch:
+                    if self.preview_display_limits is None:
+                        self.preview_display_limits = display_preview_limits(preview_source)
+                    base = apply_display_preview_limits(preview_source, self.preview_display_limits)
+                else:
+                    base = np.clip(
+                        np.nan_to_num(
+                            preview_source,
+                            nan=0.0,
+                            posinf=1.0,
+                            neginf=0.0,
+                        ),
+                        0.0,
+                        1.0,
+                    )
         h, w = base.shape[:2]
         scale = min(1.0, float(max_preview_edge) / float(max(h, w)))
         if scale < 0.999:
@@ -10599,8 +11142,11 @@ class AstroStackerWindow(QMainWindow):
         self.preview_display_cache = np.ascontiguousarray(base.astype(np.float32))
         self.preview_display_cache_source_id = cache_source_id
         self.preview_display_cache_neutralized = corrected
+        self.preview_display_cache_stretched = self.preview_auto_display_stretch
         self.preview_display_cache_edge = max_preview_edge
-        self.preview_display_scale = scale
+        self.preview_display_scale = source_scale
+        self.preview_fast_display_cache = None
+        self.preview_fast_display_cache_key = None
         return self.preview_display_cache
 
     def preview_heavy_corrected_base(self, display_source: np.ndarray, settings: StretchSettings, fast: bool = False) -> np.ndarray:
@@ -10639,6 +11185,7 @@ class AstroStackerWindow(QMainWindow):
                 "factor": self.zoom_factor,
                 "hbar": self.scroll.horizontalScrollBar().value() if hasattr(self, "scroll") else 0,
                 "vbar": self.scroll.verticalScrollBar().value() if hasattr(self, "scroll") else 0,
+                "render_shape": tuple(self.preview_render_array.shape[:2]) if self.preview_render_array is not None else None,
             }
         self.preview_interactive = True
         self.preview_render_pending_final = False
@@ -10652,7 +11199,7 @@ class AstroStackerWindow(QMainWindow):
     def schedule_preview_update(self, *_args):
         if self.preview_interactive:
             self.preview_render_pending_final = True
-            self.preview_render_timer.start(25)
+            self.preview_render_timer.start(40)
         elif self.preview_slider_zoom_state is not None:
             self.preview_render_pending_final = True
             self.preview_render_timer.start(1)
@@ -10662,10 +11209,7 @@ class AstroStackerWindow(QMainWindow):
 
     def _run_scheduled_preview_update(self):
         if self.preview_interactive:
-            # Při zvětšeném náhledu zachovej rozlišení i zoom. Menší rychlý
-            # náhled by změnil velikost pixmapy a obraz by při pohybu jezdce
-            # viditelně odskočil. V režimu Fit je zmenšený náhled bezpečný.
-            self.update_preview(fast=self.zoom_mode == "fit")
+            self.update_preview(fast=True)
             return
 
         if self.preview_render_pending_final:
@@ -10705,6 +11249,7 @@ class AstroStackerWindow(QMainWindow):
     def show_intro_preview(self):
         if not hasattr(self, "image_label") or self.linear_result is not None or self.preview_override is not None:
             return
+        self.image_label.set_overlay_markers([], (1, 1))
 
         intro_path = bundled_file_path("AstroStacker_intro.png")
         if intro_path is None:
@@ -10739,6 +11284,14 @@ class AstroStackerWindow(QMainWindow):
         self.image_label.setMinimumSize(1, 1)
         self.showing_intro_preview = True
 
+    def interactive_preview_max_edge(self) -> int:
+        """Choose a responsive work resolution for live slider updates."""
+        if not hasattr(self, "scroll"):
+            return 640
+        viewport = self.scroll.viewport().size()
+        visible_edge = max(int(viewport.width()), int(viewport.height()))
+        return max(480, min(800, int(round(visible_edge * 0.80))))
+
     def update_preview(self, fast: bool = False):
         source = self.preview_override if self.preview_override is not None else self.linear_result
         if source is None:
@@ -10747,7 +11300,18 @@ class AstroStackerWindow(QMainWindow):
         self.showing_intro_preview = False
         self.preview_source_shape = source.shape[:2]
 
-        max_preview_edge = 1200 if fast else 2200
+        interactive_target_shape = None
+        if fast and self.zoom_mode == "fixed":
+            saved_shape = (
+                self.preview_slider_zoom_state.get("render_shape")
+                if self.preview_slider_zoom_state is not None
+                else None
+            )
+            if saved_shape is not None:
+                interactive_target_shape = tuple(saved_shape)
+        self.preview_fast_zoom_scale = 1.0
+
+        max_preview_edge = self.interactive_preview_max_edge() if fast else 2200
         display_source = self.preview_display_base(source, max_preview_edge=max_preview_edge)
         stretch_settings = self.current_stretch_settings()
         display_source = self.preview_heavy_corrected_base(display_source, stretch_settings, fast=fast)
@@ -10758,7 +11322,7 @@ class AstroStackerWindow(QMainWindow):
             color_background_correction=0.0,
         )
         preview = apply_stretch(display_source, stretch_settings)
-        if hasattr(self, "histogram_label"):
+        if not fast and hasattr(self, "histogram_label"):
             hist_w = max(180, self.histogram_label.width())
             self.histogram_label.setPixmap(make_histogram_pixmap(preview, hist_w, 120))
 
@@ -10775,7 +11339,17 @@ class AstroStackerWindow(QMainWindow):
         elif rotation == 270:
             preview = np.ascontiguousarray(np.rot90(preview, k=3))
 
-        # Při ručním označování zobrazíme značku jádra komety.
+        # Keep the floating-point work image small. Qt scales the resulting
+        # pixmap to the previous on-screen dimensions in fixed zoom mode.
+        if interactive_target_shape is not None and preview.shape[:2] != interactive_target_shape:
+            target_h, target_w = interactive_target_shape
+            scale_x = float(target_w) / max(1.0, float(preview.shape[1]))
+            scale_y = float(target_h) / max(1.0, float(preview.shape[0]))
+            self.preview_fast_zoom_scale = min(scale_x, scale_y)
+
+        # Značky komety se kreslí jako vektorová vrstva nad pixmapou. Při zoomu
+        # tak zůstávají hladké a tenké místo zvětšování rastrových pixelů.
+        overlay_markers = []
         if self.preview_source_shape is not None:
             h0, w0 = self.preview_source_shape
             preview_path = self.preview_override_path
@@ -10785,22 +11359,30 @@ class AstroStackerWindow(QMainWindow):
             if self.manual_comet_end_xy is not None and preview_path == self.manual_comet_end_path:
                 markers.append((self.manual_comet_end_xy, (0.2, 0.8, 1.0)))
             if markers:
-                preview = preview.copy()
                 preview_h, preview_w = preview.shape[:2]
                 sx = float(preview_w) / max(1.0, float(w0))
                 sy = float(preview_h) / max(1.0, float(h0))
                 for (x0, y0), color in markers:
                     if 0 <= x0 < w0 and 0 <= y0 < h0:
-                        cv2.drawMarker(
-                            preview,
-                            (int(round(x0 * sx)), int(round(y0 * sy))),
-                            color,
-                            markerType=cv2.MARKER_CROSS,
-                            markerSize=max(16, int(round(40 * min(sx, sy)))),
-                            thickness=2,
-                        )
+                        nx = float(x0) / max(1.0, float(w0 - 1))
+                        ny = float(y0) / max(1.0, float(h0 - 1))
+                        if getattr(self, "flip_horizontal", False):
+                            nx = 1.0 - nx
+                        if getattr(self, "flip_vertical", False):
+                            ny = 1.0 - ny
+                        if rotation == 90:
+                            nx, ny = ny, 1.0 - nx
+                        elif rotation == 180:
+                            nx, ny = 1.0 - nx, 1.0 - ny
+                        elif rotation == 270:
+                            nx, ny = 1.0 - ny, nx
+                        marker_scale = min(sx, sy)
+                        outer_radius = max(11, int(round(28 * marker_scale)))
+                        inner_radius = max(5, int(round(12 * marker_scale)))
+                        overlay_markers.append((nx, ny, color, outer_radius, inner_radius))
 
         self.preview_render_array = np.ascontiguousarray(preview)
+        self.image_label.set_overlay_markers(overlay_markers, (preview.shape[1], preview.shape[0]))
         self.render_preview_pixmap()
 
     def render_preview_pixmap(self):
@@ -10830,7 +11412,8 @@ class AstroStackerWindow(QMainWindow):
                 center_rel_x = 0.5
                 center_rel_y = 0.5
 
-            pixmap = numpy_to_qpixmap(preview, max_size=None, zoom=self.zoom_factor)
+            effective_zoom = self.zoom_factor * max(1.0, float(self.preview_fast_zoom_scale))
+            pixmap = numpy_to_qpixmap(preview, max_size=None, zoom=effective_zoom)
             self.image_label.setPixmap(pixmap)
             self.image_label.resize(pixmap.size())
             self.image_label.setMinimumSize(pixmap.size())
@@ -11249,9 +11832,27 @@ class AstroStackerWindow(QMainWindow):
             QMessageBox.information(self, self.tr_ui("neutralize_not_possible_title"), self.tr_ui("neutralize_rgb_required"))
             return
         self.push_preview_undo_state(copy_pixels=False)
+        # Keep the corrected layer linear, exactly like the standalone utility.
+        # Display stretching belongs exclusively to preview_display_base();
+        # otherwise Balance would stretch the same data twice and clip colors.
         corrected = apply_polynomial_gradient_removal(img)
-        self.gradient_preview_layer = make_display_preview_base(corrected)
+        self.gradient_preview_layer = np.ascontiguousarray(corrected.astype(np.float32))
         self.gradient_preview_base_source_id = id(source)
+        # Any previous neutralized layer and black point were calculated from
+        # the pre-correction tonal scale. Reusing them can clip an entire RGB
+        # channel after a strong gradient correction.
+        self.preview_auto_display_stretch = True
+        self.reset_preview_display_limits()
+        neutralized = self.build_neutralized_preview_layer(corrected, show_errors=False)
+        if neutralized is not None:
+            display, _status = neutralized
+            self.neutralized_preview_layer = display
+            self.neutralized_preview_base_source_id = id(source)
+        else:
+            self.neutralized_preview_layer = None
+            self.neutralized_preview_base_source_id = None
+            display = make_display_preview_base(corrected)
+        self._set_auto_stretch_sliders(display)
         self.invalidate_preview_cache()
         self.status_label.setText(self.tr_ui("gradient_removed"))
         self.update_preview()
@@ -11262,6 +11863,8 @@ class AstroStackerWindow(QMainWindow):
             self.push_preview_undo_state(copy_pixels=False)
         self.gradient_preview_layer = None
         self.gradient_preview_base_source_id = None
+        self.neutralized_preview_layer = None
+        self.neutralized_preview_base_source_id = None
         self.invalidate_preview_cache()
         self.status_label.setText(self.tr_ui("gradient_cleared"))
         self.update_preview()
@@ -11320,26 +11923,25 @@ class AstroStackerWindow(QMainWindow):
                 interpolation=cv2.INTER_AREA,
             ).astype(np.float32)
 
-        # Masku pozadí hledáme na display-normalized kopii, protože u lineárních
-        # FIT dat by byly slabé rozdíly v náhledu obtížně použitelné. Nejdřív
-        # najdeme platnou oblast s plným RGB signálem; černé/jednobarevné okraje
-        # po rotaci a skládání se do histogramu ani neutralizace nesmí dostat.
+        # Find the background independently of channel balance. A severely weak
+        # blue channel is still valid image data and must not force the mask
+        # onto brighter galaxy structures. Geometry and luminance reject black
+        # warp borders; brightness percentiles and the high-pass mask below
+        # reject stars and extended objects.
         h, w = analysis_img.shape[:2]
         yy, xx = np.mgrid[0:h, 0:w]
         finite_rgb = np.all(np.isfinite(analysis_img[..., :3]), axis=2)
         raw_lum = 0.2126 * analysis_img[..., 0] + 0.7152 * analysis_img[..., 1] + 0.0722 * analysis_img[..., 2]
-        raw_channel_min = np.min(analysis_img[..., :3], axis=2)
-        raw_channel_max = np.max(analysis_img[..., :3], axis=2)
-        finite_lum = raw_lum[np.isfinite(raw_lum)]
-        signal_floor = max(1e-5, float(np.percentile(finite_lum, 3)) if finite_lum.size else 1e-5)
-        full_rgb_pixel = (
-            finite_rgb
-            & (raw_channel_min > signal_floor)
-            & ((raw_channel_max / np.maximum(raw_channel_min, 1e-8)) < 8.0)
-        )
+        positive_lum = raw_lum[finite_rgb & np.isfinite(raw_lum) & (raw_lum > 0)]
+        if positive_lum.size < 100:
+            if show_errors:
+                QMessageBox.warning(self, self.tr_ui("not_enough_background_title"), self.tr_ui("not_enough_background_message"))
+            return None
 
-        row_good = np.mean(full_rgb_pixel, axis=1) > 0.25
-        col_good = np.mean(full_rgb_pixel, axis=0) > 0.25
+        signal_floor = max(1e-8, float(np.percentile(positive_lum, 0.5)) * 0.25)
+        signal_pixel = finite_rgb & np.isfinite(raw_lum) & (raw_lum > signal_floor)
+        row_good = np.mean(signal_pixel, axis=1) > 0.50
+        col_good = np.mean(signal_pixel, axis=0) > 0.50
         if np.count_nonzero(row_good) >= 10 and np.count_nonzero(col_good) >= 10:
             y0, y1 = np.where(row_good)[0][[0, -1]]
             x0, x1 = np.where(col_good)[0][[0, -1]]
@@ -11354,12 +11956,8 @@ class AstroStackerWindow(QMainWindow):
             margin_y = int(h * 0.15)
             valid_area = (xx >= margin_x) & (yy >= margin_y) & (xx < w - margin_x) & (yy < h - margin_y)
 
-        valid_area &= full_rgb_pixel
+        valid_area &= signal_pixel
         display_for_detection = make_display_preview_base(analysis_img)
-        display_channel_min = np.min(display_for_detection[..., :3], axis=2)
-        display_channel_max = np.max(display_for_detection[..., :3], axis=2)
-        display_balanced_rgb = display_channel_max / np.maximum(display_channel_min, 1e-6) < 3.0
-        valid_area &= display_balanced_rgb
 
         valid_lum = raw_lum[valid_area]
         valid_lum = valid_lum[np.isfinite(valid_lum)]
@@ -11410,40 +12008,36 @@ class AstroStackerWindow(QMainWindow):
                 QMessageBox.warning(self, self.tr_ui("background_too_dark_title"), self.tr_ui("background_too_dark_message"))
             return None
 
-        target = (r_med + g_med + b_med) / 3.0
-        r_mul = target / max(r_med, eps)
-        g_mul = target / max(g_med, eps)
-        b_mul = target / max(b_med, eps)
-
-        # Zachovej přibližnou luminanci pozadí.
         old_lum = 0.2126 * r_med + 0.7152 * g_med + 0.0722 * b_med
-        new_lum = 0.2126 * (r_med * r_mul) + 0.7152 * (g_med * g_mul) + 0.0722 * (b_med * b_mul)
-        if new_lum > eps:
-            lum_scale = old_lum / new_lum
-            r_mul *= lum_scale
-            g_mul *= lum_scale
-            b_mul *= lum_scale
+        if not np.isfinite(old_lum) or old_lum <= eps:
+            if show_errors:
+                QMessageBox.warning(self, self.tr_ui("background_too_dark_title"), self.tr_ui("background_too_dark_message"))
+            return None
 
-        raw_gains = np.array([r_mul, g_mul, b_mul], dtype=np.float32)
-        if (
-            not np.all(np.isfinite(raw_gains))
-            or float(np.max(raw_gains) / max(float(np.min(raw_gains)), 1e-6)) > 3.5
-        ):
+        # Neutralization moves the channel backgrounds by offsets. Multiplying
+        # a very weak channel would also amplify its noise.
+        offsets = np.array(
+            [r_med - old_lum, g_med - old_lum, b_med - old_lum],
+            dtype=np.float32,
+        )
+        if not np.all(np.isfinite(offsets)):
             if show_errors:
                 QMessageBox.warning(self, self.tr_ui("not_enough_background_title"), self.tr_ui("not_enough_background_message"))
             return None
 
-        r_mul = float(np.clip(r_mul, 0.45, 2.2))
-        g_mul = float(np.clip(g_mul, 0.45, 2.2))
-        b_mul = float(np.clip(b_mul, 0.45, 2.2))
-
         corrected_linear = img.copy()
-        corrected_linear[..., 0] *= r_mul
-        corrected_linear[..., 1] *= g_mul
-        corrected_linear[..., 2] *= b_mul
+        corrected_linear[..., :3] -= offsets[None, None, :]
         corrected = make_display_preview_base(np.clip(corrected_linear, 0, 1).astype(np.float32))
 
-        status = self.tr_ui("neutralization_applied").format(r=r_mul, g=g_mul, b=b_mul, r_med=r_med, g_med=g_med, b_med=b_med)
+        applied_offsets = -offsets
+        status = self.tr_ui("neutralization_applied").format(
+            r=float(applied_offsets[0]),
+            g=float(applied_offsets[1]),
+            b=float(applied_offsets[2]),
+            r_med=r_med,
+            g_med=g_med,
+            b_med=b_med,
+        )
         return corrected, status
 
     def clear_background_neutralization(self):
@@ -11544,11 +12138,13 @@ class AstroStackerWindow(QMainWindow):
     def reset_stretch(self, push_undo: bool = True):
         if push_undo:
             self.push_preview_undo_state(copy_pixels=False)
+        self.preview_auto_display_stretch = False
+        self.reset_preview_display_limits()
         self.black_slider.setValue(0)
         self.white_slider.setValue(65535)
         self.gamma_slider.setValue(100)
-        if hasattr(self, "highlight_compression_slider"):
-            self.highlight_compression_slider.setValue(100)
+        if hasattr(self, "stf_strength_slider"):
+            self.stf_strength_slider.setValue(50)
         if hasattr(self, "vignette_removal_slider"):
             self.vignette_removal_slider.setValue(0)
         if hasattr(self, "synthetic_flat_slider"):
@@ -11564,6 +12160,36 @@ class AstroStackerWindow(QMainWindow):
         self.blue_slider.setValue(100)
         self.update_preview()
 
+    def _set_auto_stretch_sliders(self, display: np.ndarray) -> bool:
+        """Calculate preview black point and gamma for an already prepared display base."""
+        # The linked STF has already placed the background at the target
+        # brightness while preserving the true white point. Keep the ordinary
+        # sliders neutral to avoid applying a second automatic stretch.
+        if np.asarray(display).size < 32:
+            return False
+        for slider in (
+            self.black_slider,
+            self.white_slider,
+            self.gamma_slider,
+            self.contrast_slider,
+            self.saturation_slider,
+        ):
+            slider.blockSignals(True)
+        self.black_slider.setValue(0)
+        self.white_slider.setValue(65535)
+        self.gamma_slider.setValue(100)
+        self.contrast_slider.setValue(100)
+        self.saturation_slider.setValue(100)
+        for slider in (
+            self.black_slider,
+            self.white_slider,
+            self.gamma_slider,
+            self.contrast_slider,
+            self.saturation_slider,
+        ):
+            slider.blockSignals(False)
+        return True
+
     def auto_stretch_preview(self):
         source = self.preview_override if self.preview_override is not None else self.linear_result
         if source is None:
@@ -11575,7 +12201,14 @@ class AstroStackerWindow(QMainWindow):
             return
 
         self.push_preview_undo_state(copy_pixels=False)
-        neutralized = self.build_neutralized_preview_layer(source, show_errors=False)
+        self.preview_auto_display_stretch = True
+        balance_source = source
+        if (
+            self.gradient_preview_layer is not None
+            and self.gradient_preview_base_source_id == id(source)
+        ):
+            balance_source = self.gradient_preview_layer
+        neutralized = self.build_neutralized_preview_layer(balance_source, show_errors=False)
         if neutralized is not None:
             display, _status = neutralized
             self.neutralized_preview_layer = display
@@ -11584,78 +12217,54 @@ class AstroStackerWindow(QMainWindow):
         else:
             display = make_display_preview_base(source)
 
-        if display.ndim == 3 and display.shape[2] >= 3:
-            lum = 0.2126 * display[..., 0] + 0.7152 * display[..., 1] + 0.0722 * display[..., 2]
-        else:
-            lum = np.asarray(display, dtype=np.float32)
-
-        values = np.asarray(lum, dtype=np.float32).reshape(-1)
-        values = values[np.isfinite(values)]
-        if values.size < 32:
+        if not self._set_auto_stretch_sliders(display):
             return
-        positive = values[values > 1e-6]
-        if positive.size >= 32:
-            center = np.asarray(lum, dtype=np.float32)
-            center = center[center.shape[0] // 4: (3 * center.shape[0]) // 4, center.shape[1] // 4: (3 * center.shape[1]) // 4]
-            center = center[np.isfinite(center)]
-            center_positive = center[center > 1e-6]
-            if center_positive.size >= 32:
-                empty_threshold = max(1e-6, float(np.median(center_positive)) * 0.03)
-            else:
-                empty_threshold = max(1e-6, float(np.percentile(positive, 1.0)) * 0.5)
-            non_empty = values[values > empty_threshold]
-            if non_empty.size >= 32:
-                values = non_empty
-
-        lo = float(np.percentile(values, 0.2))
-        hi = float(np.percentile(values, 99.5))
-        core = values[(values >= lo) & (values <= hi)]
-        if core.size < 32:
-            core = values
-
-        hist, edges = np.histogram(core, bins=512, range=(0.0, 1.0))
-        peak_idx = int(np.argmax(hist))
-        peak = float((edges[peak_idx] + edges[peak_idx + 1]) * 0.5)
-        median = float(np.median(core))
-        mad = float(np.median(np.abs(core - median))) * 1.4826
-
-        # For astro data the useful black point is usually just left of the
-        # background peak, not near the absolute minimum of the frame.
-        black = peak - 0.5 * max(mad, 1e-6)
-        black = float(np.clip(black, 0.0, max(0.0, peak - 0.01)))
-        black *= 0.9
-
-        gamma = 0.7
-
-        self.black_slider.blockSignals(True)
-        self.white_slider.blockSignals(True)
-        self.gamma_slider.blockSignals(True)
-        self.contrast_slider.blockSignals(True)
-        self.saturation_slider.blockSignals(True)
-        self.black_slider.setValue(int(round(black * 65535.0)))
-        self.white_slider.setValue(65535)
-        self.gamma_slider.setValue(int(round(gamma * 100.0)))
-        self.contrast_slider.setValue(100)
-        self.saturation_slider.setValue(100)
-        self.black_slider.blockSignals(False)
-        self.white_slider.blockSignals(False)
-        self.gamma_slider.blockSignals(False)
-        self.contrast_slider.blockSignals(False)
-        self.saturation_slider.blockSignals(False)
 
         self.status_label.setText(self.tr_ui("auto_stretch_done"))
         self.update_preview()
+
+    def export_display_base(self) -> np.ndarray:
+        """Return the full-resolution visual base exactly as used by the preview."""
+        if (
+            getattr(self, "neutralized_preview_layer", None) is not None
+            and getattr(self, "neutralized_preview_base_source_id", None) == id(self.linear_result)
+        ):
+            return self.neutralized_preview_layer
+        if (
+            getattr(self, "gradient_preview_layer", None) is not None
+            and getattr(self, "gradient_preview_base_source_id", None) == id(self.linear_result)
+        ):
+            if self.preview_auto_display_stretch:
+                return make_display_preview_base(self.gradient_preview_layer)
+            return self.gradient_preview_layer
+        if self.preview_auto_display_stretch:
+            return make_display_preview_base(self.linear_result)
+        return np.clip(
+            np.nan_to_num(
+                np.asarray(self.linear_result, dtype=np.float32),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ),
+            0.0,
+            1.0,
+        )
 
     def save_preview(self):
         if self.linear_result is None:
             QMessageBox.information(self, "Nic k uložení", "Nejdřív slož snímky.")
             return
 
+        default_path = (
+            self.folder / "stacked_result.tif"
+            if self.folder is not None
+            else Path("stacked_result.tif")
+        )
         filename, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Uložit výsledek",
-            "stacked_result.tif",
-            "TIFF 16-bit (*.tif *.tiff);;PNG 8-bit (*.png);;FITS 32-bit linear (*.fits *.fit)",
+            str(default_path),
+            "TIFF 16-bit (*.tif *.tiff);;PNG 8-bit (*.png);;FITS 32-bit linear (*.fits *.fit);;XISF 32-bit linear (*.xisf)",
         )
         if not filename:
             return
@@ -11663,9 +12272,11 @@ class AstroStackerWindow(QMainWindow):
         path = Path(filename)
         suffix = path.suffix.lower()
 
-        if suffix not in {".png", ".tif", ".tiff", ".fits", ".fit"}:
+        if suffix not in {".png", ".tif", ".tiff", ".fits", ".fit", ".xisf"}:
             if "PNG" in selected_filter:
                 path = path.with_suffix(".png")
+            elif "XISF" in selected_filter:
+                path = path.with_suffix(".xisf")
             elif "FITS" in selected_filter:
                 path = path.with_suffix(".fits")
             else:
@@ -11685,22 +12296,21 @@ class AstroStackerWindow(QMainWindow):
                     "bayer_pattern": getattr(settings, "bayer_pattern", "auto"),
                 }
                 save_stack_fits(Path(filename), self.linear_result, source_header=source_header, stack_info=stack_info)
+            elif suffix in XISF_EXTENSIONS:
+                settings = self.current_stack_settings()
+                stack_info = {
+                    "align_mode": settings.align_mode,
+                    "stack_mode": settings.stack_mode,
+                    "sigma": float(settings.sigma),
+                    "num_images": len(LAST_STACK_SELECTION.get("used_paths", [])),
+                    "bayer_pattern": getattr(settings, "bayer_pattern", "auto"),
+                }
+                save_stack_xisf(Path(filename), self.linear_result, stack_info=stack_info)
             elif suffix in {".tif", ".tiff"}:
                 # TIFF ukládáme jako vizuální 16bit náhled:
                 # nejdřív stejný display stretch jako v GUI, potom uživatelské křivky/slidery.
                 # Lineární master zůstává ve FIT exportu.
-                if (
-                    getattr(self, "gradient_preview_layer", None) is not None
-                    and getattr(self, "gradient_preview_base_source_id", None) == id(self.linear_result)
-                ):
-                    display_base = self.gradient_preview_layer
-                elif (
-                    getattr(self, "neutralized_preview_layer", None) is not None
-                    and getattr(self, "neutralized_preview_base_source_id", None) == id(self.linear_result)
-                ):
-                    display_base = self.neutralized_preview_layer
-                else:
-                    display_base = make_display_preview_base(self.linear_result)
+                display_base = self.export_display_base()
                 preview = apply_stretch(display_base, self.current_stretch_settings())
                 img16_rgb = (np.clip(preview, 0, 1) * 65535).astype(np.uint16)
                 img16_bgr = cv2.cvtColor(img16_rgb, cv2.COLOR_RGB2BGR)
@@ -11710,18 +12320,7 @@ class AstroStackerWindow(QMainWindow):
             else:
                 # PNG ukládáme jako vizuální 8bit náhled:
                 # používá stejný display stretch jako zobrazení v programu.
-                if (
-                    getattr(self, "gradient_preview_layer", None) is not None
-                    and getattr(self, "gradient_preview_base_source_id", None) == id(self.linear_result)
-                ):
-                    display_base = self.gradient_preview_layer
-                elif (
-                    getattr(self, "neutralized_preview_layer", None) is not None
-                    and getattr(self, "neutralized_preview_base_source_id", None) == id(self.linear_result)
-                ):
-                    display_base = self.neutralized_preview_layer
-                else:
-                    display_base = make_display_preview_base(self.linear_result)
+                display_base = self.export_display_base()
                 preview = apply_stretch(display_base, self.current_stretch_settings())
                 Image.fromarray((np.clip(preview, 0, 1) * 255).astype(np.uint8)).save(filename)
 

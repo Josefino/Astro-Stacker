@@ -1,0 +1,2 @@
+# The CTK extra installs the CUDA runtime libraries required by CuPy.
+cupy-cuda12x[ctk]

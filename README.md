@@ -4,7 +4,7 @@ Astro Stacker is a desktop application for astronomical image stacking, calibrat
 
 The application focuses on a practical workflow: load a folder of light frames, optionally apply calibration frames, align the sequence, stack it, inspect rejected frames, and export either a linear FIT/FITS result or a stretched visual image.
 
-Current application version: **2.7**
+Current application version: **2.8**
 
 ## Main Features
 
@@ -19,25 +19,27 @@ Current application version: **2.7**
 - Automatic detection of `Flat`, `Bias`, and `Dark` subfolders.
 - Cached `MasterFlat_AS.fit`, `MasterBias_AS.fit`, and `MasterDark_AS.fit` files for faster repeated processing.
 - Manual calibration selection from a finished Master file or any folder with individual frames.
-- RAW only mode to exclude JPG/PNG/BMP/TIFF preview files while keeping FIT/FITS and camera RAW files.
+- RAW only mode to exclude JPG/PNG/BMP/TIFF preview files while keeping XISF, FIT/FITS and camera RAW files.
 - Bayer FIT handling with Auto, Mono, RGGB, BGGR, GRBG, and GBRG modes.
 - GPU stacking support where available. Aligned frames are streamed to CUDA or Metal/MPS in row tiles to avoid a second full-stack RAM copy.
 - CPU multiprocessing and tiled CPU stacking for large datasets.
 - PixInsight wrapper support.
 - Simple and Advanced UI modes.
-- Preview tools: Balance, Auto WB, crop, background neutralization, polynomial gradient removal, histogram, flip/rotate, color correction, synthetic flat, vignette correction, SCNR Green, highlight compression, and Astro Denoise.
+- Preview tools: Balance, adjustable STF strength, Auto WB, crop, background neutralization, polynomial gradient removal, histogram, flip/rotate, color correction, synthetic flat, vignette correction, SCNR Green, and Astro Denoise.
 - Linear FIT/FITS export plus visual TIFF/PNG export.
 
 ## Supported Formats
 
 Input formats include:
 
+- XISF, including compressed PixInsight XISF files
 - FIT / FITS
 - CR2 / CR3 / RAW / NEF / ARW / DNG / ORF / RW2 / RAF
 - TIFF / PNG / JPG / BMP
 
 Recommended output formats:
 
+- **XISF** for compressed 32-bit linear data and direct use in PixInsight.
 - **FIT/FITS** for linear astronomical data and further processing.
 - **TIFF** for 16-bit stretched visual export. External 16-bit TIFF files are also loaded without reducing their tonal depth.
 - **PNG** for 8-bit preview/share export.
@@ -132,7 +134,7 @@ Install Python 3 and the required packages in your Python environment.
 Typical dependencies include:
 
 ```bash
-pip install numpy opencv-python pillow astropy rawpy PySide6
+pip install numpy opencv-python pillow astropy rawpy PySide6 xisf
 ```
 
 Optional GPU-related packages depend on your platform and hardware.
@@ -145,30 +147,14 @@ python astro_stacker_app.py
 
 ## Building Standalone Packages
 
-The project can be packaged with PyInstaller.
+Ready-to-run installer build scripts are available in the `packaging` folder.
+They create:
 
-Example macOS command:
+- `AstroStacker28_Setup.exe` for Windows, with optional NVIDIA CUDA support.
+- `AstroStacker28_macOS.dmg` for macOS, with Apple Metal/MPS support.
 
-```bash
-python -m PyInstaller \
-  --windowed \
-  --onedir \
-  --name AstroStacker \
-  --hidden-import PySide6.QtCore \
-  --hidden-import PySide6.QtGui \
-  --hidden-import PySide6.QtWidgets \
-  --add-data "AS_balance_icon.png:." \
-  --add-data "AstroStacker_intro.png:." \
-  astro_stacker_app.py
-```
-
-xattr -dr com.apple.quarantine dist/AstroStacker.app
-
-Example Windows command:
-
-python -m PyInstaller --windowed --onedir --name AstroStacker --icon AstroStacker.ico --add-data "AS_balance_icon.png;." --add-data "AstroStacker_intro.png:." --collect-all cupy --collect-all cupyx --collect-all cupy_backends --collect-all nvidia astro_stacker_app.py
-
-On Windows, include GPU/CuPy packages only if you intend to distribute NVIDIA GPU support.
+See [`packaging/README_BUILD.md`](packaging/README_BUILD.md) for the exact
+requirements, commands, CUDA packaging, macOS signing, and notarization.
 
 
 ## Documentation

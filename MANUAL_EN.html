@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>Astro Stacker 2.7 - User Manual</title>
+<title>Astro Stacker 2.8 - User Manual</title>
 <style>
 @page { margin: 18mm 16mm; }
 body {
@@ -41,13 +41,13 @@ strong { color: #111827; }
 </style>
 </head>
 <body>
-<h1>Astro Stacker 2.7 - User Manual</h1>
+<h1>Astro Stacker 2.8 - User Manual</h1>
 <p>Astro Stacker is an application for stacking astronomical images from DSLR and mirrorless cameras, astronomy cameras, and smart telescopes. It loads a sequence of Light frames, optionally applies Flat/Bias/Dark calibration, aligns the frames on stars or a comet, stacks the result, and provides preview tools for inspection and export.</p>
-<p>The program is designed so the linear FIT output remains suitable for further processing. Most controls in the right panel affect the preview and PNG/TIFF export, not the original linear data.</p>
+<p>The program is designed so the linear XISF/FIT output remains suitable for further processing. Most controls in the right panel affect the preview and PNG/TIFF export, not the original linear data.</p>
 <h2>1. What Astro Stacker Does</h2>
 <ul>
 <li>Stacks Light frames from a selected folder.</li>
-<li>Supports FIT/FITS, common camera RAW files, and standard image formats.</li>
+<li>Supports PixInsight XISF, FIT/FITS, common camera RAW files, and standard image formats.</li>
 <li>Applies optional Flat, Bias, and Dark calibration.</li>
 <li>Aligns frames by translation, affine ECC, stars with RANSAC, perspective star matching, or comet motion.</li>
 <li>Allows automatic or manual reference frame selection.</li>
@@ -56,7 +56,7 @@ strong { color: #111827; }
 <li>Detects satellite trails and masks only the affected pixels during stacking.</li>
 <li>Saves and loads settings profiles.</li>
 <li>Provides preview tools with histogram, curves, color controls, background balancing, and Balance.</li>
-<li>Exports linear FIT or visually adjusted PNG/TIFF.</li>
+<li>Exports linear XISF/FIT or visually adjusted PNG/TIFF.</li>
 <li>Can launch the PixInsight wrapper.</li>
 </ul>
 <h2>2. Quick Start for Normal Stacking</h2>
@@ -91,8 +91,9 @@ strong { color: #111827; }
 </ul>
 <p>The file list can also be used to inspect individual frames.</p>
 <h3>RAW Only</h3>
-<p>When enabled, <strong>RAW only</strong> keeps FIT/FITS and camera RAW files such as ARW, CR2, CR3, and similar formats. It excludes JPG, PNG, BMP, and TIFF files. This is useful when a camera or smart telescope stores both working frames and preview images in the same folder.</p>
-<p>For Bayer FIT/FITS sequences, calibration is applied to the sensor mosaic before debayering. Large FIT headers are inspected without loading the full image, and the actual loading, debayering, and alignment run in parallel worker processes when multiprocessing is enabled.</p>
+<p>When enabled, <strong>RAW only</strong> keeps XISF, FIT/FITS and camera RAW files such as ARW, CR2, CR3, and similar formats. It excludes JPG, PNG, BMP, and TIFF files. This is useful when a camera or smart telescope stores both working frames and preview images in the same folder.</p>
+<p>XISF files from PixInsight can be used as Light or calibration frames. Compressed XISF files are supported. XISF without explicit CFA/Bayer metadata is treated as monochrome; a CFA XISF is debayered automatically or according to the manually selected Bayer pattern.</p>
+<p>For Bayer XISF/FIT/FITS sequences, calibration is applied to the sensor mosaic before debayering. Large FIT headers are inspected without loading the full image, and the actual loading, debayering, and alignment run in parallel worker processes when multiprocessing is enabled.</p>
 <h3>Alignment Modes</h3>
 <p><strong>Translation</strong></p>
 <p>Fast shift-only alignment. Suitable for small drift without rotation.</p>
@@ -197,6 +198,7 @@ strong { color: #111827; }
 <li><strong>File &gt; Save settings profile</strong></li>
 <li><strong>File &gt; Load settings profile</strong></li>
 </ul>
+<p>After selecting a working folder with <strong>Choose folder</strong>, the result and settings-profile save dialogs open directly in that folder.</p>
 <p>A profile stores stacking, calibration, comet, and preview settings. Profiles are useful for different workflows, such as:</p>
 <ul>
 <li>DSLR RAW,</li>
@@ -206,7 +208,8 @@ strong { color: #111827; }
 <li>linear FIT workflows.</li>
 </ul>
 <h2>8. Right Panel - Preview and Adjustments</h2>
-<p>The right panel is used for inspection and visual adjustments. These controls mainly affect preview and PNG/TIFF export. Linear FIT data remains suitable for further processing.</p>
+<p>The right panel is used for inspection and visual adjustments. These controls mainly affect preview and PNG/TIFF export. Linear XISF/FIT data remains suitable for further processing.</p>
+<p>After completion, the stack is displayed linearly and may look almost black. <strong>Balance</strong> stretches the preview only and does not modify the linear data.</p>
 <p>Use the small arrow in the top-left corner of the panel to hide the whole right</p>
 <p>panel temporarily. Click the remaining arrow rail to show it again.</p>
 <h3>Show Stacked Image</h3>
@@ -227,8 +230,9 @@ strong { color: #111827; }
 <li><strong>White point</strong> sets the bright level.</li>
 <li><strong>Gamma</strong> adjusts midtones.</li>
 </ul>
-<h3>Highlight Compression</h3>
-<p>Compresses very bright highlights, such as bright stars or object cores. Useful for previewing high dynamic range images.</p>
+<p>Black point and White point can be adjusted in fine <strong>0.05</strong> increments, for example to 2.25.</p>
+<h3>STF Strength</h3>
+<p>Controls the Screen Transfer Function intensity for the preview and visual PNG/TIFF export only. <strong>0</strong> gives a gentler, darker STF with more contrast, <strong>5</strong> is the standard preview, and <strong>10</strong> strongly reveals very faint structures. Black and white endpoints remain fixed; linear XISF/FIT export is unchanged.</p>
 <h3>Vignette Removal</h3>
 <p>Gently brightens edges and corners. It is not a replacement for real Flat calibration, but it can help with quick visual inspection.</p>
 <h3>Synthetic Flat</h3>
@@ -257,7 +261,7 @@ strong { color: #111827; }
 <h3>Auto White Balance</h3>
 <p>Attempts automatic white balance on neutral/gray regions. For some astro images, manual RGB adjustment or Color background correction may work better.</p>
 <h3>Neutralize Background</h3>
-<p>Attempts to equalize the background color. It works best when there is enough neutral background without nebulosity and without problematic edges.</p>
+<p>Attempts to equalize the background color. It selects background by geometry, luminance, and absence of stars rather than requiring similarly strong RGB channels. This improves images with a very weak blue or another color channel. Additive channel offsets are used so noise in the weak channel is not unnecessarily amplified. It works best when enough real background is visible outside large nebulosity.</p>
 <h3>Flip Horizontal / Vertical</h3>
 <p>Flips the preview horizontally or vertically.</p>
 <h3>Fit and 1:1</h3>
@@ -268,7 +272,7 @@ strong { color: #111827; }
 <h2>9. PixInsight Wrapper</h2>
 <p>The <strong>PixInsight</strong> button opens PixInsight and runs the AS_Stacker wrapper if it is available. The wrapper can run the CLI stacker from PixInsight and open the resulting FIT file after completion.</p>
 <p>The wrapper needs a Python environment with the required packages installed.</p>
-<p>The wrapper in version 2.7 also provides the <strong>Satellite trail</strong> option and uses Star alignment + RANSAC with Median as the defaults for a new configuration.</p>
+<p>The wrapper in version 2.8 also provides the <strong>Satellite trail</strong> option and uses Star alignment + RANSAC with Median as the defaults for a new configuration.</p>
 <h2>10. Recommended Workflows</h2>
 <h3>Normal Deep-Sky Sequence</h3>
 <ul>

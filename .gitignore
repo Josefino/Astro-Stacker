@@ -20,9 +20,18 @@ trail_*_diagnostic.png
 build/
 dist/
 *.spec
+!packaging/*.spec
+build_installer/
+build_installer_macos/
+dist_installer/
+dist_installer_macos/
+release/
+packaging/icons/
 
 # Virtual environments
 .venv/
+.venv-build-windows/
+.venv-build-macos/
 venv/
 env/
 
@@ -36,4 +45,3 @@ astro_stacker_app3.py
 astro_stacker_app4.py
 astro_stacker_app5.py
 astro_stacker_app6.py
-
