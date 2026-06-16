@@ -1,2 +1,5 @@
 # The CTK extra installs the CUDA runtime libraries required by CuPy.
 cupy-cuda12x[ctk]
+# DirectML accelerates DRUNet through DirectX 12 without the very large cuDNN
+# runtime. CuPy/CUDA remains available independently for image stacking.
+onnxruntime-directml

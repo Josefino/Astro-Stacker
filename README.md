@@ -4,7 +4,7 @@ Astro Stacker is a desktop application for astronomical image stacking, calibrat
 
 The application focuses on a practical workflow: load a folder of light frames, optionally apply calibration frames, align the sequence, stack it, inspect rejected frames, and export either a linear FIT/FITS result or a stretched visual image.
 
-Current application version: **2.8**
+Current application version: **3.0**
 
 ## Main Features
 
@@ -23,6 +23,8 @@ Current application version: **2.8**
 - Bayer FIT handling with Auto, Mono, RGGB, BGGR, GRBG, and GBRG modes.
 - GPU stacking support where available. Aligned frames are streamed to CUDA or Metal/MPS in row tiles to avoid a second full-stack RAM copy.
 - CPU multiprocessing and tiled CPU stacking for large datasets.
+- ASCOM Alpaca control for one or more cameras, including synchronized capture into a shared Live Stack folder.
+- Per-camera file identifiers in file names and FIT metadata for distinguishing frames from identical cameras.
 - PixInsight wrapper support.
 - Simple and Advanced UI modes.
 - Preview tools: Balance, adjustable STF strength, Auto WB, crop, background neutralization, polynomial gradient removal, histogram, flip/rotate, color correction, synthetic flat, vignette correction, SCNR Green, and Astro Denoise.
@@ -55,6 +57,20 @@ Recommended output formats:
 7. Start stacking.
 8. Use the right panel to adjust the preview.
 9. Save a linear FIT/FITS file for processing, or export a stretched TIFF/PNG image.
+
+## ASCOM Alpaca Cameras
+
+Open **Camera > ASCOM Alpaca cameras...** to control one camera or a synchronized
+group. Discover the cameras, select them in the **Use** column, connect them,
+set exposure and cooling parameters, and select a shared output folder.
+
+The **Camera/ID file** column shows the camera together with the identifier used
+in generated file names and the FIT `CAMID` keyword. This keeps frames from
+several identical cameras distinguishable while allowing all cameras to feed
+the same Live Stack folder.
+
+Alpaca support uses standard network components and does not require an extra
+Python package.
 
 ## Mosaic Mode
 
@@ -102,7 +118,8 @@ Important tools:
 - **Remove gradient**: subtract a smooth polynomial background model. This works especially well for galaxies; use it carefully with large nebulae.
 - **Synthetic flat**: approximate smooth background correction when no real flat is available.
 - **Color background correction**: remove strong color casts, useful for smart-telescope data.
-- **Astro Denoise**: gentle denoising with star and nebula-structure protection.
+- **Astro Denoise**: Classic CPU denoising or AI DRUNet ONNX denoising with an adaptive cached noise map.
+- **AI Star Deconvolution**: cached stellar-model sharpening with an adjustable star-only mask. It affects preview and PNG/TIFF export while linear FIT remains unchanged.
 - **Show stacked image**: return to the original stacked image without preview edits.
 
 ## Comet Stacking
@@ -117,7 +134,7 @@ The application interpolates comet motion between the two marked frames and can 
 
 ## PixInsight Wrapper
 
-The `AS_Stacker_PI_Plugin` folder contains a PixInsight wrapper script and a CLI bridge. The wrapper allows Astro Stacker processing from inside PixInsight and can open the resulting FIT file after completion.
+The `AS_Stacker_PI_Plugin` folder contains a PixInsight wrapper script, CLI bridge, current stacking engine, both bundled DRUNet models, and the AI Star Deconvolution stellar model. The wrapper allows Astro Stacker processing from inside PixInsight and can open the resulting linear FIT file after completion.
 
 Main files:
 
@@ -137,7 +154,26 @@ Typical dependencies include:
 pip install numpy opencv-python pillow astropy rawpy PySide6 xisf
 ```
 
-Optional GPU-related packages depend on your platform and hardware.
+Optional GPU-related packages depend on your platform and hardware. For a
+Windows source installation with NVIDIA CUDA, install the CTK extra so the
+required runtime DLL packages are included:
+
+```bash
+pip install "cupy-cuda12x[ctk]" onnxruntime-gpu
+```
+
+For DRUNet ONNX denoising, install ONNX Runtime. The distribution contains:
+
+- `models/drunet_color.onnx` for RGB images
+- `models/drunet_gray.onnx` for monochrome images
+- `models/cosmic_clarity_stellar.onnx` for AI Star Deconvolution
+
+The application selects the color model automatically. A different bundled
+model can be selected from the right panel:
+
+```bash
+pip install onnxruntime
+```
 
 Run:
 
@@ -150,8 +186,9 @@ python astro_stacker_app.py
 Ready-to-run installer build scripts are available in the `packaging` folder.
 They create:
 
-- `AstroStacker28_Setup.exe` for Windows, with optional NVIDIA CUDA support.
-- `AstroStacker28_macOS.dmg` for macOS, with Apple Metal/MPS support.
+- `AstroStacker30_Setup.exe` for Windows, with optional NVIDIA CUDA support.
+- `AstroStacker30_Lite_Setup.exe` for the compact Windows CPU-only edition.
+- `AstroStacker30_macOS.dmg` for macOS, with Apple Metal/MPS support.
 
 See [`packaging/README_BUILD.md`](packaging/README_BUILD.md) for the exact
 requirements, commands, CUDA packaging, macOS signing, and notarization.
@@ -161,9 +198,7 @@ requirements, commands, CUDA packaging, macOS signing, and notarization.
 
 Full user manuals are included:
 
-- `MANUAL_EN.md`
 - `MANUAL_EN.html`
-- `MANUAL_CZ.md`
 - `MANUAL_CZ.html`
 
 ## Author

@@ -6,9 +6,11 @@ set "ROOT=%CD%"
 set "PACKAGING=%ROOT%\packaging"
 set "DIST=%ROOT%\dist_installer"
 set "RELEASE=%ROOT%\release"
+set "REDIST_DIR=%PACKAGING%\redist"
+set "VCREDIST=%REDIST_DIR%\vc_redist.x64.exe"
 
 echo ============================================================
-echo Astro Stacker 2.8 - create installer from existing builds
+echo Astro Stacker 3.0 - create installer from existing builds
 echo ============================================================
 echo.
 
@@ -24,6 +26,25 @@ if not exist "%DIST%\AstroStacker_CUDA\AstroStacker.exe" (
   echo ERROR: The CUDA build was not found:
   echo   %DIST%\AstroStacker_CUDA\AstroStacker.exe
   echo Run packaging\build_windows_installer.bat first.
+  pause
+  exit /b 1
+)
+
+if not exist "%REDIST_DIR%" mkdir "%REDIST_DIR%"
+if not exist "%VCREDIST%" (
+  echo Downloading Microsoft Visual C++ Redistributable x64...
+  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -UseBasicParsing 'https://aka.ms/vc14/vc_redist.x64.exe' -OutFile '%VCREDIST%'"
+  if errorlevel 1 (
+    echo ERROR: Microsoft Visual C++ Redistributable could not be downloaded.
+    echo Save it manually as:
+    echo   %VCREDIST%
+    pause
+    exit /b 1
+  )
+)
+for %%F in ("%VCREDIST%") do if %%~zF LSS 1000000 (
+  echo ERROR: vc_redist.x64.exe is incomplete or invalid.
   pause
   exit /b 1
 )
@@ -50,7 +71,7 @@ if "%ISCC%"=="" (
   exit /b 2
 )
 
-echo Creating AstroStacker28_Setup.exe...
+echo Creating AstroStacker30_Setup.exe...
 pushd "%PACKAGING%"
 "%ISCC%" "AstroStacker.iss"
 set "INNO_RESULT=%ERRORLEVEL%"
@@ -64,7 +85,7 @@ if not "%INNO_RESULT%"=="0" (
 
 echo.
 echo Installer created successfully:
-echo   %RELEASE%\AstroStacker28_Setup.exe
+echo   %RELEASE%\AstroStacker30_Setup.exe
 echo.
 pause
 exit /b 0

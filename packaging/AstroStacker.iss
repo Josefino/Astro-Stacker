@@ -1,5 +1,5 @@
 #define MyAppName "Astro Stacker"
-#define MyAppVersion "2.8"
+#define MyAppVersion "3.0"
 #define MyAppPublisher "Josef Ladra"
 #define MyAppExeName "AstroStacker.exe"
 
@@ -16,7 +16,7 @@ DefaultDirName={autopf}\Astro Stacker
 DefaultGroupName=Astro Stacker
 AllowNoIcons=yes
 OutputDir=..\release
-OutputBaseFilename=AstroStacker28_Setup
+OutputBaseFilename=AstroStacker30_Setup
 SetupIconFile=icons\AstroStacker.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
@@ -41,12 +41,15 @@ Source: "..\dist_installer\AstroStacker_CUDA\*"; DestDir: "{app}"; Flags: ignore
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\MANUAL_EN.html"; DestDir: "{app}\Documentation"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\MANUAL_CZ.html"; DestDir: "{app}\Documentation"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\AS_Stacker_PI_Plugin\*"; DestDir: "{app}\AS_Stacker_PI_Plugin"; Excludes: "models\*"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "redist\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 [Icons]
 Name: "{group}\Astro Stacker"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\Astro Stacker"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
+Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing or updating Microsoft Visual C++ Runtime..."; Flags: waituntilterminated
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,Astro Stacker}"; Flags: nowait postinstall skipifsilent
 
 [Code]

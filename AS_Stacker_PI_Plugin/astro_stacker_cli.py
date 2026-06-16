@@ -1,3 +1,5 @@
+"""Command-line bridge for the Astro Stacker 3.0 processing engine."""
+
 from __future__ import annotations
 
 import argparse
@@ -9,7 +11,7 @@ import traceback
 import unicodedata
 from pathlib import Path
 
-CLI_VERSION = "2.8"
+CLI_VERSION = "3.0"
 
 
 def ascii_text(text: str) -> str:
@@ -151,9 +153,30 @@ def build_settings(args: argparse.Namespace, stack_settings_cls):
         "bias_frame_path": str(args.bias) if args.bias else None,
         "dark_frame_path": str(args.dark) if args.dark else None,
         "source_folder": str(args.input),
+        "output_dir": str(args.output_dir) if args.output_dir else None,
         "use_gpu": args.gpu,
         "use_aligned_cache": args.aligned_cache,
         "mosaic_mode": args.mosaic,
+        "max_comet_shift": args.max_comet_shift,
+        "comet_refine": not args.no_comet_refine,
+        "comet_refine_patch": args.comet_refine_patch,
+        "comet_refine_search": args.comet_refine_search,
+        "manual_comet_xy": (
+            (args.comet_start_x, args.comet_start_y)
+            if args.comet_start_x is not None and args.comet_start_y is not None
+            else None
+        ),
+        "manual_comet_reference_path": (
+            str(args.comet_start_file) if args.comet_start_file else None
+        ),
+        "manual_comet_end_xy": (
+            (args.comet_end_x, args.comet_end_y)
+            if args.comet_end_x is not None and args.comet_end_y is not None
+            else None
+        ),
+        "manual_comet_end_path": (
+            str(args.comet_end_file) if args.comet_end_file else None
+        ),
         "language": "en",
     }
     if dataclasses.is_dataclass(stack_settings_cls):
@@ -186,7 +209,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input", type=Path, help="Folder with light frames.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Output folder. Default: input/astro_stacker_output.")
     parser.add_argument("--output-name", default="AS_stack.fit", help="Output FIT/FITS name. AS_ prefix is added automatically.")
-    parser.add_argument("--align", choices=["translation", "ecc_affine", "star_affine", "calibration"], default="star_affine")
+    parser.add_argument(
+        "--align",
+        choices=[
+            "translation",
+            "ecc_affine",
+            "star_affine",
+            "calibration",
+            "comet",
+            "comet_merge",
+        ],
+        default="star_affine",
+    )
     parser.add_argument("--stack", choices=["mean", "median", "sigma", "high_rejection"], default="median")
     parser.add_argument("--sigma", type=float, default=2.5)
     parser.add_argument("--max-images", type=int, default=0)
@@ -198,6 +232,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flat", type=Path, default=None, help="Master Flat file or folder with individual Flat frames.")
     parser.add_argument("--bias", type=Path, default=None, help="Master Bias file or folder with individual Bias frames.")
     parser.add_argument("--dark", type=Path, default=None, help="Master Dark file or folder with individual Dark frames.")
+    parser.add_argument("--comet-start-file", type=Path, default=None, help="First/reference frame containing the marked comet.")
+    parser.add_argument("--comet-start-x", type=float, default=None, help="Comet X coordinate in the first/reference frame.")
+    parser.add_argument("--comet-start-y", type=float, default=None, help="Comet Y coordinate in the first/reference frame.")
+    parser.add_argument("--comet-end-file", type=Path, default=None, help="Last frame containing the marked comet.")
+    parser.add_argument("--comet-end-x", type=float, default=None, help="Comet X coordinate in the last frame.")
+    parser.add_argument("--comet-end-y", type=float, default=None, help="Comet Y coordinate in the last frame.")
+    parser.add_argument("--max-comet-shift", type=int, default=800)
+    parser.add_argument("--no-comet-refine", action="store_true")
+    parser.add_argument("--comet-refine-patch", type=int, default=45)
+    parser.add_argument("--comet-refine-search", type=int, default=90)
     parser.add_argument("--processes", type=int, default=0, help="CPU processes. 0 = auto.")
     parser.add_argument("--gpu", action="store_true")
     parser.add_argument("--aligned-cache", action="store_true", help="Enable aligned-frame cache for repeated runs.")
@@ -215,6 +259,22 @@ def main() -> int:
     args = parse_args()
     if not args.input.exists() or not args.input.is_dir():
         raise SystemExit(f"Input folder does not exist: {args.input}")
+    if args.align in {"comet", "comet_merge"}:
+        comet_values = (
+            args.comet_start_file,
+            args.comet_start_x,
+            args.comet_start_y,
+            args.comet_end_file,
+            args.comet_end_x,
+            args.comet_end_y,
+        )
+        if any(value is None for value in comet_values):
+            raise SystemExit(
+                "Comet modes require first and last frame paths plus X/Y coordinates."
+            )
+        for comet_path in (args.comet_start_file, args.comet_end_file):
+            if comet_path is None or not comet_path.is_file():
+                raise SystemExit(f"Comet marker frame does not exist: {comet_path}")
 
     from astro_stacker_app import (
         StackSettings,
@@ -224,6 +284,13 @@ def main() -> int:
         stack_folder_multiprocessing,
     )
     import astro_stacker_app as engine
+
+    engine_version = str(getattr(engine, "APP_VERSION", "unknown"))
+    if engine_version != CLI_VERSION:
+        progress(
+            0,
+            f"Warning: CLI version {CLI_VERSION} is using engine version {engine_version}.",
+        )
 
     settings = build_settings(args, StackSettings)
     processes = args.processes if args.processes and args.processes > 1 else auto_processes()
@@ -241,6 +308,13 @@ def main() -> int:
         result = stack_folder(args.input, settings, progress)
 
     if result is None:
+        if settings.align_mode == "comet_merge":
+            output_dir = args.output_dir or (args.input / "astro_stacker_output")
+            output_star = output_dir / "01_star_stack.fit"
+            output_comet = output_dir / "02_comet_stack.fit"
+            progress(100, f"Saved: {output_star}")
+            progress(100, f"Saved: {output_comet}")
+            return 0
         raise SystemExit("No single output was produced by this mode.")
 
     output_path = output_path_for(args)
@@ -257,6 +331,7 @@ def main() -> int:
     stats = dict(get_alignment_stats() if callable(get_alignment_stats) else {})
     run_log = [
         f"Astro Stacker CLI {CLI_VERSION} run",
+        f"Engine version: {engine_version}",
         f"Python: {sys.executable}",
         f"Input: {args.input}",
         f"Output: {output_path}",

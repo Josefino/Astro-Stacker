@@ -9,6 +9,17 @@ ROOT = Path(SPECPATH).resolve().parent
 datas = [
     (str(ROOT / "AS_balance_icon.png"), "."),
     (str(ROOT / "AstroStacker_intro.png"), "."),
+    (str(ROOT / "models" / "drunet_color.onnx"), "models"),
+    (str(ROOT / "models" / "drunet_gray.onnx"), "models"),
+    (str(ROOT / "models" / "cosmic_clarity_stellar.onnx"), "models"),
+    (str(ROOT / "models" / "COSMIC_CLARITY_STELLAR_LICENSE.txt"), "models"),
+    (str(ROOT / "MANUAL_EN.html"), "Documentation"),
+    (str(ROOT / "MANUAL_CZ.html"), "Documentation"),
+    (str(ROOT / "AS_Stacker_PI_Plugin" / "AS_Stacker_PI.js"), "AS_Stacker_PI_Plugin"),
+    (str(ROOT / "AS_Stacker_PI_Plugin" / "astro_stacker_cli.py"), "AS_Stacker_PI_Plugin"),
+    (str(ROOT / "AS_Stacker_PI_Plugin" / "astro_stacker_app.py"), "AS_Stacker_PI_Plugin"),
+    (str(ROOT / "AS_Stacker_PI_Plugin" / "README_INSTALL.txt"), "AS_Stacker_PI_Plugin"),
+    (str(ROOT / "AS_Stacker_PI_Plugin" / "requirements.txt"), "AS_Stacker_PI_Plugin"),
 ]
 binaries = []
 hiddenimports = [
@@ -19,9 +30,10 @@ hiddenimports = [
     "xisf",
     "lz4.frame",
     "zstandard",
+    "onnxruntime",
 ]
 
-for package in ("xisf", "lz4", "zstandard", "cupy", "cupyx", "cupy_backends"):
+for package in ("xisf", "lz4", "zstandard", "onnxruntime", "cupy", "cupyx", "cupy_backends"):
     package_datas, package_binaries, package_hidden = collect_all(package)
     datas += package_datas
     binaries += package_binaries

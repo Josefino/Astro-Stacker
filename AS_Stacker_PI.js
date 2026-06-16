@@ -1,6 +1,8 @@
 // Astro Stacker PixInsight wrapper
 // Runs astro_stacker_cli.py and writes FITS outputs with AS_ prefix.
 
+var AS_STACKER_WRAPPER_VERSION = "3.0";
+
 #include <pjsr/StdButton.jsh>
 #include <pjsr/StdDialogCode.jsh>
 #include <pjsr/FrameStyle.jsh>
@@ -8,9 +10,10 @@
 #include <pjsr/TextAlign.jsh>
 #include <pjsr/DataType.jsh>
 #include <pjsr/NumericControl.jsh>
+#include <pjsr/SectionBar.jsh>
 
 #feature-id    Utilities > AS_Stacker
-#feature-info  Astro Stacker wrapper for PixInsight. Calls the external Python CLI engine.
+#feature-info  Astro Stacker 3.0 wrapper for PixInsight. Calls the external Python CLI engine.
 
 var AS_STACKER_SETTINGS_ID = "AS_Stacker/settings";
 var AS_STACKER_SCRIPT_DIR = File.extractDrive( #__FILE__ ) + File.extractDirectory( #__FILE__ );
@@ -37,6 +40,9 @@ function defaultSettings()
       input: "",
       outputDir: "",
       outputName: "AS_stack.fit",
+      flat: "",
+      bias: "",
+      dark: "",
       align: 0,
       stack: 1,
       bayer: 0,
@@ -44,6 +50,16 @@ function defaultSettings()
       maxImages: 0,
       keepPercent: 80,
       maxShift: 180,
+      maxCometShift: 800,
+      cometStartFile: "",
+      cometStartX: 0,
+      cometStartY: 0,
+      cometEndFile: "",
+      cometEndX: 0,
+      cometEndY: 0,
+      cometRefine: true,
+      cometPatch: 45,
+      cometSearch: 90,
       border: 120,
       processes: 1,
       rawOnly: false,
@@ -425,12 +441,35 @@ function browseButton( parent, onClick )
    return b;
 }
 
+function addFileAndFolderButtons( parent, row, caption, filters )
+{
+   var fileButton = browseButton( parent, function()
+   {
+      var f = chooseFile( "Select " + caption + " master", filters );
+      if ( f.length > 0 )
+         row.edit.text = f;
+   } );
+   fileButton.text = "File";
+   fileButton.toolTip = "Select a master file";
+   row.sizer.add( fileButton );
+
+   var folderButton = browseButton( parent, function()
+   {
+      var d = chooseDirectory( "Select " + caption + " frames folder" );
+      if ( d.length > 0 )
+         row.edit.text = d;
+   } );
+   folderButton.text = "Folder";
+   folderButton.toolTip = "Select a folder with individual calibration frames";
+   row.sizer.add( folderButton );
+}
+
 function ASStackerDialog()
 {
    this.__base__ = Dialog;
    this.__base__();
 
-   this.windowTitle = "AS_Stacker - PixInsight Wrapper";
+   this.windowTitle = "AS_Stacker " + AS_STACKER_WRAPPER_VERSION + " - PixInsight Wrapper";
    this.labelWidth = this.font.width( "Star border margin:" ) + 12;
    var saved = loadSettings();
 
@@ -439,6 +478,11 @@ function ASStackerDialog()
    var input = labeledEdit( this, "Light folder:", saved.input );
    var outputDir = labeledEdit( this, "Output folder:", saved.outputDir );
    var outputName = labeledEdit( this, "Output name:", saved.outputName );
+   var flat = labeledEdit( this, "Flat:", saved.flat );
+   var bias = labeledEdit( this, "Bias:", saved.bias );
+   var dark = labeledEdit( this, "Dark:", saved.dark );
+   var cometStartFile = labeledEdit( this, "Comet first:", saved.cometStartFile );
+   var cometEndFile = labeledEdit( this, "Comet last:", saved.cometEndFile );
 
    var pyBrowse = browseButton( this, function()
    {
@@ -476,12 +520,39 @@ function ASStackerDialog()
    } );
    outputDir.sizer.add( outputBrowse );
 
+   var calibrationFilters = [
+      ["Calibration images", "*.xisf *.fit *.fits *.tif *.tiff *.cr2 *.cr3 *.raw *.nef *.arw *.dng"],
+      ["All files", "*"]
+   ];
+   addFileAndFolderButtons( this, flat, "Flat", calibrationFilters );
+   addFileAndFolderButtons( this, bias, "Bias", calibrationFilters );
+   addFileAndFolderButtons( this, dark, "Dark", calibrationFilters );
+
+   var cometFilters = [
+      ["Astronomy images", "*.xisf *.fit *.fits *.tif *.tiff *.cr2 *.cr3 *.raw *.nef *.arw *.dng"],
+      ["All files", "*"]
+   ];
+   cometStartFile.sizer.add( browseButton( this, function()
+   {
+      var f = chooseFile( "Select first/reference comet frame", cometFilters );
+      if ( f.length > 0 )
+         cometStartFile.edit.text = f;
+   } ) );
+   cometEndFile.sizer.add( browseButton( this, function()
+   {
+      var f = chooseFile( "Select last comet frame", cometFilters );
+      if ( f.length > 0 )
+         cometEndFile.edit.text = f;
+   } ) );
+
    this.alignCombo = new ComboBox( this );
    this.alignCombo.addItem( "Star alignment + RANSAC" );
    this.alignCombo.addItem( "Translation" );
    this.alignCombo.addItem( "ECC affine" );
    this.alignCombo.addItem( "Calibration/no alignment" );
-   this.alignCombo.currentItem = Math.max( 0, Math.min( 3, saved.align ) );
+   this.alignCombo.addItem( "Comet alignment" );
+   this.alignCombo.addItem( "Star + Comet separate outputs" );
+   this.alignCombo.currentItem = Math.max( 0, Math.min( 5, saved.align ) );
 
    this.stackCombo = new ComboBox( this );
    this.stackCombo.addItem( "Sigma clip" );
@@ -522,6 +593,41 @@ function ASStackerDialog()
    this.maxShiftSpin.maxValue = 1000;
    this.maxShiftSpin.value = saved.maxShift;
 
+   this.maxCometShiftSpin = new SpinBox( this );
+   this.maxCometShiftSpin.minValue = 20;
+   this.maxCometShiftSpin.maxValue = 5000;
+   this.maxCometShiftSpin.value = saved.maxCometShift;
+
+   this.cometStartXSpin = new SpinBox( this );
+   this.cometStartXSpin.minValue = 0;
+   this.cometStartXSpin.maxValue = 100000;
+   this.cometStartXSpin.value = saved.cometStartX;
+
+   this.cometStartYSpin = new SpinBox( this );
+   this.cometStartYSpin.minValue = 0;
+   this.cometStartYSpin.maxValue = 100000;
+   this.cometStartYSpin.value = saved.cometStartY;
+
+   this.cometEndXSpin = new SpinBox( this );
+   this.cometEndXSpin.minValue = 0;
+   this.cometEndXSpin.maxValue = 100000;
+   this.cometEndXSpin.value = saved.cometEndX;
+
+   this.cometEndYSpin = new SpinBox( this );
+   this.cometEndYSpin.minValue = 0;
+   this.cometEndYSpin.maxValue = 100000;
+   this.cometEndYSpin.value = saved.cometEndY;
+
+   this.cometPatchSpin = new SpinBox( this );
+   this.cometPatchSpin.minValue = 10;
+   this.cometPatchSpin.maxValue = 300;
+   this.cometPatchSpin.value = saved.cometPatch;
+
+   this.cometSearchSpin = new SpinBox( this );
+   this.cometSearchSpin.minValue = 10;
+   this.cometSearchSpin.maxValue = 800;
+   this.cometSearchSpin.value = saved.cometSearch;
+
    this.borderSpin = new SpinBox( this );
    this.borderSpin.minValue = 0;
    this.borderSpin.maxValue = 5000;
@@ -534,7 +640,7 @@ function ASStackerDialog()
 
    this.rawOnlyCheck = new CheckBox( this );
    this.rawOnlyCheck.text = "RAW only";
-   this.rawOnlyCheck.toolTip = "Use only FIT/FITS and camera RAW files. JPG/PNG/BMP/TIFF previews are ignored, including in automatic Flat/Bias/Dark folders.";
+   this.rawOnlyCheck.toolTip = "Use only XISF, FIT/FITS and camera RAW files. JPG/PNG/BMP/TIFF previews are ignored, including in automatic Flat/Bias/Dark folders.";
    this.rawOnlyCheck.checked = saved.rawOnly;
 
    this.autoRefCheck = new CheckBox( this );
@@ -566,6 +672,11 @@ function ASStackerDialog()
    this.gpuCheck = new CheckBox( this );
    this.gpuCheck.text = "Use GPU";
    this.gpuCheck.checked = saved.gpu;
+
+   this.cometRefineCheck = new CheckBox( this );
+   this.cometRefineCheck.text = "Refine comet position";
+   this.cometRefineCheck.toolTip = "Refine the predicted comet nucleus by local correlation in every frame.";
+   this.cometRefineCheck.checked = saved.cometRefine;
 
    function comboRow( dialog, text, control )
    {
@@ -624,7 +735,7 @@ function ASStackerDialog()
          outDir = inputPath + "/astro_stacker_output";
       var logPath = outDir + "/AS_stacker_cli_error.log";
 
-      var alignValues = [ "star_affine", "translation", "ecc_affine", "calibration" ];
+      var alignValues = [ "star_affine", "translation", "ecc_affine", "calibration", "comet", "comet_merge" ];
       var stackValues = [ "sigma", "median", "mean", "high_rejection" ];
       var bayerValues = [ "auto", "mono", "RGGB", "BGGR", "GRBG", "GBRG" ];
 
@@ -643,6 +754,40 @@ function ASStackerDialog()
          "--bayer", bayerValues[this.dialog.bayerCombo.currentItem],
          "--processes", this.dialog.processesSpin.value.toString()
       ];
+
+      var flatPath = flat.edit.text.trim();
+      var biasPath = bias.edit.text.trim();
+      var darkPath = dark.edit.text.trim();
+      if ( flatPath.length > 0 )
+         args.push( "--flat", flatPath );
+      if ( biasPath.length > 0 )
+         args.push( "--bias", biasPath );
+      if ( darkPath.length > 0 )
+         args.push( "--dark", darkPath );
+
+      var cometMode = this.dialog.alignCombo.currentItem >= 4;
+      var cometStartPath = cometStartFile.edit.text.trim();
+      var cometEndPath = cometEndFile.edit.text.trim();
+      if ( cometMode )
+      {
+         if ( !fileExists( cometStartPath ) || !fileExists( cometEndPath ) )
+         {
+            new MessageBox( "Comet modes require valid first and last frame files.",
+                            "AS_Stacker", StdIcon_Error, StdButton_Ok ).execute();
+            return;
+         }
+         args.push( "--comet-start-file", cometStartPath );
+         args.push( "--comet-start-x", this.dialog.cometStartXSpin.value.toString() );
+         args.push( "--comet-start-y", this.dialog.cometStartYSpin.value.toString() );
+         args.push( "--comet-end-file", cometEndPath );
+         args.push( "--comet-end-x", this.dialog.cometEndXSpin.value.toString() );
+         args.push( "--comet-end-y", this.dialog.cometEndYSpin.value.toString() );
+         args.push( "--max-comet-shift", this.dialog.maxCometShiftSpin.value.toString() );
+         args.push( "--comet-refine-patch", this.dialog.cometPatchSpin.value.toString() );
+         args.push( "--comet-refine-search", this.dialog.cometSearchSpin.value.toString() );
+         if ( !this.dialog.cometRefineCheck.checked )
+            args.push( "--no-comet-refine" );
+      }
 
       if ( this.dialog.gpuCheck.checked )
          args.push( "--gpu" );
@@ -667,6 +812,9 @@ function ASStackerDialog()
          input: inputPath,
          outputDir: outDir,
          outputName: outName,
+         flat: flatPath,
+         bias: biasPath,
+         dark: darkPath,
          align: this.dialog.alignCombo.currentItem,
          stack: this.dialog.stackCombo.currentItem,
          bayer: this.dialog.bayerCombo.currentItem,
@@ -674,6 +822,16 @@ function ASStackerDialog()
          maxImages: this.dialog.maxImagesSpin.value,
          keepPercent: this.dialog.keepSpin.value,
          maxShift: this.dialog.maxShiftSpin.value,
+         maxCometShift: this.dialog.maxCometShiftSpin.value,
+         cometStartFile: cometStartPath,
+         cometStartX: this.dialog.cometStartXSpin.value,
+         cometStartY: this.dialog.cometStartYSpin.value,
+         cometEndFile: cometEndPath,
+         cometEndX: this.dialog.cometEndXSpin.value,
+         cometEndY: this.dialog.cometEndYSpin.value,
+         cometRefine: this.dialog.cometRefineCheck.checked,
+         cometPatch: this.dialog.cometPatchSpin.value,
+         cometSearch: this.dialog.cometSearchSpin.value,
          border: this.dialog.borderSpin.value,
          processes: this.dialog.processesSpin.value,
          rawOnly: this.dialog.rawOnlyCheck.checked,
@@ -695,23 +853,29 @@ function ASStackerDialog()
       Console.writeln( "Running external process..." );
 
       var outputPath = outDir + "/" + outName;
-      if ( !removeFileIfExists( outputPath ) )
+      var previousOutputs = cometMode && this.dialog.alignCombo.currentItem == 5
+         ? [ outDir + "/01_star_stack.fit", outDir + "/02_comet_stack.fit" ]
+         : [ outputPath ];
+      for ( var previousIndex = 0; previousIndex < previousOutputs.length; ++previousIndex )
       {
-         new MessageBox( "The previous output file could not be removed:\n" + outputPath +
-                         "\n\nClose it in PixInsight, choose another output name, or select another output folder.",
-                         "AS_Stacker", StdIcon_Error, StdButton_Ok ).execute();
-         return;
+         if ( !removeFileIfExists( previousOutputs[previousIndex] ) )
+         {
+            new MessageBox( "The previous output file could not be removed:\n" + previousOutputs[previousIndex] +
+                            "\n\nClose it in PixInsight, choose another output name, or select another output folder.",
+                            "AS_Stacker", StdIcon_Error, StdButton_Ok ).execute();
+            return;
+         }
       }
 
-      var openedOutput = false;
+      var openedOutputs = {};
       runExternalProcessLive( python, args, function( line )
       {
-         if ( openedOutput )
-            return;
          var savedPath = savedPathFromLine( line );
          if ( savedPath.length == 0 )
             return;
-         openedOutput = true;
+         if ( openedOutputs[savedPath] )
+            return;
+         openedOutputs[savedPath] = true;
          openStackOutputWindow( savedPath );
       } );
    };
@@ -723,10 +887,46 @@ function ASStackerDialog()
    this.cancelButton.dialog = this;
 
    this.info = new Label( this );
-   this.info.text = "This is a PixInsight wrapper around astro_stacker_cli.py. Output files always start with AS_.";
+   this.info.text = "PixInsight wrapper for Astro Stacker CLI. Flat/Bias/Dark accepts either a master file or a folder. For comet modes, select the first and last frames and enter full-resolution nucleus coordinates read in PixInsight.";
    this.info.wordWrapping = true;
    this.info.frameStyle = FrameStyle_Box;
    this.info.margin = 6;
+
+   function resizeAfterSectionToggle( section, toggleBegin )
+   {
+      if ( !toggleBegin )
+      {
+         section.dialog.adjustToContents();
+         section.dialog.setVariableSize();
+      }
+   }
+
+   this.calibrationBar = new SectionBar( this, "Calibration frames" );
+   this.calibrationControl = new Control( this );
+   this.calibrationControl.sizer = new VerticalSizer;
+   this.calibrationControl.sizer.spacing = 6;
+   this.calibrationControl.sizer.add( flat.sizer );
+   this.calibrationControl.sizer.add( bias.sizer );
+   this.calibrationControl.sizer.add( dark.sizer );
+   this.calibrationBar.onToggleSection = resizeAfterSectionToggle;
+   this.calibrationBar.setSection( this.calibrationControl );
+
+   this.cometBar = new SectionBar( this, "Comet settings" );
+   this.cometControl = new Control( this );
+   this.cometControl.sizer = new VerticalSizer;
+   this.cometControl.sizer.spacing = 6;
+   this.cometControl.sizer.add( cometStartFile.sizer );
+   this.cometControl.sizer.add( spinRow( this, "Comet first X:", this.cometStartXSpin ) );
+   this.cometControl.sizer.add( spinRow( this, "Comet first Y:", this.cometStartYSpin ) );
+   this.cometControl.sizer.add( cometEndFile.sizer );
+   this.cometControl.sizer.add( spinRow( this, "Comet last X:", this.cometEndXSpin ) );
+   this.cometControl.sizer.add( spinRow( this, "Comet last Y:", this.cometEndYSpin ) );
+   this.cometControl.sizer.add( spinRow( this, "Max comet motion:", this.maxCometShiftSpin ) );
+   this.cometControl.sizer.add( spinRow( this, "Comet template:", this.cometPatchSpin ) );
+   this.cometControl.sizer.add( spinRow( this, "Comet search:", this.cometSearchSpin ) );
+   this.cometControl.sizer.add( this.cometRefineCheck );
+   this.cometBar.onToggleSection = resizeAfterSectionToggle;
+   this.cometBar.setSection( this.cometControl );
 
    this.sizer = new VerticalSizer;
    this.sizer.margin = 8;
@@ -737,6 +937,8 @@ function ASStackerDialog()
    this.sizer.add( input.sizer );
    this.sizer.add( outputDir.sizer );
    this.sizer.add( outputName.sizer );
+   this.sizer.add( this.calibrationBar );
+   this.sizer.add( this.calibrationControl );
    this.sizer.add( comboRow( this, "Alignment:", this.alignCombo ) );
    this.sizer.add( comboRow( this, "Stacking:", this.stackCombo ) );
    this.sizer.add( comboRow( this, "Bayer FIT:", this.bayerCombo ) );
@@ -744,6 +946,8 @@ function ASStackerDialog()
    this.sizer.add( spinRow( this, "Max frames:", this.maxImagesSpin ) );
    this.sizer.add( spinRow( this, "Keep %:", this.keepSpin ) );
    this.sizer.add( spinRow( this, "Max star drift:", this.maxShiftSpin ) );
+   this.sizer.add( this.cometBar );
+   this.sizer.add( this.cometControl );
    this.sizer.add( spinRow( this, "Ignore border:", this.borderSpin ) );
    this.sizer.add( spinRow( this, "CPU processes:", this.processesSpin ) );
 
@@ -768,6 +972,8 @@ function ASStackerDialog()
    this.sizer.add( buttons );
 
    this.adjustToContents();
+   this.calibrationBar.toggleSection();
+   this.cometBar.toggleSection();
 }
 ASStackerDialog.prototype = new Dialog;
 

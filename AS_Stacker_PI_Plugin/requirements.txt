@@ -5,3 +5,4 @@ astropy
 rawpy
 PySide6
 xisf==0.9.6
+onnxruntime

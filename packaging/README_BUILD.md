@@ -30,15 +30,17 @@ through `winget`. Windows may display a confirmation or administrator prompt.
 The script:
 
 1. Creates an isolated `.venv-build-windows` environment.
-2. Builds `AstroStacker_CPU`.
-3. Installs CuPy with its CUDA 12 runtime packages.
+2. Removes stale CUDA packages and builds a clean `AstroStacker_CPU`.
+3. Installs CuPy with CUDA 12 for stacking and DirectML for DRUNet AI denoise.
 4. Builds `AstroStacker_CUDA`.
-5. Creates one installer with an **Install NVIDIA CUDA GPU support** checkbox.
+5. Downloads and embeds the current Microsoft Visual C++ v14 x64 Runtime.
+6. Verifies both DRUNet models, manuals, wrapper, and CUDA DLL payloads.
+7. Creates one installer with an **Install NVIDIA CUDA GPU support** checkbox.
 
 Result:
 
 ```text
-release\AstroStacker28_Setup.exe
+release\AstroStacker30_Setup.exe
 ```
 
 If the CPU and CUDA folders were already built but Inno Setup was missing, do
@@ -57,6 +59,29 @@ NVIDIA display driver before publishing.
 The installer contains both CPU and CUDA payloads so that the selected version
 is complete and independent. This makes the installer larger, but avoids
 fragile partial CUDA installations.
+The bundled Microsoft Visual C++ Runtime installer is invoked silently. It
+updates an older runtime when needed and otherwise completes without changing
+the system.
+
+## Windows Lite installer
+
+For a significantly smaller CPU-only package without CUDA, PyTorch, ONNX
+Runtime, DRUNet models, or the PixInsight wrapper, run:
+
+```bat
+packaging\build_windows_lite_installer.bat
+```
+
+Result:
+
+```text
+release\AstroStacker30_Lite_Setup.exe
+```
+
+The Lite interface hides the GPU option and AI DRUNet method. Classic denoise
+and all ordinary CPU stacking and editing functions remain available. The
+build script also checks that no ONNX models, ONNX Runtime, CuPy, CUDA, or
+PyTorch binaries leaked into the final package.
 
 ## macOS DMG
 
@@ -76,12 +101,19 @@ chmod +x packaging/build_macos_dmg.command
 Result:
 
 ```text
-release/AstroStacker28_macOS.dmg
+release/AstroStacker30_macOS.dmg
 ```
 
 The script installs PyTorch so that Apple Metal/MPS GPU stacking is available.
+The common requirements install ONNX Runtime for DRUNet AI denoising. Both
+`models/drunet_color.onnx` and `models/drunet_gray.onnx` are embedded in the
+standalone application, together with the English/Czech HTML manuals and the
+PixInsight wrapper package.
 The resulting build matches the architecture of the Python interpreter used to
 run the build.
+The build also verifies the Python/host architecture and checks the complete
+application payload before signing. The finished DMG is verified with
+`hdiutil verify`.
 
 ### Public signed and notarized DMG
 
@@ -112,9 +144,14 @@ local testing. Users may then need to remove quarantine manually.
 
 - `requirements-base.txt`: common application/build dependencies.
 - `requirements-windows-cuda.txt`: optional Windows CUDA dependencies.
+- `requirements-windows-lite.txt`: minimal Windows CPU dependencies.
 - `AstroStacker-Windows-CPU.spec`: CPU-only PyInstaller build.
 - `AstroStacker-Windows-CUDA.spec`: NVIDIA CUDA PyInstaller build.
+- `AstroStacker-Windows-Lite.spec`: small CPU build without AI/CUDA.
 - `AstroStacker.iss`: Inno Setup installer.
+- `AstroStacker-Lite.iss`: Inno Setup definition for the Lite installer.
 - `AstroStacker-macOS.spec`: macOS PyInstaller app bundle.
 - `macos-entitlements.plist`: hardened-runtime permissions needed by PyTorch.
 - `make_icons.py`: creates Windows ICO and macOS ICNS files.
+- `../models/drunet_color.onnx`: bundled RGB DRUNet model.
+- `../models/drunet_gray.onnx`: bundled monochrome DRUNet model.

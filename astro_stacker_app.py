@@ -40,9 +40,11 @@ Cesky prehled:
 Installation / Instalace:
     pip install PySide6 opencv-python numpy pillow astropy rawpy xisf
     optional NVIDIA GPU acceleration / volitelna NVIDIA GPU akcelerace:
-    pip install cupy-cuda12x
+    pip install "cupy-cuda12x[ctk]"
     optional Apple Silicon Metal/MPS acceleration / volitelna Apple Metal/MPS akcelerace:
     pip install torch
+    optional DRUNet ONNX AI denoising / volitelne AI odsumeni DRUNet ONNX:
+    pip install onnxruntime
 
 Run / Spusteni:
     python astro_stacker_app.py
@@ -58,12 +60,14 @@ import sys
 import re
 import traceback
 import multiprocessing as mp
+import socket
 import warnings
 import subprocess
 import tempfile
 import ctypes
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
@@ -76,7 +80,9 @@ from PIL import Image
 
 
 LOG_PATH: Optional[Path] = None
-APP_VERSION = "2.8"
+APP_VERSION = "3.0"
+LITE_BUILD = os.environ.get("ASTRO_STACKER_LITE", "").strip() == "1"
+APP_DISPLAY_VERSION = f"{APP_VERSION} Lite" if LITE_BUILD else APP_VERSION
 GITHUB_RELEASES_API_URL = "https://api.github.com/repos/Josefino/Astro-Stacker/releases/latest"
 GITHUB_RELEASES_PAGE_URL = "https://github.com/Josefino/Astro-Stacker/releases/latest"
 
@@ -211,40 +217,47 @@ def configure_cuda_runtime_path() -> None:
         candidates.extend(sorted(root.glob("v*"), reverse=True))
 
     # CUDA wheels installed through cupy-cuda12x[ctk] keep individual runtime
-    # DLL groups in separate nvidia/*/bin directories. PyInstaller preserves
-    # this layout, so every directory containing a CUDA DLL must remain in the
-    # Windows DLL search path for the lifetime of the process.
-    if getattr(sys, "frozen", False):
-        dll_patterns = (
-            "cudart*.dll",
-            "nvrtc*.dll",
-            "nvJitLink*.dll",
-            "cublas*.dll",
-        )
-        dll_dirs = set()
-        for frozen_root in candidates[:2]:
-            if not frozen_root.exists():
-                continue
-            for pattern in dll_patterns:
-                try:
-                    dll_dirs.update(path.parent for path in frozen_root.rglob(pattern))
-                except OSError:
-                    continue
+    # DLL groups in separate nvidia/*/bin directories. Search those directories
+    # both in a PyInstaller bundle and in a normal virtual environment.
+    runtime_roots = list(candidates[:2]) if getattr(sys, "frozen", False) else []
+    for entry in sys.path:
+        try:
+            nvidia_root = Path(entry) / "nvidia"
+            if nvidia_root.is_dir():
+                runtime_roots.append(nvidia_root)
+        except (OSError, TypeError):
+            continue
 
-        for dll_dir in sorted(dll_dirs, key=lambda path: str(path).lower()):
-            dll_dir_text = str(dll_dir)
-            path_parts = os.environ.get("PATH", "").split(os.pathsep)
-            if dll_dir_text not in path_parts:
-                os.environ["PATH"] = dll_dir_text + os.pathsep + os.environ.get("PATH", "")
+    dll_patterns = (
+        "cudart*.dll",
+        "nvrtc*.dll",
+        "nvJitLink*.dll",
+        "cublas*.dll",
+    )
+    dll_dirs = set()
+    for runtime_root in runtime_roots:
+        if not runtime_root.exists():
+            continue
+        for pattern in dll_patterns:
             try:
-                handle = os.add_dll_directory(dll_dir_text)
-                _CUDA_DLL_DIRECTORY_HANDLES.append(handle)
-                log_debug(f"added bundled CUDA DLL directory: {dll_dir}")
-            except Exception:
-                log_debug(f"add bundled DLL directory failed for {dll_dir}:\n{traceback.format_exc()}")
+                dll_dirs.update(path.parent for path in runtime_root.rglob(pattern))
+            except OSError:
+                continue
 
-        if dll_dirs:
-            log_debug(f"bundled CUDA DLL directories found: {len(dll_dirs)}")
+    for dll_dir in sorted(dll_dirs, key=lambda path: str(path).lower()):
+        dll_dir_text = str(dll_dir)
+        path_parts = os.environ.get("PATH", "").split(os.pathsep)
+        if dll_dir_text not in path_parts:
+            os.environ["PATH"] = dll_dir_text + os.pathsep + os.environ.get("PATH", "")
+        try:
+            handle = os.add_dll_directory(dll_dir_text)
+            _CUDA_DLL_DIRECTORY_HANDLES.append(handle)
+            log_debug(f"added bundled CUDA DLL directory: {dll_dir}")
+        except Exception:
+            log_debug(f"add bundled DLL directory failed for {dll_dir}:\n{traceback.format_exc()}")
+
+    if dll_dirs:
+        log_debug(f"bundled CUDA DLL directories found: {len(dll_dirs)}")
 
     for cuda_root in candidates:
         bin_dir = cuda_root / "bin"
@@ -301,6 +314,32 @@ MPS_AVAILABLE_ERROR = None
 MPS_AVAILABLE_DETAIL = ""
 
 try:
+    import onnxruntime as ort
+    ONNXRUNTIME_IMPORT_ERROR = None
+    available_ort_providers = ort.get_available_providers()
+    if (
+        os.name == "nt"
+        and "CUDAExecutionProvider" in available_ort_providers
+        and hasattr(ort, "preload_dlls")
+    ):
+        try:
+            ort.preload_dlls(directory="")
+            log_debug("ONNX Runtime optional GPU DLL preload completed.")
+        except Exception:
+            log_debug(
+                "ONNX Runtime optional GPU DLL preload failed:\n"
+                + traceback.format_exc()
+            )
+    log_debug(
+        f"ONNX Runtime import OK: {getattr(ort, '__version__', '?')}; "
+        f"providers={available_ort_providers}"
+    )
+except Exception:
+    ort = None
+    ONNXRUNTIME_IMPORT_ERROR = traceback.format_exc()
+    log_debug(f"ONNX Runtime import failed:\n{ONNXRUNTIME_IMPORT_ERROR}")
+
+try:
     from astropy.io import fits
     from astropy.io.fits.verify import VerifyWarning
 except ImportError:  # aplikace poběží i bez FITS podpory, ale FITS nepůjde načíst/uložit
@@ -316,7 +355,7 @@ try:
     from xisf import XISF
 except ImportError:
     XISF = None
-from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QEventLoop, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDesktopServices, QIcon, QImage, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
@@ -324,12 +363,14 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -360,6 +401,20 @@ QUALITY_CACHE_VERSION = "quality-v15-star-shape-reference"
 CALIBRATION_SIGNATURE_CACHE: Dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
 MP_WORKER_CONTEXT: Dict[str, Any] = {}
 GRADIENT_REMOVAL_ALGORITHM_VERSION = "gradient-v2-robust-polynomial"
+DRUNET_MODEL_FILENAMES = (
+    "drunet_color.onnx",
+    "drunet_color_fp32.onnx",
+    "drunet_rgb.onnx",
+    "drunet_gray.onnx",
+    "drunet_grayscale.onnx",
+)
+DRUNET_SESSION_CACHE: Dict[Tuple[str, Tuple[str, ...]], Any] = {}
+STELLAR_MODEL_FILENAMES = (
+    "cosmic_clarity_stellar.onnx",
+    "deep_sharp_stellar_cnn.onnx",
+    "deep_sharp_stellar_cnn_AI3_5s.onnx",
+)
+STELLAR_SESSION_CACHE: Dict[Tuple[str, Tuple[str, ...]], Any] = {}
 
 
 class ArrowComboBox(QComboBox):
@@ -383,6 +438,34 @@ class ArrowComboBox(QComboBox):
 
 class ArrowSpinBox(QSpinBox):
     """QSpinBox with explicit up/down triangles; QSS native arrows are unreliable."""
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        self._paint_arrows()
+
+    def _paint_arrows(self):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        color = QColor("#9aa3b2") if not self.isEnabled() else self.palette().color(self.foregroundRole())
+        painter.setBrush(color)
+        painter.setPen(Qt.NoPen)
+        cx = self.width() - 12
+        up_y = max(7, self.height() // 4)
+        down_y = min(self.height() - 7, (self.height() * 3) // 4)
+        painter.drawPolygon(QPolygon([
+            QPoint(cx - 5, up_y + 3),
+            QPoint(cx + 5, up_y + 3),
+            QPoint(cx, up_y - 4),
+        ]))
+        painter.drawPolygon(QPolygon([
+            QPoint(cx - 5, down_y - 3),
+            QPoint(cx + 5, down_y - 3),
+            QPoint(cx, down_y + 4),
+        ]))
+
+
+class ArrowDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox with the same visible arrows as ArrowSpinBox."""
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -484,6 +567,7 @@ class StackSettings:
     bias_frame_path: Optional[str] = None  # volitelný master bias nebo složka Bias snímků
     dark_frame_path: Optional[str] = None  # volitelný master dark nebo složka Dark snímků
     source_folder: Optional[str] = None  # složka light snímků pro automatické hledání Bias/Flat/Dark podsložek
+    output_dir: Optional[str] = None  # volitelná výstupní složka pro CLI/wrapper režimy s více soubory
     use_gpu: bool = False                  # optional CUDA/CuPy or Apple Metal/MPS acceleration for stacking
     use_aligned_cache: bool = False         # cache zarovnaných snímků; default vypnuto kvůli I/O brzdě při alignmentu
     language: str = "en"
@@ -499,6 +583,11 @@ class StretchSettings:
     synthetic_flat: float = 0.0
     color_background_correction: float = 0.0
     denoise_strength: float = 0.0
+    denoise_mode: str = "classic"
+    ai_denoise_model_path: Optional[str] = None
+    star_deconvolution_strength: float = 0.0
+    star_deconvolution_size: float = 5.0
+    star_deconvolution_model_path: Optional[str] = None
     contrast: float = 1.0
     saturation: float = 1.0
     red: float = 1.0
@@ -555,58 +644,43 @@ def display_preview_limits(img: np.ndarray) -> Tuple[float, ...]:
     if finite.size < 10:
         return 0.0, 1.0, 0.25, 0.16, 0.85, 0.55
 
-    lo = float(np.percentile(finite, 0.1))
-    hi = float(np.max(np.asarray(img, dtype=np.float32)[np.isfinite(img)]))
-    if hi <= lo:
-        hi = float(np.max(finite))
-    if hi <= lo:
+    median = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - median)))
+    if not np.isfinite(median):
         return 0.0, 1.0, 0.25, 0.16, 0.85, 0.55
 
-    norm_lum = np.clip((finite - lo) / (hi - lo), 0.0, 1.0)
-    median = float(np.median(norm_lum[np.isfinite(norm_lum)]))
-    # Moderate linked STF: a compromise between the restrained display and
-    # the brighter arcsinh preview variant.
+    # Standard linked astronomical STF: clip only the low background tail
+    # using median/MAD, then move the remaining background median to a
+    # moderate display level. Bright pixels retain the complete 0..1 range;
+    # no high percentile is promoted into the highlight region.
+    lo = max(0.0, median - 2.8 * mad)
+    hi = 1.0
+    normalized_median = float(np.clip((median - lo) / max(hi - lo, 1e-6), 0.0, 1.0))
+    # A restrained background target keeps single light frames from looking
+    # excessively noisy while preserving the standard STF highlight behavior.
     target = 0.16
-    if median <= 1e-6:
+    if normalized_median <= 1e-6:
         mtf = 0.25
     else:
-        denom = 2.0 * median * target - target - median
-        mtf = median * (target - 1.0) / denom if abs(denom) > 1e-8 else 0.25
+        denom = 2.0 * normalized_median * target - target - normalized_median
+        mtf = (
+            normalized_median * (target - 1.0) / denom
+            if abs(denom) > 1e-8
+            else 0.25
+        )
     mtf = float(np.clip(mtf, 1e-4, 0.999))
-    knee = float(np.percentile(finite, 99.85))
-    if knee <= lo:
-        knee = float(np.percentile(finite, 99.0))
-    knee = float(np.clip(knee, lo + 1e-6, hi))
-    return lo, hi, mtf, target, knee, 0.55
+    return lo, hi, mtf, target, hi, 1.0
 
 
 def apply_display_preview_limits(img: np.ndarray, limits: Tuple[float, ...]) -> np.ndarray:
     arr = np.asarray(img, dtype=np.float32)
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     if len(limits) >= 6:
-        lo, hi, mtf, _target, knee, stf_weight = map(float, limits[:6])
+        lo, hi, mtf, _target, _knee, _stf_weight = map(float, limits[:6])
         if hi <= lo:
             return np.zeros_like(arr, dtype=np.float32)
         x = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
-        stf = midtones_transfer(mtf, x)
-
-        knee_level = 0.78
-        fits_base = np.clip((arr - lo) / max(knee - lo, 1e-6), 0.0, None) * knee_level
-        if hi > knee:
-            tail = np.clip((arr - knee) / (hi - knee), 0.0, 1.0)
-            strength = 12.0
-            tail = np.arcsinh(strength * tail) / np.arcsinh(strength)
-            fits_base = np.where(
-                arr > knee,
-                knee_level + (1.0 - knee_level) * tail,
-                fits_base,
-            )
-        fits_base = np.clip(fits_base, 0.0, 1.0).astype(np.float32)
-        return np.clip(
-            stf_weight * stf + (1.0 - stf_weight) * fits_base,
-            0.0,
-            1.0,
-        ).astype(np.float32)
+        return midtones_transfer(mtf, x)
     elif len(limits) >= 4:
         lo, hi, mtf, _target = map(float, limits[:4])
         if hi <= lo:
@@ -676,6 +750,19 @@ def normalize_fits_linear_to_float(arr: np.ndarray) -> np.ndarray:
     hi = float(np.max(data))
     if hi <= lo:
         return np.zeros_like(data, dtype=np.float32)
+
+    # A normalized 32-bit floating-point FIT is already linear 0..1 data.
+    # Stretching it again from its own min/max destroys its physical brightness
+    # scale and makes bright galaxy cores appear much larger than they are.
+    if lo >= 0.0 and hi <= 1.000001:
+        return np.clip(data, 0, 1).astype(np.float32)
+
+    # Non-normalized non-negative float FIT data are commonly stored as ADU.
+    # Scale by the sensor container range without subtracting the frame minimum.
+    if lo >= 0.0 and hi <= 65535.0:
+        return np.clip(data / 65535.0, 0, 1).astype(np.float32)
+
+    # Last-resort linear mapping for signed/calibrated floating-point data.
     data = (data - lo) / (hi - lo)
     return np.clip(data, 0, 1).astype(np.float32)
 
@@ -5283,7 +5370,11 @@ def stack_star_and_comet_two_outputs(folder: Path, settings: StackSettings, use_
     if settings.manual_comet_xy is None or settings.manual_comet_end_xy is None:
         raise ValueError("Star + Comet výstupy vyžadují označení komety v prvním i posledním snímku.")
 
-    output_dir = folder / "astro_stacker_output"
+    output_dir = (
+        Path(settings.output_dir)
+        if getattr(settings, "output_dir", None)
+        else folder / "astro_stacker_output"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     output_star = output_dir / "01_star_stack.fit"
     output_comet = output_dir / "02_comet_stack.fit"
@@ -5497,15 +5588,16 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
 
 
 def apply_scnr_green(img: np.ndarray, strength: int = 0) -> np.ndarray:
-    """SCNR Green — potlačení zeleného nádechu pro astro snímky.
+    """SCNR Green — šetrné potlačení zeleného přebytku.
 
     strength:
     0 = vypnuto
     1 = velmi jemné
     10 = silné
 
-    Princip: když je G kanál vyšší než průměr R/B, stáhne se směrem k R/B.
-    Nepřepisuje červený ani modrý kanál.
+    Používá princip Maximum Neutral: G se omezuje směrem k silnějšímu
+    z kanálů R/B. Oproti průměru R/B zachová více skutečného zeleného
+    signálu a zelený přebytek se barevně posune k dominantnímu R nebo B.
     """
     strength = int(max(0, min(10, strength)))
     if strength <= 0:
@@ -5516,14 +5608,21 @@ def apply_scnr_green(img: np.ndarray, strength: int = 0) -> np.ndarray:
     g = out[..., 1]
     b = out[..., 2]
 
-    # Cíl pro zelený kanál: robustní průměr R/B.
-    rb = 0.5 * (r + b)
+    # Maximum Neutral je šetrnější než Average Neutral. Pokud je například
+    # modrý kanál silný, zelená se přiblíží modré místo zbytečného stažení
+    # až k průměru R/B, které může poškodit zelenomodrou mlhovinu.
+    neutral_green = np.maximum(r, b)
 
     # Míra zásahu: 1..10 -> 10..100 %
     amount = strength / 10.0
 
-    # Pouze tam, kde je zelená nad R/B, ji stáhneme.
-    g_new = np.where(g > rb, g * (1.0 - amount) + rb * amount, g)
+    # Zasahuj pouze do skutečného zeleného přebytku. R a B zůstávají beze
+    # změny; částečná síla plynule míchá původní a neutralizovanou hodnotu.
+    g_new = np.where(
+        g > neutral_green,
+        g * (1.0 - amount) + neutral_green * amount,
+        g,
+    )
     out[..., 1] = g_new
 
     return np.clip(out, 0, 1).astype(np.float32)
@@ -5888,6 +5987,494 @@ def apply_astro_denoise(img: np.ndarray, strength: float = 0.0) -> np.ndarray:
     return np.clip(out, 0, 1).astype(np.float32)
 
 
+def find_drunet_model(explicit_path: Optional[str] = None) -> Optional[Path]:
+    """Find a bundled, user-selected, or locally installed DRUNet ONNX model."""
+    candidates: List[Path] = []
+    if explicit_path:
+        candidates.append(Path(explicit_path).expanduser())
+
+    roots: List[Path] = []
+    if getattr(sys, "frozen", False):
+        roots.extend(
+            [
+                Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)),
+                Path(sys.executable).resolve().parent,
+            ]
+        )
+    module_root = Path(__file__).resolve().parent
+    roots.extend([module_root, module_root.parent, Path.cwd()])
+
+    if sys.platform == "darwin":
+        roots.append(Path.home() / "Library" / "Application Support" / "AstroStacker" / "models")
+    elif os.name == "nt":
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            roots.append(Path(local_appdata) / "AstroStacker" / "models")
+    else:
+        roots.append(Path.home() / ".local" / "share" / "AstroStacker" / "models")
+
+    for root in roots:
+        for filename in DRUNET_MODEL_FILENAMES:
+            candidates.append(root / filename)
+            candidates.append(root / "models" / filename)
+            # An external PixInsight wrapper installed next to a PyInstaller
+            # one-folder application can reuse the bundled models without
+            # installing another 250 MB copy.
+            candidates.append(root / "_internal" / "models" / filename)
+
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file() and candidate.suffix.lower() == ".onnx":
+            return candidate
+    return None
+
+
+def drunet_execution_providers() -> List[str]:
+    if ort is None:
+        return []
+    available = set(ort.get_available_providers())
+    preferred: List[str] = []
+    if sys.platform == "darwin":
+        preferred.append("CoreMLExecutionProvider")
+    elif os.name == "nt":
+        preferred.extend(["CUDAExecutionProvider", "DmlExecutionProvider"])
+    preferred.append("CPUExecutionProvider")
+    return [provider for provider in preferred if provider in available]
+
+
+def get_drunet_session(model_path: Path):
+    if ort is None:
+        raise RuntimeError("ONNX Runtime is not installed. Install: pip install onnxruntime")
+    providers = drunet_execution_providers()
+    if not providers:
+        raise RuntimeError("ONNX Runtime has no usable execution provider.")
+    key = (
+        str(Path(model_path).resolve()),
+        tuple(repr(provider) for provider in providers),
+    )
+    cached = DRUNET_SESSION_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    options.log_severity_level = 3
+    if "DmlExecutionProvider" in providers:
+        options.enable_mem_pattern = False
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    session = ort.InferenceSession(str(model_path), sess_options=options, providers=providers)
+    active_providers = session.get_providers()
+    missing_providers = [provider for provider in providers if provider not in active_providers]
+    if missing_providers:
+        log_debug(
+            "DRUNet ONNX provider fallback: "
+            f"requested={providers}; active={active_providers}; "
+            f"unavailable={missing_providers}."
+        )
+    DRUNET_SESSION_CACHE[key] = session
+    log_debug(f"DRUNet ONNX loaded: {model_path}; providers={active_providers}")
+    return session
+
+
+def find_stellar_deconvolution_model(
+    explicit_path: Optional[str] = None,
+) -> Optional[Path]:
+    """Find the optional Cosmic Clarity stellar sharpening ONNX model."""
+    candidates: List[Path] = []
+    if explicit_path:
+        candidates.append(Path(explicit_path).expanduser())
+
+    roots: List[Path] = []
+    if getattr(sys, "frozen", False):
+        roots.extend(
+            [
+                Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)),
+                Path(sys.executable).resolve().parent,
+            ]
+        )
+    module_root = Path(__file__).resolve().parent
+    roots.extend([module_root, module_root.parent, Path.cwd()])
+    for root in roots:
+        for filename in STELLAR_MODEL_FILENAMES:
+            candidates.extend(
+                [
+                    root / filename,
+                    root / "models" / filename,
+                    root / "_internal" / "models" / filename,
+                ]
+            )
+
+    seen = set()
+    for candidate in candidates:
+        try:
+            key = str(candidate.resolve())
+        except Exception:
+            key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file() and candidate.suffix.lower() == ".onnx":
+            return candidate
+    return None
+
+
+def get_stellar_deconvolution_session(model_path: Path):
+    if ort is None:
+        raise RuntimeError("ONNX Runtime is not installed. Install: pip install onnxruntime")
+    providers = cosmic_clarity_execution_providers()
+    if not providers:
+        raise RuntimeError("ONNX Runtime has no usable execution provider.")
+    key = (
+        str(Path(model_path).resolve()),
+        tuple(repr(provider) for provider in providers),
+    )
+    cached = STELLAR_SESSION_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    options.log_severity_level = 3
+    if "DmlExecutionProvider" in providers:
+        options.enable_mem_pattern = False
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    try:
+        session = ort.InferenceSession(
+            str(model_path),
+            sess_options=options,
+            providers=providers,
+        )
+    except Exception:
+        if providers == ["CPUExecutionProvider"]:
+            raise
+        log_debug(
+            "Stellar ONNX GPU provider initialization failed; "
+            "falling back to CPU:\n"
+            + traceback.format_exc()
+        )
+        session = ort.InferenceSession(
+            str(model_path),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+    STELLAR_SESSION_CACHE[key] = session
+    log_debug(
+        f"Cosmic Clarity stellar ONNX loaded: {model_path}; "
+        f"providers={session.get_providers()}"
+    )
+    return session
+
+
+def cosmic_clarity_execution_providers():
+    """Prefer the Apple GPU explicitly for the fixed-size Cosmic models."""
+    if ort is None:
+        return []
+    available = set(ort.get_available_providers())
+    providers: List[Any] = []
+    if sys.platform == "darwin" and "CoreMLExecutionProvider" in available:
+        cache_dir = (
+            Path.home()
+            / "Library"
+            / "Caches"
+            / "AstroStacker"
+            / "CoreML"
+        )
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            cache_dir = Path(tempfile.gettempdir()) / "AstroStacker-CoreML"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        providers.append(
+            (
+                "CoreMLExecutionProvider",
+                {
+                    "ModelFormat": "MLProgram",
+                    "MLComputeUnits": "CPUAndGPU",
+                    "RequireStaticInputShapes": "1",
+                    "EnableOnSubgraphs": "0",
+                    "SpecializationStrategy": "FastPrediction",
+                    "ModelCacheDirectory": str(cache_dir),
+                },
+            )
+        )
+    elif os.name == "nt":
+        if "CUDAExecutionProvider" in available:
+            providers.append("CUDAExecutionProvider")
+        if "DmlExecutionProvider" in available:
+            providers.append("DmlExecutionProvider")
+    if "CPUExecutionProvider" in available:
+        providers.append("CPUExecutionProvider")
+    return providers
+
+
+def _drunet_tile_positions(length: int, tile: int, overlap: int) -> List[int]:
+    if length <= tile:
+        return [0]
+    step = max(1, tile - overlap)
+    positions = list(range(0, max(1, length - tile + 1), step))
+    last = length - tile
+    if not positions or positions[-1] != last:
+        positions.append(last)
+    return positions
+
+
+def _drunet_tile_weight(
+    tile_h: int,
+    tile_w: int,
+    overlap: int,
+    top_edge: bool,
+    bottom_edge: bool,
+    left_edge: bool,
+    right_edge: bool,
+) -> np.ndarray:
+    wy = np.ones(tile_h, dtype=np.float32)
+    wx = np.ones(tile_w, dtype=np.float32)
+    ramp_h = min(overlap, tile_h // 2)
+    ramp_w = min(overlap, tile_w // 2)
+    if ramp_h > 0:
+        ramp = np.sin(np.linspace(0.0, np.pi / 2.0, ramp_h, dtype=np.float32)) ** 2
+        if not top_edge:
+            wy[:ramp_h] = ramp
+        if not bottom_edge:
+            wy[-ramp_h:] = ramp[::-1]
+    if ramp_w > 0:
+        ramp = np.sin(np.linspace(0.0, np.pi / 2.0, ramp_w, dtype=np.float32)) ** 2
+        if not left_edge:
+            wx[:ramp_w] = ramp
+        if not right_edge:
+            wx[-ramp_w:] = ramp[::-1]
+    return wy[:, None] * wx[None, :]
+
+
+def stellar_deconvolution_mask(img: np.ndarray, star_size: float) -> np.ndarray:
+    """Build a soft star-only mask while excluding broad nebula/galaxy structure."""
+    rgb = np.clip(np.asarray(img, dtype=np.float32)[..., :3], 0.0, 1.0)
+    lum = (
+        0.2126 * rgb[..., 0]
+        + 0.7152 * rgb[..., 1]
+        + 0.0722 * rgb[..., 2]
+    ).astype(np.float32)
+    local_background = cv2.GaussianBlur(lum, (0, 0), 3.2)
+    compact = np.maximum(lum - local_background, 0.0)
+    noise = float(np.median(np.abs(compact - np.median(compact))) * 1.4826)
+    threshold = max(float(np.percentile(compact, 97.8)), noise * 3.5, 1e-4)
+    core = ((compact >= threshold) & (lum >= np.percentile(lum, 65.0))).astype(np.uint8)
+
+    radius = max(1, int(round(np.clip(star_size, 1.0, 10.0) * 0.65)))
+    kernel_size = radius * 2 + 1
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (kernel_size, kernel_size),
+    )
+    expanded = cv2.dilate(core, kernel, iterations=1).astype(np.float32)
+    sigma = max(0.8, radius * 0.55)
+    return np.clip(cv2.GaussianBlur(expanded, (0, 0), sigma), 0.0, 1.0)
+
+
+def run_stellar_deconvolution_onnx(
+    img: np.ndarray,
+    model_path: Path,
+    tile_size: int = 256,
+    overlap: int = 64,
+) -> np.ndarray:
+    """Run Cosmic Clarity stellar sharpening on luminance and return raw output."""
+    source = np.clip(
+        np.nan_to_num(np.asarray(img, dtype=np.float32), nan=0.0, posinf=1.0),
+        0.0,
+        1.0,
+    )
+    if source.ndim != 3 or source.shape[2] < 3:
+        raise ValueError("AI Star Deconvolution requires an RGB display image.")
+
+    session = get_stellar_deconvolution_session(Path(model_path))
+    input_meta = session.get_inputs()[0]
+    input_shape = list(input_meta.shape)
+    fixed_h = input_shape[2] if len(input_shape) == 4 and isinstance(input_shape[2], int) else None
+    fixed_w = input_shape[3] if len(input_shape) == 4 and isinstance(input_shape[3], int) else None
+    tile_h = int(fixed_h or tile_size)
+    tile_w = int(fixed_w or tile_size)
+    overlap = max(16, min(int(overlap), tile_h // 3, tile_w // 3))
+
+    rgb = np.ascontiguousarray(source[..., :3])
+    lum = (
+        0.2126 * rgb[..., 0]
+        + 0.7152 * rgb[..., 1]
+        + 0.0722 * rgb[..., 2]
+    ).astype(np.float32)
+    h, w = lum.shape
+    padded_h = max(h, tile_h)
+    padded_w = max(w, tile_w)
+    padded = np.pad(
+        lum,
+        ((0, padded_h - h), (0, padded_w - w)),
+        mode="reflect",
+    )
+    out_sum = np.zeros((padded_h, padded_w), dtype=np.float32)
+    weight_sum = np.zeros((padded_h, padded_w), dtype=np.float32)
+    input_name = input_meta.name
+    output_name = session.get_outputs()[0].name
+
+    for y0 in _drunet_tile_positions(padded_h, tile_h, overlap):
+        for x0 in _drunet_tile_positions(padded_w, tile_w, overlap):
+            tile = padded[y0:y0 + tile_h, x0:x0 + tile_w]
+            tensor = np.repeat(tile[None, None], 3, axis=1).astype(np.float32)
+            prediction = session.run([output_name], {input_name: tensor})[0]
+            if prediction.ndim != 4 or prediction.shape[1] < 1:
+                raise ValueError(
+                    f"Unexpected stellar model output shape: {prediction.shape}"
+                )
+            tile_out = np.asarray(prediction[0, 0], dtype=np.float32)
+            weight = _drunet_tile_weight(
+                tile_h,
+                tile_w,
+                overlap,
+                y0 == 0,
+                y0 + tile_h >= padded_h,
+                x0 == 0,
+                x0 + tile_w >= padded_w,
+            )
+            out_sum[y0:y0 + tile_h, x0:x0 + tile_w] += tile_out * weight
+            weight_sum[y0:y0 + tile_h, x0:x0 + tile_w] += weight
+
+    sharpened_lum = out_sum / np.maximum(weight_sum, 1e-6)
+    sharpened_lum = np.clip(sharpened_lum[:h, :w], 0.0, 1.0)
+    delta = sharpened_lum - lum
+    return np.clip(rgb + delta[..., None], 0.0, 1.0).astype(np.float32)
+
+
+def astro_detail_protection_mask(img: np.ndarray) -> np.ndarray:
+    """Soft mask protecting stars and high-contrast astronomical structures."""
+    work = np.clip(np.asarray(img, dtype=np.float32)[..., :3], 0, 1)
+    lum = 0.2126 * work[..., 0] + 0.7152 * work[..., 1] + 0.0722 * work[..., 2]
+    blur = cv2.GaussianBlur(lum, (0, 0), 1.1)
+    highpass = np.abs(lum - blur)
+    grad_x = cv2.Sobel(lum, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(lum, cv2.CV_32F, 0, 1, ksize=3)
+    gradient = cv2.magnitude(grad_x, grad_y)
+    star_thr = float(np.percentile(highpass, 98.2))
+    grad_thr = float(np.percentile(gradient, 96.0))
+    bright_thr = float(np.percentile(lum, 98.5))
+    mask = ((highpass > star_thr) | (gradient > grad_thr) | (lum > bright_thr)).astype(np.uint8)
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1).astype(np.float32)
+    return np.clip(cv2.GaussianBlur(mask, (0, 0), 1.5), 0, 1)
+
+
+def apply_drunet_onnx(
+    img: np.ndarray,
+    strength: float,
+    model_path: Path,
+    tile_size: int = 512,
+    overlap: int = 48,
+) -> np.ndarray:
+    """Run color DRUNet ONNX tile inference on a stretched RGB image."""
+    amount = float(np.clip(strength, 0.0, 1.0))
+    source = np.clip(np.nan_to_num(np.asarray(img, dtype=np.float32), nan=0.0, posinf=1.0, neginf=0.0), 0, 1)
+    if amount <= 1e-6:
+        return source
+    if source.ndim != 3 or source.shape[2] < 3:
+        raise ValueError("DRUNet requires an RGB display image.")
+
+    session = get_drunet_session(Path(model_path))
+    input_meta = session.get_inputs()[0]
+    input_shape = list(input_meta.shape)
+    input_channels = input_shape[1] if len(input_shape) == 4 and isinstance(input_shape[1], int) else 4
+    fixed_h = input_shape[2] if len(input_shape) == 4 and isinstance(input_shape[2], int) else None
+    fixed_w = input_shape[3] if len(input_shape) == 4 and isinstance(input_shape[3], int) else None
+    tile_h = int(fixed_h or tile_size)
+    tile_w = int(fixed_w or tile_size)
+    tile_h = max(32, tile_h - tile_h % 8)
+    tile_w = max(32, tile_w - tile_w % 8)
+    overlap = max(8, min(int(overlap), tile_h // 3, tile_w // 3))
+
+    rgb = np.ascontiguousarray(source[..., :3])
+    grayscale_model = input_channels in (1, 2)
+    if input_channels not in (1, 2, 3, 4):
+        raise ValueError(f"Unsupported DRUNet input channel count: {input_channels}")
+    if grayscale_model:
+        model_input = (
+            0.2126 * rgb[..., 0]
+            + 0.7152 * rgb[..., 1]
+            + 0.0722 * rgb[..., 2]
+        )[..., None].astype(np.float32)
+    else:
+        model_input = rgb
+    h, w = rgb.shape[:2]
+    padded_h = max(h, tile_h)
+    padded_w = max(w, tile_w)
+    pad_bottom = padded_h - h
+    pad_right = padded_w - w
+    padded = np.pad(
+        model_input,
+        ((0, pad_bottom), (0, pad_right), (0, 0)),
+        mode="reflect",
+    )
+    output_channels = 1 if grayscale_model else 3
+    out_sum = np.zeros(
+        (padded_h, padded_w, output_channels),
+        dtype=np.float32,
+    )
+    weight_sum = np.zeros(padded.shape[:2], dtype=np.float32)
+
+    noise_sigma = (5.0 + 45.0 * amount) / 255.0
+    y_positions = _drunet_tile_positions(padded_h, tile_h, overlap)
+    x_positions = _drunet_tile_positions(padded_w, tile_w, overlap)
+    input_name = input_meta.name
+    output_name = session.get_outputs()[0].name
+
+    for y0 in y_positions:
+        for x0 in x_positions:
+            tile = padded[y0:y0 + tile_h, x0:x0 + tile_w, :]
+            tensor = np.transpose(tile, (2, 0, 1))[None].astype(np.float32)
+            if input_channels in (2, 4):
+                noise_map = np.full((1, 1, tile_h, tile_w), noise_sigma, dtype=np.float32)
+                tensor = np.concatenate((tensor, noise_map), axis=1)
+
+            prediction = session.run([output_name], {input_name: tensor})[0]
+            if prediction.ndim != 4:
+                raise ValueError(f"Unexpected DRUNet output shape: {prediction.shape}")
+            if prediction.shape[1] < output_channels:
+                raise ValueError(f"Unexpected DRUNet output shape: {prediction.shape}")
+            tile_out = np.transpose(
+                prediction[0, :output_channels],
+                (1, 2, 0),
+            )
+            tile_out = np.clip(tile_out[:tile_h, :tile_w], 0, 1).astype(np.float32)
+            weight = _drunet_tile_weight(
+                tile_h,
+                tile_w,
+                overlap,
+                y0 == 0,
+                y0 + tile_h >= padded_h,
+                x0 == 0,
+                x0 + tile_w >= padded_w,
+            )
+            out_sum[y0:y0 + tile_h, x0:x0 + tile_w] += tile_out * weight[..., None]
+            weight_sum[y0:y0 + tile_h, x0:x0 + tile_w] += weight
+
+    denoised = out_sum / np.maximum(weight_sum[..., None], 1e-6)
+    denoised = denoised[:h, :w]
+    if grayscale_model:
+        original_luminance = model_input[:h, :w, 0]
+        luminance_delta = denoised[..., 0] - original_luminance
+        denoised = np.clip(
+            rgb + luminance_delta[..., None],
+            0.0,
+            1.0,
+        ).astype(np.float32)
+    protect = astro_detail_protection_mask(rgb)
+    blend = amount * (1.0 - 0.82 * protect)
+    result = rgb * (1.0 - blend[..., None]) + denoised * blend[..., None]
+    return np.clip(result, 0, 1).astype(np.float32)
+
+
 def apply_stretch(img: np.ndarray, s: StretchSettings) -> np.ndarray:
     out = img.astype(np.float32).copy()
 
@@ -5903,17 +6490,12 @@ def apply_stretch(img: np.ndarray, s: StretchSettings) -> np.ndarray:
     gamma = max(0.05, s.gamma)
     out = np.power(out, 1.0 / gamma)
 
-    # Adjustable STF strength. The hybrid FIT/STF display generated above is
-    # the neutral midpoint. Moving below 5 restrains the midtones; moving above
-    # 5 reveals progressively weaker structures while black and white stay
-    # fixed.
+    # Adjustable additional STF. Keep the direction unambiguous:
+    # 0 = no extra STF, 5 = medium, 10 = strongest reveal of faint structures.
     stf_strength = float(np.clip(getattr(s, "stf_strength", 5.0), 0.0, 10.0))
-    signed_strength = (stf_strength - 5.0) / 5.0
-    if abs(signed_strength) > 1e-6:
-        if signed_strength > 0:
-            mtf = 0.5 - 0.24 * np.power(signed_strength, 0.85)
-        else:
-            mtf = 0.5 + 0.18 * np.power(-signed_strength, 0.85)
+    normalized_strength = stf_strength / 10.0
+    if normalized_strength > 1e-6:
+        mtf = 0.5 - 0.30 * np.power(normalized_strength, 0.85)
         out = midtones_transfer(float(mtf), out)
 
     out = (out - 0.5) * s.contrast + 0.5
@@ -5923,6 +6505,22 @@ def apply_stretch(img: np.ndarray, s: StretchSettings) -> np.ndarray:
     out[..., 0] *= s.red
     out[..., 1] *= s.green
     out[..., 2] *= s.blue
+
+    # Preserve highlight structure after RGB/Balance gains. A hard per-channel
+    # clip turns bright galaxy nuclei into a flat white or colored patch as soon
+    # as one channel exceeds 1.0. Compress the per-pixel peak smoothly instead
+    # and scale all channels together so their color ratios remain unchanged.
+    peak = np.max(out, axis=2)
+    shoulder = 0.85
+    bright = peak > shoulder
+    if np.any(bright):
+        span = 1.0 - shoulder
+        rolled_peak = shoulder + span * (
+            1.0 - np.exp(-(peak - shoulder) / span)
+        )
+        scale = np.ones_like(peak, dtype=np.float32)
+        scale[bright] = rolled_peak[bright] / np.maximum(peak[bright], 1e-6)
+        out *= scale[..., None]
     out = np.clip(out, 0, 1)
 
     # SCNR Green — astro potlačení zeleného nádechu po RGB balance.
@@ -5936,7 +6534,8 @@ def apply_stretch(img: np.ndarray, s: StretchSettings) -> np.ndarray:
     hsv[..., 1] = np.clip(hsv[..., 1], 0.0, 1.0)
     out = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB).astype(np.float32)
     out = np.clip(out, 0.0, 1.0)
-    out = apply_astro_denoise(out, getattr(s, "denoise_strength", 0.0))
+    if getattr(s, "denoise_mode", "classic") != "drunet":
+        out = apply_astro_denoise(out, getattr(s, "denoise_strength", 0.0))
     return out
 
 
@@ -6060,7 +6659,7 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #777c85;
             border-color: #36393f;
         }
-        QComboBox, QSpinBox {
+        QComboBox, QSpinBox, QDoubleSpinBox {
             background-color: #191b1f;
             color: #f1f3f4;
             border: 1px solid #4a4f58;
@@ -6082,29 +6681,31 @@ def apply_dark_theme(app: QApplication) -> None:
             border-top: 6px solid #e8eaed;
             margin-right: 6px;
         }
-        QSpinBox::up-button, QSpinBox::down-button {
+        QSpinBox::up-button, QSpinBox::down-button,
+        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
             subcontrol-origin: border;
             width: 22px;
             background-color: #2b3038;
             border-left: 1px solid #4a4f58;
         }
-        QSpinBox::up-button {
+        QSpinBox::up-button, QDoubleSpinBox::up-button {
             subcontrol-position: top right;
             border-top-right-radius: 4px;
         }
-        QSpinBox::down-button {
+        QSpinBox::down-button, QDoubleSpinBox::down-button {
             subcontrol-position: bottom right;
             border-bottom-right-radius: 4px;
         }
-        QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+        QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+        QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
             background-color: #3a404a;
         }
-        QSpinBox::up-arrow {
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
             image: none;
             width: 9px;
             height: 9px;
         }
-        QSpinBox::down-arrow {
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
             image: none;
             width: 9px;
             height: 9px;
@@ -6248,7 +6849,7 @@ def apply_light_theme(app: QApplication) -> None:
             color: #8a94a3;
             border-color: #c8ced8;
         }
-        QComboBox, QSpinBox {
+        QComboBox, QSpinBox, QDoubleSpinBox {
             background-color: #eef1f5;
             color: #111827;
             border: 1px solid #9aa6b8;
@@ -6270,29 +6871,31 @@ def apply_light_theme(app: QApplication) -> None:
             border-top: 6px solid #1f2933;
             margin-right: 6px;
         }
-        QSpinBox::up-button, QSpinBox::down-button {
+        QSpinBox::up-button, QSpinBox::down-button,
+        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
             subcontrol-origin: border;
             width: 22px;
             background-color: #e8eef7;
             border-left: 1px solid #9aa6b8;
         }
-        QSpinBox::up-button {
+        QSpinBox::up-button, QDoubleSpinBox::up-button {
             subcontrol-position: top right;
             border-top-right-radius: 4px;
         }
-        QSpinBox::down-button {
+        QSpinBox::down-button, QDoubleSpinBox::down-button {
             subcontrol-position: bottom right;
             border-bottom-right-radius: 4px;
         }
-        QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+        QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+        QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
             background-color: #dbeafe;
         }
-        QSpinBox::up-arrow {
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
             image: none;
             width: 9px;
             height: 9px;
         }
-        QSpinBox::down-arrow {
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
             image: none;
             width: 9px;
             height: 9px;
@@ -7064,6 +7667,136 @@ class FrameQualityTable(QTableWidget):
         super().keyPressEvent(event)
 
 
+class AutoStackCalibrationWorker(QThread):
+    """Prepare manual or automatic calibration masters once per live session."""
+
+    progress = Signal(str)
+    masters_ready = Signal(object, object, object)
+    failed = Signal(str)
+
+    def __init__(self, settings: StackSettings):
+        super().__init__()
+        self.settings = settings
+
+    def run(self):
+        try:
+            def report(_value: int, message: str):
+                if self.isInterruptionRequested():
+                    raise ProcessingCancelled()
+                self.progress.emit(str(message))
+
+            flat, bias, dark = load_calibration_frames(self.settings, report)
+            if self.isInterruptionRequested():
+                return
+            self.masters_ready.emit(flat, bias, dark)
+        except ProcessingCancelled:
+            return
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class AutoStackFrameWorker(QThread):
+    """Load and align one newly completed frame without blocking the GUI."""
+
+    frame_ready = Signal(str, object, object, object)
+    failed = Signal(str, str)
+
+    def __init__(
+        self,
+        path: Path,
+        settings: StackSettings,
+        reference_gray: Optional[np.ndarray],
+        reference_shape: Optional[Tuple[int, ...]],
+        flat: Optional[np.ndarray] = None,
+        bias: Optional[np.ndarray] = None,
+        dark: Optional[np.ndarray] = None,
+    ):
+        super().__init__()
+        self.path = Path(path)
+        self.settings = settings
+        self.reference_gray = reference_gray
+        self.reference_shape = reference_shape
+        self.flat = flat
+        self.bias = bias
+        self.dark = dark
+
+    def run(self):
+        try:
+            if self.isInterruptionRequested():
+                return
+            set_bayer_pattern_override(getattr(self.settings, "bayer_pattern", "auto"))
+            image = np.ascontiguousarray(
+                load_calibrated_image_as_float(
+                    self.path,
+                    self.flat,
+                    self.bias,
+                    self.dark,
+                ).astype(np.float32)
+            )
+            if image.ndim not in (2, 3):
+                raise ValueError(f"Unsupported image shape: {image.shape}")
+            if image.ndim == 3 and image.shape[2] not in (1, 3):
+                image = np.ascontiguousarray(image[..., :3])
+
+            valid = np.all(np.isfinite(image), axis=2) if image.ndim == 3 else np.isfinite(image)
+            image = np.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+            if self.reference_gray is None:
+                coverage = valid.astype(np.float32)
+                self.frame_ready.emit(
+                    str(self.path),
+                    image,
+                    coverage,
+                    {"status": "reference"},
+                )
+                return
+
+            if self.reference_shape is None or tuple(image.shape) != tuple(self.reference_shape):
+                raise ValueError(
+                    f"Frame dimensions differ from the reference: {image.shape} != {self.reference_shape}"
+                )
+            if self.isInterruptionRequested():
+                return
+
+            moving_gray = to_gray_float(image)
+            matrix, status, detail = estimate_star_affine_detailed(
+                self.reference_gray,
+                moving_gray,
+                float(getattr(self.settings, "downscale_for_alignment", 0.5)),
+                int(getattr(self.settings, "max_star_shift", 180)),
+                int(getattr(self.settings, "star_border_margin", 40)),
+                bool(getattr(self.settings, "strict_star_filter", True)),
+            )
+            if status != "ransac":
+                raise ValueError(f"RANSAC alignment failed ({status})")
+            if self.isInterruptionRequested():
+                return
+
+            height, width = self.reference_gray.shape[:2]
+            aligned = cv2.warpAffine(
+                image,
+                matrix.astype(np.float32),
+                (width, height),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            ).astype(np.float32)
+            coverage = cv2.warpAffine(
+                valid.astype(np.float32),
+                matrix.astype(np.float32),
+                (width, height),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            coverage = (coverage > 0.5).astype(np.float32)
+            detail = dict(detail or {})
+            detail["status"] = status
+            self.frame_ready.emit(str(self.path), aligned, coverage, detail)
+        except Exception as exc:
+            self.failed.emit(str(self.path), str(exc))
+
+
 class StackWorker(QThread):
     progress = Signal(int, str)
     finished = Signal(object)
@@ -7268,10 +8001,1228 @@ class UpdateCheckWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class AlpacaClient:
+    """Small dependency-free client for the ASCOM Alpaca Camera API."""
+
+    DISCOVERY_PORT = 32227
+    DISCOVERY_MESSAGE = b"alpacadiscovery1"
+    IMAGE_BYTES_DTYPES = {
+        1: np.dtype("<i2"),
+        2: np.dtype("<i4"),
+        3: np.dtype("<f8"),
+        4: np.dtype("<f4"),
+        5: np.dtype("<u8"),
+        6: np.dtype("u1"),
+        7: np.dtype("<i8"),
+        8: np.dtype("<u2"),
+        9: np.dtype("<u4"),
+    }
+
+    def __init__(self, host: str, port: int, timeout: float = 8.0):
+        host = str(host).strip()
+        if not host:
+            raise ValueError("Alpaca host is empty.")
+        if "://" not in host:
+            host = "http://" + host
+        parsed = urllib.parse.urlsplit(host)
+        hostname = parsed.hostname or parsed.path
+        scheme = parsed.scheme or "http"
+        selected_port = parsed.port or int(port)
+        self.base_url = f"{scheme}://{hostname}:{selected_port}"
+        self.timeout = float(timeout)
+        self.client_id = max(1, os.getpid() & 0x7FFFFFFF)
+        self.transaction_id = 0
+
+    def _next_transaction(self) -> int:
+        self.transaction_id += 1
+        return self.transaction_id
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        params = dict(parameters or {})
+        params["ClientID"] = self.client_id
+        params["ClientTransactionID"] = self._next_transaction()
+        url = self.base_url + "/" + str(path).lstrip("/")
+        data = None
+        if method.upper() == "GET":
+            url += "?" + urllib.parse.urlencode(params)
+        else:
+            data = urllib.parse.urlencode(params).encode("ascii")
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": f"Astro-Stacker/{APP_VERSION}",
+        }
+        if data is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        request = urllib.request.Request(
+            url,
+            data=data,
+            method=method.upper(),
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Alpaca HTTP {exc.code}: {detail or exc.reason}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Cannot reach Alpaca server {self.base_url}: {exc.reason}") from exc
+
+        error_number = int(payload.get("ErrorNumber", 0) or 0)
+        if error_number:
+            message = str(payload.get("ErrorMessage", "") or "Unknown Alpaca error")
+            raise RuntimeError(f"Alpaca error {error_number}: {message}")
+        return payload.get("Value")
+
+    def get(self, path: str, parameters: Optional[Dict[str, Any]] = None) -> Any:
+        return self.request("GET", path, parameters)
+
+    def put(self, path: str, parameters: Optional[Dict[str, Any]] = None) -> Any:
+        return self.request("PUT", path, parameters)
+
+    def configured_cameras(self) -> List[Dict[str, Any]]:
+        devices = self.get("/management/v1/configureddevices")
+        return [
+            device for device in (devices or [])
+            if str(device.get("DeviceType", "")).lower() == "camera"
+        ]
+
+    @classmethod
+    def discover_servers(
+        cls,
+        timeout: float = 2.5,
+        target_host: Optional[str] = None,
+    ) -> List[Tuple[str, int]]:
+        """Discover Alpaca servers on the local network using the standard UDP probe."""
+        discovered: Dict[Tuple[str, int], None] = {}
+        deadline = time.monotonic() + max(0.2, float(timeout))
+        targets = [("255.255.255.255", cls.DISCOVERY_PORT)]
+        if target_host:
+            host = str(target_host).strip()
+            if "://" not in host:
+                host = "http://" + host
+            parsed = urllib.parse.urlsplit(host)
+            hostname = parsed.hostname or parsed.path
+            if hostname and hostname != "255.255.255.255":
+                targets.append((hostname, cls.DISCOVERY_PORT))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
+            udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            udp_socket.bind(("", 0))
+            for target in targets:
+                try:
+                    udp_socket.sendto(cls.DISCOVERY_MESSAGE, target)
+                except OSError:
+                    continue
+            while time.monotonic() < deadline:
+                udp_socket.settimeout(max(0.05, deadline - time.monotonic()))
+                try:
+                    response, address = udp_socket.recvfrom(4096)
+                except socket.timeout:
+                    break
+                try:
+                    payload = json.loads(response.decode("utf-8"))
+                    port = int(payload.get("AlpacaPort", 0))
+                except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
+                    continue
+                if 1 <= port <= 65535:
+                    discovered[(str(address[0]), port)] = None
+        return list(discovered)
+
+    def camera_path(self, device_number: int, command: str) -> str:
+        return f"/api/v1/camera/{int(device_number)}/{command.lower()}"
+
+    def camera_get(self, device_number: int, command: str) -> Any:
+        return self.get(self.camera_path(device_number, command))
+
+    def camera_put(
+        self,
+        device_number: int,
+        command: str,
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        return self.put(self.camera_path(device_number, command), parameters)
+
+    def camera_image_array(self, device_number: int) -> np.ndarray:
+        """Download ImageArray in either Alpaca ImageBytes or JSON format."""
+        params = {
+            "ClientID": self.client_id,
+            "ClientTransactionID": self._next_transaction(),
+        }
+        url = self.base_url + self.camera_path(device_number, "imagearray")
+        url += "?" + urllib.parse.urlencode(params)
+        request = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "application/imagebytes, application/json",
+                "User-Agent": f"Astro-Stacker/{APP_VERSION}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=max(60.0, self.timeout)) as response:
+                content_type = response.headers.get_content_type().lower()
+                payload = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Alpaca HTTP {exc.code}: {detail or exc.reason}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Cannot download the Alpaca image: {exc.reason}") from exc
+
+        if content_type == "application/imagebytes" or not payload.lstrip().startswith((b"{", b"[")):
+            return self._decode_image_bytes(payload)
+
+        response_payload = json.loads(payload.decode("utf-8"))
+        error_number = int(response_payload.get("ErrorNumber", 0) or 0)
+        if error_number:
+            message = str(response_payload.get("ErrorMessage", "") or "Unknown Alpaca error")
+            raise RuntimeError(f"Alpaca error {error_number}: {message}")
+        return np.asarray(response_payload.get("Value"))
+
+    @classmethod
+    def _decode_image_bytes(cls, payload: bytes) -> np.ndarray:
+        if len(payload) < 44:
+            raise RuntimeError(
+                f"Invalid Alpaca ImageBytes response: only {len(payload)} bytes received."
+            )
+        error_number = int.from_bytes(payload[4:8], "little", signed=True)
+        data_start = int.from_bytes(payload[16:20], "little", signed=False)
+        transmission_type = int.from_bytes(payload[24:28], "little", signed=False)
+        rank = int.from_bytes(payload[28:32], "little", signed=False)
+        dimensions = [
+            int.from_bytes(payload[32:36], "little", signed=False),
+            int.from_bytes(payload[36:40], "little", signed=False),
+            int.from_bytes(payload[40:44], "little", signed=False),
+        ]
+        if error_number:
+            message_start = data_start if 44 <= data_start < len(payload) else 44
+            message = payload[message_start:].decode("utf-8", errors="replace")
+            raise RuntimeError(f"Alpaca error {error_number}: {message}")
+        if rank not in (2, 3):
+            raise RuntimeError(f"Unsupported Alpaca ImageBytes rank: {rank}.")
+        shape = tuple(dimensions[:rank])
+        if not all(shape):
+            raise RuntimeError(f"Invalid Alpaca ImageBytes dimensions: {shape}.")
+        dtype = cls.IMAGE_BYTES_DTYPES.get(transmission_type)
+        if dtype is None:
+            raise RuntimeError(
+                f"Unsupported Alpaca ImageBytes element type: {transmission_type}."
+            )
+        if data_start < 44 or data_start > len(payload):
+            raise RuntimeError(f"Invalid Alpaca ImageBytes data offset: {data_start}.")
+        expected_pixels = math.prod(shape)
+        available_pixels = (len(payload) - data_start) // dtype.itemsize
+        if available_pixels < expected_pixels:
+            raise RuntimeError(
+                "Incomplete Alpaca image: "
+                f"expected {expected_pixels} pixels, received {available_pixels}."
+            )
+        image = np.frombuffer(
+            payload,
+            dtype=dtype,
+            count=expected_pixels,
+            offset=data_start,
+        )
+        return image.reshape(shape)
+
+
+class AlpacaCaptureWorker(QThread):
+    progress = Signal(int, str)
+    frame_saved = Signal(str)
+    failed = Signal(str)
+    connection_changed = Signal(bool)
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        device_number: int,
+        output_folder: Path,
+        exposure_seconds: float,
+        frame_count: int,
+        interval_seconds: float,
+        gain: int,
+        binning: int,
+        cooler_enabled: bool,
+        target_temperature: float,
+        camera_id: str = "Camera",
+    ):
+        super().__init__()
+        self.host = host
+        self.port = int(port)
+        self.device_number = int(device_number)
+        self.output_folder = Path(output_folder)
+        self.exposure_seconds = float(exposure_seconds)
+        self.frame_count = int(frame_count)
+        self.interval_seconds = float(interval_seconds)
+        self.gain = int(gain)
+        self.binning = int(binning)
+        self.cooler_enabled = bool(cooler_enabled)
+        self.target_temperature = float(target_temperature)
+        safe_camera_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(camera_id)).strip("_")
+        self.camera_id = safe_camera_id or f"Camera_{self.device_number}"
+        self.camera_name = ""
+        self.sensor_type: Optional[int] = None
+        self.bayer_pattern: Optional[str] = None
+        self.max_adu: Optional[int] = None
+
+    def _wait_interruptible(self, seconds: float):
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while time.monotonic() < deadline:
+            if self.isInterruptionRequested():
+                raise ProcessingCancelled()
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+    def _image_to_fits_array(self, value: Any) -> np.ndarray:
+        image = np.asarray(value)
+        if image.ndim == 2:
+            image = image.T
+        elif image.ndim == 3:
+            image = np.transpose(image, (1, 0, 2))
+            if image.shape[2] in (3, 4):
+                image = np.moveaxis(image[..., :3], -1, 0)
+        else:
+            raise ValueError(f"Unsupported Alpaca ImageArray shape: {image.shape}")
+        if image.dtype.kind not in "uif":
+            image = image.astype(np.float32)
+        elif image.dtype.kind in "iu" and image.size:
+            minimum = int(np.min(image))
+            maximum = int(np.max(image))
+            if minimum >= 0 and maximum <= np.iinfo(np.uint16).max:
+                image = image.astype(np.uint16, copy=False)
+        return np.ascontiguousarray(image)
+
+    @staticmethod
+    def _bayer_pattern_from_alpaca(
+        sensor_type: Optional[int],
+        offset_x: int,
+        offset_y: int,
+    ) -> Optional[str]:
+        if sensor_type != 2:
+            return None
+        patterns = {
+            (0, 0): "RGGB",
+            (1, 0): "GRBG",
+            (0, 1): "GBRG",
+            (1, 1): "BGGR",
+        }
+        return patterns[(int(offset_x) & 1, int(offset_y) & 1)]
+
+    def _read_camera_metadata(self, client: AlpacaClient):
+        try:
+            self.camera_name = str(
+                client.camera_get(self.device_number, "name") or ""
+            )
+        except Exception:
+            self.camera_name = ""
+        try:
+            self.sensor_type = int(
+                client.camera_get(self.device_number, "sensortype")
+            )
+        except Exception:
+            self.sensor_type = None
+        offset_x = 0
+        offset_y = 0
+        if self.sensor_type == 2:
+            try:
+                offset_x = int(client.camera_get(self.device_number, "bayeroffsetx"))
+                offset_y = int(client.camera_get(self.device_number, "bayeroffsety"))
+            except Exception:
+                offset_x = 0
+                offset_y = 0
+        self.bayer_pattern = self._bayer_pattern_from_alpaca(
+            self.sensor_type,
+            offset_x,
+            offset_y,
+        )
+        try:
+            self.max_adu = int(client.camera_get(self.device_number, "maxadu"))
+        except Exception:
+            self.max_adu = None
+
+    def _save_frame(
+        self,
+        image: np.ndarray,
+        index: int,
+        sensor_temperature: Optional[float] = None,
+    ) -> Path:
+        if fits is None:
+            raise RuntimeError("Astropy is required to save Alpaca camera frames as FIT.")
+        self.output_folder.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        path = (
+            self.output_folder
+            / f"Alpaca_{self.camera_id}_Light_{timestamp}_{index:04d}.fit"
+        )
+        header = fits.Header()
+        header["IMAGETYP"] = ("LIGHT", "Frame type")
+        header["EXPTIME"] = (self.exposure_seconds, "Exposure time in seconds")
+        header["XBINNING"] = self.binning
+        header["YBINNING"] = self.binning
+        if self.gain >= 0:
+            header["GAIN"] = self.gain
+        if self.camera_name:
+            header["INSTRUME"] = self.camera_name
+        header["CAMID"] = (self.camera_id, "Multi-camera source identifier")
+        if self.max_adu is not None:
+            header["MAXADU"] = self.max_adu
+        if self.bayer_pattern:
+            header["BAYERPAT"] = (self.bayer_pattern, "Bayer CFA pattern")
+        if self.cooler_enabled:
+            header["SET-TEMP"] = (self.target_temperature, "Cooler target in deg C")
+        if sensor_temperature is not None:
+            header["CCD-TEMP"] = (sensor_temperature, "Sensor temperature in deg C")
+        header["ORIGIN"] = f"Astro Stacker {APP_VERSION} Alpaca"
+        fits.PrimaryHDU(data=image, header=header).writeto(path, overwrite=False)
+        return path
+
+    def run(self):
+        client = AlpacaClient(self.host, self.port, timeout=15.0)
+        try:
+            client.camera_put(self.device_number, "connected", {"Connected": "true"})
+            self.connection_changed.emit(True)
+            self._read_camera_metadata(client)
+            if self.binning > 0:
+                client.camera_put(self.device_number, "binx", {"BinX": self.binning})
+                client.camera_put(self.device_number, "biny", {"BinY": self.binning})
+            if self.gain >= 0:
+                client.camera_put(self.device_number, "gain", {"Gain": self.gain})
+            if self.cooler_enabled:
+                client.camera_put(
+                    self.device_number,
+                    "setccdtemperature",
+                    {"SetCCDTemperature": self.target_temperature},
+                )
+                client.camera_put(
+                    self.device_number,
+                    "cooleron",
+                    {"CoolerOn": "true"},
+                )
+
+            for index in range(1, self.frame_count + 1):
+                if self.isInterruptionRequested():
+                    raise ProcessingCancelled()
+                self.progress.emit(
+                    int((index - 1) * 100 / max(1, self.frame_count)),
+                    f"Starting exposure {index}/{self.frame_count} ({self.exposure_seconds:.2f} s)…",
+                )
+                client.camera_put(
+                    self.device_number,
+                    "startexposure",
+                    {"Duration": self.exposure_seconds, "Light": "true"},
+                )
+                deadline = time.monotonic() + max(30.0, self.exposure_seconds + 120.0)
+                while not bool(client.camera_get(self.device_number, "imageready")):
+                    if self.isInterruptionRequested():
+                        try:
+                            client.camera_put(self.device_number, "abortexposure")
+                        except Exception:
+                            pass
+                        raise ProcessingCancelled()
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("The Alpaca camera did not finish the exposure in time.")
+                    self._wait_interruptible(0.25)
+
+                self.progress.emit(
+                    int((index - 0.25) * 100 / max(1, self.frame_count)),
+                    f"Downloading exposure {index}/{self.frame_count}…",
+                )
+                image = self._image_to_fits_array(
+                    client.camera_image_array(self.device_number)
+                )
+                sensor_temperature = None
+                try:
+                    sensor_temperature = float(
+                        client.camera_get(self.device_number, "ccdtemperature")
+                    )
+                except Exception:
+                    pass
+                path = self._save_frame(image, index, sensor_temperature)
+                self.frame_saved.emit(str(path))
+                self.progress.emit(
+                    int(index * 100 / max(1, self.frame_count)),
+                    f"Saved {path.name}",
+                )
+                if index < self.frame_count:
+                    self._wait_interruptible(self.interval_seconds)
+        except ProcessingCancelled:
+            pass
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class AlpacaCameraDialog(QDialog):
+    def __init__(self, main_window: "AstroStackerWindow"):
+        super().__init__(main_window)
+        self.main_window = main_window
+        self.capture_workers: Dict[str, AlpacaCaptureWorker] = {}
+        self.camera_states: Dict[str, bool] = {}
+        self.camera_progress: Dict[str, int] = {}
+        self.setWindowTitle("Camera - ASCOM Alpaca Multi Camera")
+        self.setMinimumWidth(720)
+        self.setModal(False)
+
+        layout = QVBoxLayout(self)
+        connection_form = QFormLayout()
+        connection_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.host_edit = QLineEdit("10.42.42.1")
+        self.port_spin = ArrowSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(80)
+        server_row = QHBoxLayout()
+        server_row.setContentsMargins(0, 0, 0, 0)
+        server_row.addWidget(self.host_edit, 1)
+        server_row.addWidget(self.port_spin)
+        self.discover_btn = QPushButton("Discover")
+        self.discover_btn.clicked.connect(self.discover_cameras)
+        server_row.addWidget(self.discover_btn)
+        server_widget = QWidget()
+        server_widget.setLayout(server_row)
+        connection_form.addRow("Alpaca server", server_widget)
+
+        camera_buttons = QHBoxLayout()
+        camera_buttons.setContentsMargins(0, 0, 0, 0)
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.clicked.connect(self.refresh_cameras)
+        self.select_all_btn = QPushButton("Select all")
+        self.select_none_btn = QPushButton("Select none")
+        self.select_all_btn.clicked.connect(lambda: self.set_all_cameras_checked(True))
+        self.select_none_btn.clicked.connect(lambda: self.set_all_cameras_checked(False))
+        camera_buttons.addWidget(self.refresh_btn)
+        camera_buttons.addWidget(self.select_all_btn)
+        camera_buttons.addWidget(self.select_none_btn)
+        camera_buttons.addStretch(1)
+        camera_buttons_widget = QWidget()
+        camera_buttons_widget.setLayout(camera_buttons)
+        connection_form.addRow("Cameras", camera_buttons_widget)
+        layout.addLayout(connection_form)
+
+        self.camera_table = QTableWidget(0, 4)
+        self.camera_table.setHorizontalHeaderLabels(
+            ["Use", "Camera/ID file", "Alpaca server", "Status"]
+        )
+        self.camera_table.verticalHeader().setVisible(False)
+        self.camera_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.camera_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.camera_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.camera_table.setMinimumHeight(150)
+        header = self.camera_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        layout.addWidget(self.camera_table)
+
+        connect_row = QHBoxLayout()
+        self.connect_btn = QPushButton("Connect selected")
+        self.disconnect_btn = QPushButton("Disconnect selected")
+        self.connect_btn.clicked.connect(lambda: self.set_connected(True))
+        self.disconnect_btn.clicked.connect(lambda: self.set_connected(False))
+        connect_row.addWidget(self.connect_btn)
+        connect_row.addWidget(self.disconnect_btn)
+        layout.addLayout(connect_row)
+
+        capture_form = QFormLayout()
+        self.exposure_spin = ArrowDoubleSpinBox()
+        self.exposure_spin.setRange(0.001, 86400.0)
+        self.exposure_spin.setDecimals(3)
+        self.exposure_spin.setValue(10.0)
+        self.exposure_spin.setSuffix(" s")
+        capture_form.addRow("Exposure", self.exposure_spin)
+
+        self.gain_spin = ArrowSpinBox()
+        self.gain_spin.setRange(-1, 100000)
+        self.gain_spin.setValue(-1)
+        self.gain_spin.setSpecialValueText("Unchanged")
+        capture_form.addRow("Gain", self.gain_spin)
+
+        temperature_row = QHBoxLayout()
+        self.cooler_check = QCheckBox("Cooler")
+        self.target_temperature_spin = ArrowDoubleSpinBox()
+        self.target_temperature_spin.setRange(-80.0, 40.0)
+        self.target_temperature_spin.setDecimals(1)
+        self.target_temperature_spin.setValue(-10.0)
+        self.target_temperature_spin.setSuffix(" °C")
+        self.apply_camera_settings_btn = QPushButton("Apply")
+        self.apply_camera_settings_btn.clicked.connect(self.apply_camera_settings)
+        temperature_row.addWidget(self.cooler_check)
+        temperature_row.addWidget(self.target_temperature_spin)
+        temperature_row.addWidget(self.apply_camera_settings_btn)
+        temperature_widget = QWidget()
+        temperature_widget.setLayout(temperature_row)
+        capture_form.addRow("Sensor temperature", temperature_widget)
+
+        self.current_temperature_label = QLabel("Current: -- °C")
+        capture_form.addRow("", self.current_temperature_label)
+
+        self.bin_spin = ArrowSpinBox()
+        self.bin_spin.setRange(1, 16)
+        self.bin_spin.setValue(1)
+        capture_form.addRow("Binning", self.bin_spin)
+
+        self.count_spin = ArrowSpinBox()
+        self.count_spin.setRange(1, 100000)
+        self.count_spin.setValue(10)
+        capture_form.addRow("Frames", self.count_spin)
+
+        self.interval_spin = ArrowDoubleSpinBox()
+        self.interval_spin.setRange(0.0, 3600.0)
+        self.interval_spin.setValue(0.5)
+        self.interval_spin.setSuffix(" s")
+        capture_form.addRow("Interval", self.interval_spin)
+
+        folder_row = QHBoxLayout()
+        self.folder_edit = QLineEdit(
+            str(main_window.folder) if main_window.folder is not None else ""
+        )
+        self.folder_btn = QPushButton("Select")
+        self.folder_btn.clicked.connect(self.choose_output_folder)
+        folder_row.addWidget(self.folder_edit, 1)
+        folder_row.addWidget(self.folder_btn)
+        folder_widget = QWidget()
+        folder_widget.setLayout(folder_row)
+        capture_form.addRow("Live stack folder", folder_widget)
+        layout.addLayout(capture_form)
+
+        self.auto_live_check = QCheckBox("Start Live stacking automatically")
+        self.auto_live_check.setChecked(True)
+        layout.addWidget(self.auto_live_check)
+
+        action_row = QHBoxLayout()
+        self.start_btn = QPushButton("Start synchronized sequence")
+        self.stop_btn = QPushButton("Stop all")
+        self.stop_btn.setEnabled(False)
+        self.start_btn.clicked.connect(self.start_sequence)
+        self.stop_btn.clicked.connect(self.stop_sequence)
+        action_row.addWidget(self.start_btn)
+        action_row.addWidget(self.stop_btn)
+        layout.addLayout(action_row)
+
+        self.progress = QProgressBar()
+        layout.addWidget(self.progress)
+        self.status_label = QLabel("Enter the Alpaca server and press Refresh.")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        self.update_connection_indicator(False)
+
+    @staticmethod
+    def camera_key(host: str, port: int, device_number: int) -> str:
+        return f"{host}:{int(port)}/camera/{int(device_number)}"
+
+    @staticmethod
+    def camera_file_id(name: str, host: str, device_number: int) -> str:
+        safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(name)).strip("_")
+        safe_host = re.sub(r"[^A-Za-z0-9_-]+", "_", str(host)).strip("_")
+        return f"{safe_name or 'Camera'}_{safe_host}_D{int(device_number)}"
+
+    def clear_camera_table(self):
+        self.camera_table.setRowCount(0)
+        self.camera_states.clear()
+        self.camera_progress.clear()
+        self.update_connection_indicator(False)
+
+    def add_camera_row(
+        self,
+        name: str,
+        host: str,
+        port: int,
+        device_number: int,
+        checked: bool = True,
+    ):
+        key = self.camera_key(host, port, device_number)
+        camera_id = self.camera_file_id(name, host, device_number)
+        for row in range(self.camera_table.rowCount()):
+            item = self.camera_table.item(row, 0)
+            if item is not None and item.data(Qt.UserRole) == key:
+                return
+        row = self.camera_table.rowCount()
+        self.camera_table.insertRow(row)
+        use_item = QTableWidgetItem()
+        use_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+        use_item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        use_item.setData(Qt.UserRole, key)
+        use_item.setData(
+            Qt.UserRole + 1,
+            (str(host), int(port), int(device_number), str(name), camera_id),
+        )
+        self.camera_table.setItem(row, 0, use_item)
+        self.camera_table.setItem(row, 1, QTableWidgetItem(str(name)))
+        self.camera_table.setItem(row, 2, QTableWidgetItem(f"{host}:{int(port)}"))
+        status_item = QTableWidgetItem("Disconnected")
+        status_item.setForeground(QBrush(QColor("#ef4444")))
+        self.camera_table.setItem(row, 3, status_item)
+        self.camera_states[key] = False
+        self.camera_progress[key] = 0
+
+    def camera_entries(self, selected_only: bool = True) -> List[Dict[str, Any]]:
+        entries = []
+        for row in range(self.camera_table.rowCount()):
+            use_item = self.camera_table.item(row, 0)
+            if use_item is None:
+                continue
+            if selected_only and use_item.checkState() != Qt.Checked:
+                continue
+            data = use_item.data(Qt.UserRole + 1)
+            if not data:
+                continue
+            host, port, device_number, name, camera_id = data
+            entries.append(
+                {
+                    "row": row,
+                    "key": str(use_item.data(Qt.UserRole)),
+                    "host": str(host),
+                    "port": int(port),
+                    "device_number": int(device_number),
+                    "name": str(name),
+                    "camera_id": str(camera_id),
+                }
+            )
+        return entries
+
+    def set_all_cameras_checked(self, checked: bool):
+        for row in range(self.camera_table.rowCount()):
+            item = self.camera_table.item(row, 0)
+            if item is not None:
+                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        self.update_aggregate_connection_indicator()
+
+    def set_camera_status(
+        self,
+        key: str,
+        text: str,
+        color: str,
+        connected: Optional[bool] = None,
+        progress: Optional[int] = None,
+    ):
+        for entry in self.camera_entries(selected_only=False):
+            if entry["key"] != key:
+                continue
+            item = self.camera_table.item(entry["row"], 3)
+            if item is not None:
+                item.setText(text)
+                item.setForeground(QBrush(QColor(color)))
+            break
+        if connected is not None:
+            self.camera_states[key] = bool(connected)
+        if progress is not None:
+            self.camera_progress[key] = int(progress)
+        self.update_aggregate_connection_indicator()
+
+    def update_aggregate_connection_indicator(self):
+        selected = self.camera_entries()
+        if not selected:
+            self.update_connection_indicator(False)
+            return
+        states = [self.camera_states.get(entry["key"], False) for entry in selected]
+        if all(states):
+            self.update_connection_indicator(True)
+        elif any(states):
+            self.connect_btn.setText("Connect remaining")
+            self.connect_btn.setEnabled(True)
+            self.connect_btn.setStyleSheet("font-weight: 600; padding: 6px 12px;")
+            self.disconnect_btn.setText("Disconnect all")
+            self.disconnect_btn.setEnabled(True)
+            self.disconnect_btn.setStyleSheet(
+                """
+                QPushButton {
+                    font-weight: 600;
+                    padding: 6px 12px;
+                    color: white;
+                    background-color: #b45309;
+                    border: 1px solid #f59e0b;
+                }
+                """
+            )
+        else:
+            self.update_connection_indicator(False)
+
+    def update_connection_indicator(
+        self,
+        connected: Optional[bool],
+    ):
+        base_style = "font-weight: 600; padding: 6px 12px;"
+        if connected is True:
+            self.connect_btn.setText("All selected connected")
+            self.connect_btn.setEnabled(False)
+            self.connect_btn.setStyleSheet(
+                base_style
+                + """
+                QPushButton, QPushButton:disabled {
+                    color: white;
+                    background-color: #2563eb;
+                    border: 1px solid #60a5fa;
+                }
+                """
+            )
+            self.disconnect_btn.setText("Disconnect selected")
+            self.disconnect_btn.setEnabled(True)
+            self.disconnect_btn.setStyleSheet(base_style)
+        elif connected is False:
+            self.connect_btn.setText("Connect selected")
+            self.connect_btn.setEnabled(True)
+            self.connect_btn.setStyleSheet(base_style)
+            self.disconnect_btn.setText("Selected disconnected")
+            self.disconnect_btn.setEnabled(False)
+            self.disconnect_btn.setStyleSheet(
+                base_style
+                + """
+                QPushButton, QPushButton:disabled {
+                    color: white;
+                    background-color: #b91c1c;
+                    border: 1px solid #ef4444;
+                }
+                """
+            )
+        else:
+            self.connect_btn.setText("Connecting selected...")
+            self.connect_btn.setEnabled(False)
+            self.connect_btn.setStyleSheet(
+                base_style
+                + """
+                QPushButton, QPushButton:disabled {
+                    color: #111827;
+                    background-color: #f59e0b;
+                    border: 1px solid #fbbf24;
+                }
+                """
+            )
+            self.disconnect_btn.setText("Disconnect selected")
+            self.disconnect_btn.setEnabled(False)
+            self.disconnect_btn.setStyleSheet(base_style)
+
+    def discover_cameras(self):
+        self.discover_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            servers = AlpacaClient.discover_servers(
+                target_host=self.host_edit.text(),
+            )
+            if not servers:
+                self.status_label.setText(
+                    "No Alpaca server was discovered. Check that the computer is "
+                    "connected to the camera Wi-Fi."
+                )
+                return
+
+            total_cameras = 0
+            self.clear_camera_table()
+            first_server: Optional[Tuple[str, int]] = None
+            errors = []
+            for host, port in servers:
+                try:
+                    cameras = AlpacaClient(host, port).configured_cameras()
+                except Exception as exc:
+                    errors.append(f"{host}:{port}: {exc}")
+                    continue
+                if first_server is None and cameras:
+                    first_server = (host, port)
+                for camera in cameras:
+                    number = int(camera.get("DeviceNumber", 0))
+                    name = str(camera.get("DeviceName") or f"Camera {number}")
+                    self.add_camera_row(name, host, port, number)
+                    total_cameras += 1
+
+            if first_server is not None:
+                self.host_edit.setText(first_server[0])
+                self.port_spin.setValue(first_server[1])
+            if total_cameras:
+                self.refresh_connection_indicator()
+                self.status_label.setText(
+                    f"Discovered {total_cameras} Alpaca camera(s) on "
+                    f"{len(servers)} server(s)."
+                )
+            elif errors:
+                self.status_label.setText(errors[0])
+            else:
+                self.status_label.setText(
+                    f"Found {len(servers)} Alpaca server(s), but none reported a camera."
+                )
+        except Exception as exc:
+            self.status_label.setText(f"Alpaca discovery failed: {exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.discover_btn.setEnabled(True)
+            self.refresh_btn.setEnabled(True)
+
+    def current_client_and_device(self) -> Tuple[AlpacaClient, int]:
+        entries = self.camera_entries()
+        if not entries:
+            raise RuntimeError("Select at least one Alpaca camera first.")
+        entry = entries[0]
+        return (
+            AlpacaClient(entry["host"], entry["port"]),
+            entry["device_number"],
+        )
+
+    def refresh_cameras(self):
+        self.refresh_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            client = AlpacaClient(self.host_edit.text(), self.port_spin.value())
+            cameras = client.configured_cameras()
+            self.clear_camera_table()
+            for camera in cameras:
+                number = int(camera.get("DeviceNumber", 0))
+                name = str(camera.get("DeviceName") or f"Camera {number}")
+                self.add_camera_row(
+                    name,
+                    self.host_edit.text().strip(),
+                    self.port_spin.value(),
+                    number,
+                )
+            if cameras:
+                self.refresh_connection_indicator()
+                self.status_label.setText(f"Found {len(cameras)} Alpaca camera(s).")
+            else:
+                self.status_label.setText("No Alpaca cameras were reported by this server.")
+        except Exception as exc:
+            self.status_label.setText(str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.refresh_btn.setEnabled(True)
+
+    def refresh_connection_indicator(self):
+        for entry in self.camera_entries():
+            try:
+                state = bool(
+                    AlpacaClient(entry["host"], entry["port"]).camera_get(
+                        entry["device_number"],
+                        "connected",
+                    )
+                )
+            except Exception:
+                state = False
+            self.set_camera_status(
+                entry["key"],
+                "Connected" if state else "Disconnected",
+                "#60a5fa" if state else "#ef4444",
+                connected=state,
+            )
+
+    def set_connected(self, connected: bool):
+        self.update_connection_indicator(None)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            entries = self.camera_entries()
+            if not entries:
+                raise RuntimeError("Select at least one Alpaca camera first.")
+            failures = []
+            for index, entry in enumerate(entries):
+                client = AlpacaClient(entry["host"], entry["port"])
+                try:
+                    self.set_camera_status(
+                        entry["key"],
+                        "Connecting..." if connected else "Disconnecting...",
+                        "#f59e0b",
+                    )
+                    client.camera_put(
+                        entry["device_number"],
+                        "connected",
+                        {"Connected": "true" if connected else "false"},
+                    )
+                    try:
+                        state = bool(
+                            client.camera_get(entry["device_number"], "connected")
+                        )
+                    except Exception:
+                        state = bool(connected)
+                    if state and index == 0:
+                        self.read_camera_settings(client, entry["device_number"])
+                    self.set_camera_status(
+                        entry["key"],
+                        "Connected" if state else "Disconnected",
+                        "#60a5fa" if state else "#ef4444",
+                        connected=state,
+                    )
+                except Exception as exc:
+                    failures.append(f"{entry['name']}: {exc}")
+                    self.set_camera_status(
+                        entry["key"],
+                        "Error",
+                        "#ef4444",
+                        connected=False,
+                    )
+            if failures:
+                self.status_label.setText("; ".join(failures))
+            else:
+                self.status_label.setText(
+                    f"{len(entries)} camera(s) "
+                    f"{'connected' if connected else 'disconnected'}."
+                )
+        except Exception as exc:
+            self.status_label.setText(str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def read_camera_settings(
+        self,
+        client: Optional[AlpacaClient] = None,
+        device_number: Optional[int] = None,
+    ):
+        if client is None or device_number is None:
+            client, device_number = self.current_client_and_device()
+        details = []
+        try:
+            gain_min = int(client.camera_get(device_number, "gainmin"))
+            gain_max = int(client.camera_get(device_number, "gainmax"))
+            if gain_max >= gain_min:
+                self.gain_spin.setRange(gain_min, gain_max)
+        except Exception:
+            pass
+        try:
+            gain = int(client.camera_get(device_number, "gain"))
+            self.gain_spin.setValue(gain)
+            details.append(f"gain {gain}")
+        except Exception:
+            pass
+        try:
+            temperature = float(client.camera_get(device_number, "ccdtemperature"))
+            self.current_temperature_label.setText(f"Current: {temperature:.1f} °C")
+            details.append(f"sensor {temperature:.1f} °C")
+        except Exception:
+            self.current_temperature_label.setText("Current: unavailable")
+        try:
+            cooler_on = bool(client.camera_get(device_number, "cooleron"))
+            self.cooler_check.setChecked(cooler_on)
+        except Exception:
+            pass
+        try:
+            target = float(client.camera_get(device_number, "setccdtemperature"))
+            self.target_temperature_spin.setValue(target)
+        except Exception:
+            pass
+        return details
+
+    def apply_camera_settings(self):
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            entries = self.camera_entries()
+            if not entries:
+                raise RuntimeError("Select at least one Alpaca camera first.")
+            failures = []
+            for index, entry in enumerate(entries):
+                client = AlpacaClient(entry["host"], entry["port"])
+                try:
+                    if self.gain_spin.value() >= 0:
+                        client.camera_put(
+                            entry["device_number"],
+                            "gain",
+                            {"Gain": self.gain_spin.value()},
+                        )
+                    if self.cooler_check.isChecked():
+                        client.camera_put(
+                            entry["device_number"],
+                            "setccdtemperature",
+                            {
+                                "SetCCDTemperature":
+                                    self.target_temperature_spin.value()
+                            },
+                        )
+                    client.camera_put(
+                        entry["device_number"],
+                        "cooleron",
+                        {
+                            "CoolerOn":
+                                "true" if self.cooler_check.isChecked() else "false"
+                        },
+                    )
+                    if index == 0:
+                        self.read_camera_settings(client, entry["device_number"])
+                    self.set_camera_status(
+                        entry["key"],
+                        "Settings applied",
+                        "#60a5fa",
+                        connected=True,
+                    )
+                except Exception as exc:
+                    failures.append(f"{entry['name']}: {exc}")
+                    self.set_camera_status(entry["key"], "Settings error", "#ef4444")
+            if failures:
+                self.status_label.setText("; ".join(failures))
+            else:
+                self.status_label.setText(
+                    f"Settings applied to {len(entries)} camera(s)."
+                )
+        except Exception as exc:
+            self.status_label.setText(str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def choose_output_folder(self):
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Select Live stack folder",
+            self.folder_edit.text(),
+        )
+        if selected:
+            self.folder_edit.setText(selected)
+
+    def start_sequence(self):
+        if self.capture_workers:
+            return
+        try:
+            entries = self.camera_entries()
+            if not entries:
+                raise RuntimeError("Select at least one Alpaca camera first.")
+            output_folder_text = self.folder_edit.text().strip()
+            if not output_folder_text:
+                raise RuntimeError("Select an output folder.")
+            output_folder = Path(output_folder_text).expanduser()
+            output_folder.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            QMessageBox.warning(self, "Camera", str(exc))
+            return
+
+        self.main_window.folder = output_folder
+        self.main_window.folder_label.setText(
+            f"{self.main_window.tr_ui('folder_prefix')}: {output_folder}"
+        )
+        if self.auto_live_check.isChecked() and not self.main_window.auto_stack_active:
+            self.main_window.start_auto_stacking()
+
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.progress.setValue(0)
+        self.update_connection_indicator(None)
+        self.camera_progress = {entry["key"]: 0 for entry in entries}
+
+        for entry in entries:
+            worker = AlpacaCaptureWorker(
+                entry["host"],
+                entry["port"],
+                entry["device_number"],
+                output_folder,
+                self.exposure_spin.value(),
+                self.count_spin.value(),
+                self.interval_spin.value(),
+                self.gain_spin.value(),
+                self.bin_spin.value(),
+                self.cooler_check.isChecked(),
+                self.target_temperature_spin.value(),
+                camera_id=entry["camera_id"],
+            )
+            key = entry["key"]
+            name = entry["name"]
+            self.capture_workers[key] = worker
+            self.set_camera_status(key, "Starting...", "#f59e0b", progress=0)
+            worker.progress.connect(
+                lambda value, message, camera_key=key, camera_name=name:
+                    self.on_capture_progress(
+                        camera_key,
+                        camera_name,
+                        value,
+                        message,
+                    )
+            )
+            worker.frame_saved.connect(
+                lambda path, camera_key=key, camera_name=name:
+                    self.on_frame_saved(camera_key, camera_name, path)
+            )
+            worker.failed.connect(
+                lambda message, camera_key=key, camera_name=name:
+                    self.on_capture_failed(camera_key, camera_name, message)
+            )
+            worker.connection_changed.connect(
+                lambda connected, camera_key=key:
+                    self.set_camera_status(
+                        camera_key,
+                        "Connected" if connected else "Disconnected",
+                        "#60a5fa" if connected else "#ef4444",
+                        connected=connected,
+                    )
+            )
+            worker.finished.connect(
+                lambda camera_key=key, finished_worker=worker:
+                    self.on_capture_finished(camera_key, finished_worker)
+            )
+
+        for worker in list(self.capture_workers.values()):
+            worker.start()
+        self.status_label.setText(
+            f"Started synchronized sequence on {len(entries)} camera(s)."
+        )
+
+    def stop_sequence(self):
+        if self.capture_workers:
+            for key, worker in list(self.capture_workers.items()):
+                worker.requestInterruption()
+                self.set_camera_status(key, "Stopping...", "#f59e0b")
+            self.stop_btn.setEnabled(False)
+            self.status_label.setText(
+                "Stopping all cameras after their current operation..."
+            )
+
+    def on_capture_progress(
+        self,
+        key: str,
+        name: str,
+        value: int,
+        message: str,
+    ):
+        self.camera_progress[key] = int(value)
+        active_values = [
+            self.camera_progress.get(active_key, 0)
+            for active_key in self.capture_workers
+        ]
+        if active_values:
+            self.progress.setValue(round(sum(active_values) / len(active_values)))
+        short_message = message.replace("Starting exposure", "Exposing")
+        self.set_camera_status(key, short_message, "#60a5fa", progress=value)
+        self.status_label.setText(f"{name}: {message}")
+
+    def on_frame_saved(self, key: str, name: str, path: str):
+        self.set_camera_status(key, f"Saved {Path(path).name}", "#22c55e")
+        self.status_label.setText(
+            f"{name}: saved {Path(path).name}; Live stack will queue it."
+        )
+
+    def on_capture_failed(self, key: str, name: str, message: str):
+        self.set_camera_status(key, "Error", "#ef4444")
+        self.status_label.setText(f"{name}: {message}")
+
+    def on_capture_finished(self, key: str, worker: AlpacaCaptureWorker):
+        current_worker = self.capture_workers.get(key)
+        if current_worker is not worker:
+            worker.deleteLater()
+            return
+        self.capture_workers.pop(key, None)
+        completed = self.camera_progress.get(key, 0) >= 100
+        self.set_camera_status(
+            key,
+            "Completed" if completed else "Stopped",
+            "#22c55e" if completed else "#f59e0b",
+            progress=100 if completed else self.camera_progress.get(key, 0),
+        )
+        worker.deleteLater()
+        if not self.capture_workers:
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            if self.camera_progress and all(
+                value >= 100 for value in self.camera_progress.values()
+            ):
+                self.progress.setValue(100)
+                self.status_label.setText("All camera sequences completed.")
+            else:
+                self.status_label.setText("Multi-camera sequence stopped.")
+
+    def closeEvent(self, event):
+        if self.capture_workers:
+            self.hide()
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
 class AstroStackerWindow(QMainWindow):
     TRANSLATIONS = {
         "cz": {
-            "window_title": f"Astro Stacker {APP_VERSION} - skládání astronomických snímků",
+            "window_title": f"Astro Stacker {APP_DISPLAY_VERSION} - skládání astronomických snímků",
             "settings": "Setup", "folder_none": "Složka: nevybrána", "choose_folder": "Vybrat složku",
             "open_image": "Otevřít obrázek/FIT", "language": "Jazyk", "align": "Zarovnání",
             "pixinsight": "PixInsight",
@@ -7347,7 +9298,7 @@ class AstroStackerWindow(QMainWindow):
             "hide_right_panel": "Skrýt pravý panel",
             "show_right_panel": "Zobrazit pravý panel",
             "curves": "Křivky / barvy / kontrast", "stf_strength": "Síla STF",
-            "stf_strength_tooltip": "0 = jemné STF; 5 = standardní náhled; 10 = silné STF pro velmi slabé snímky.",
+            "stf_strength_tooltip": "0 = silné STF pro velmi slabé snímky; 5 = standardní náhled; 10 = jemné STF.",
             "auto_stretch": "Balance",
             "auto_stretch_tooltip": "Neutralizuje pozadí a nastaví black point/gamma pouze pro náhled. Lineární FIT výstup se nemění.",
             "auto_stretch_done": "Balance nastaven pouze pro náhled.",
@@ -7356,6 +9307,28 @@ class AstroStackerWindow(QMainWindow):
             "color_background": "Korekce barevného pozadí",
             "astro_denoise": "Astro odšumění",
             "astro_denoise_tooltip": "Jemné odšumění náhledu/exportu s ochranou hvězd a struktur mlhovin. Potlačuje luminanční i barevný chroma šum. Lineární FIT výstup zůstává beze změny.",
+            "denoise_mode": "Metoda odšumění",
+            "denoise_classic": "Klasické",
+            "denoise_drunet": "AI DRUNet",
+            "select_drunet_model": "Vybrat model",
+            "select_drunet_title": "Vybrat DRUNet ONNX model",
+            "drunet_model_missing_title": "Chybí DRUNet model",
+            "drunet_model_missing_message": "Vyber DRUNet model ve formátu ONNX. Podporovaný je barevný RGB model i šedý model, s volitelnou mapou šumu.",
+            "onnxruntime_missing_title": "Chybí ONNX Runtime",
+            "onnxruntime_missing_message": "Pro AI DRUNet nainstaluj balíček onnxruntime.",
+            "drunet_model_selected": "DRUNet model nastaven: {name}",
+            "drunet_tooltip": "AI odšumění přes DRUNet ONNX. Na macOS preferuje CoreML, ve Windows CUDA nebo DirectML. Model pracuje jen s vizuálním náhledem a PNG/TIFF exportem.",
+            "star_deconvolution": "AI dekonvoluce hvězd",
+            "star_deconvolution_size": "Velikost hvězd",
+            "star_deconvolution_tooltip": "Doostří a zmenší hvězdy pomocí stellar modelu Cosmic Clarity. Ovlivňuje pouze náhled a PNG/TIFF export; lineární FIT zůstává beze změny.",
+            "select_stellar_model": "Vybrat",
+            "select_stellar_title": "Vybrat Cosmic Clarity stellar ONNX model",
+            "stellar_model_missing_title": "Chybí stellar ONNX model",
+            "stellar_model_missing_message": "Vyber převedený Cosmic Clarity stellar model ve formátu ONNX.",
+            "stellar_model_selected": "Stellar model nastaven: {name}",
+            "ai_stellar_preview": "AI dekonvoluce hvězd v náhledu…",
+            "ai_stellar_export": "AI dekonvoluce hvězd v plném rozlišení…",
+            "ai_stellar_done": "AI dekonvoluce hvězd dokončena.",
             "contrast": "Kontrast", "saturation": "Saturace", "red": "Červená", "green": "Zelená", "blue": "Modrá",
             "histogram": "Histogram L/R/G/B", "neutralize": "Neutralizovat pozadí",
             "clear_neutralize": "Zrušit neutralizaci", "flip_h": "Flip H",
@@ -7363,6 +9336,10 @@ class AstroStackerWindow(QMainWindow):
             "preview_view": "Zobrazení náhledu", "fit": "Přizpůsobit",
             "reset": "Reset úprav", "starting": "Startuji…", "cancel_requested": "Zastavuji po dokončení aktuálního kroku…",
             "cancelled": "Skládání zastaveno.", "done_edit": "Složeno lineárně. Pro zviditelnění náhledu použij Balance.",
+            "activity_title": "Aktuální operace",
+            "ai_denoise_preview": "AI odšumění náhledu…",
+            "ai_denoise_export": "AI odšumění v plném rozlišení…",
+            "ai_denoise_done": "AI odšumění dokončeno.",
             "auto_rotated": "Automaticky pootočeno {angle:+.2f}°.",
             "failed": "Chyba při skládání.",
             "preview_prompt": "Vyber složku a spusť skládání.",
@@ -7408,6 +9385,10 @@ class AstroStackerWindow(QMainWindow):
             "completion_sound": "Zvuk hotovo",
             "missing_image_title": "Chybí obraz",
             "missing_image_message": "Nejdřív slož snímky nebo otevři obrázek/FIT.",
+            "save_image_title": "Uložit výsledek",
+            "save_image_done": "Uloženo: {path}",
+            "save_image_error_title": "Chyba při ukládání",
+            "save_tiff_error": "TIFF se nepodařilo uložit přes OpenCV.",
             "neutralize_not_possible_title": "Nelze neutralizovat",
             "neutralize_rgb_required": "Neutralizace pozadí vyžaduje RGB obraz.",
             "not_enough_background_title": "Málo pozadí",
@@ -7438,7 +9419,7 @@ class AstroStackerWindow(QMainWindow):
             "awb_status": "AWB ({source}): R {r:.2f}×, G {g:.2f}×, B {b:.2f}×",
         },
         "en": {
-            "window_title": f"Astro Stacker {APP_VERSION} - astronomical image stacking",
+            "window_title": f"Astro Stacker {APP_DISPLAY_VERSION} - astronomical image stacking",
             "settings": "Setup", "folder_none": "Folder: not selected", "choose_folder": "Choose folder",
             "open_image": "Open image/FIT", "language": "Language", "align": "Alignment",
             "pixinsight": "PixInsight",
@@ -7514,7 +9495,7 @@ class AstroStackerWindow(QMainWindow):
             "hide_right_panel": "Hide right panel",
             "show_right_panel": "Show right panel",
             "curves": "Curves / color / contrast", "stf_strength": "STF strength",
-            "stf_strength_tooltip": "0 = gentle STF; 5 = standard preview; 10 = strong STF for very faint images.",
+            "stf_strength_tooltip": "0 = strong STF for very faint images; 5 = standard preview; 10 = gentle STF.",
             "auto_stretch": "Balance",
             "auto_stretch_tooltip": "Neutralizes background and sets black point/gamma for preview only. Linear FIT output is unchanged.",
             "auto_stretch_done": "Balance applied to preview only.",
@@ -7523,6 +9504,28 @@ class AstroStackerWindow(QMainWindow):
             "color_background": "Color background correction",
             "astro_denoise": "Astro Denoise",
             "astro_denoise_tooltip": "Gentle preview/export denoise with star and nebula-structure protection. Reduces luminance and color chroma noise. Linear FIT output is unchanged.",
+            "denoise_mode": "Denoise method",
+            "denoise_classic": "Classic",
+            "denoise_drunet": "AI DRUNet",
+            "select_drunet_model": "Select",
+            "select_drunet_title": "Select DRUNet ONNX model",
+            "drunet_model_missing_title": "DRUNet model missing",
+            "drunet_model_missing_message": "Select a DRUNet model in ONNX format. RGB and grayscale models are supported, with an optional noise map.",
+            "onnxruntime_missing_title": "ONNX Runtime missing",
+            "onnxruntime_missing_message": "Install the onnxruntime package to use AI DRUNet.",
+            "drunet_model_selected": "DRUNet model selected: {name}",
+            "drunet_tooltip": "AI denoising through DRUNet ONNX. Prefers CoreML on macOS and CUDA or DirectML on Windows. It affects only the visual preview and PNG/TIFF export.",
+            "star_deconvolution": "AI Star Deconvolution",
+            "star_deconvolution_size": "Star size",
+            "star_deconvolution_tooltip": "Sharpens and reduces stars with the Cosmic Clarity stellar model. It affects only the preview and PNG/TIFF export; linear FIT data is unchanged.",
+            "select_stellar_model": "Select",
+            "select_stellar_title": "Select Cosmic Clarity stellar ONNX model",
+            "stellar_model_missing_title": "Stellar ONNX model missing",
+            "stellar_model_missing_message": "Select a converted Cosmic Clarity stellar model in ONNX format.",
+            "stellar_model_selected": "Stellar model selected: {name}",
+            "ai_stellar_preview": "AI star deconvolution preview…",
+            "ai_stellar_export": "AI star deconvolution at full resolution…",
+            "ai_stellar_done": "AI star deconvolution complete.",
             "contrast": "Contrast", "saturation": "Saturation", "red": "Red", "green": "Green", "blue": "Blue",
             "histogram": "Histogram L/R/G/B", "neutralize": "Neutralize background",
             "clear_neutralize": "Clear neutralization", "flip_h": "Flip H",
@@ -7530,6 +9533,10 @@ class AstroStackerWindow(QMainWindow):
             "preview_view": "Preview view", "fit": "Fit",
             "reset": "Reset adjustments", "starting": "Starting…", "cancel_requested": "Stopping after the current step…",
             "cancelled": "Stacking stopped.", "done_edit": "Linear stack complete. Use Balance to stretch the preview.",
+            "activity_title": "Current operation",
+            "ai_denoise_preview": "AI denoising preview…",
+            "ai_denoise_export": "AI denoising at full resolution…",
+            "ai_denoise_done": "AI denoising complete.",
             "auto_rotated": "Auto-rotated {angle:+.2f}°.",
             "failed": "Stacking failed.",
             "preview_prompt": "Choose a folder and start stacking.",
@@ -7575,6 +9582,10 @@ class AstroStackerWindow(QMainWindow):
             "completion_sound": "Finish Sound",
             "missing_image_title": "Missing image",
             "missing_image_message": "Stack frames first or open an image/FIT.",
+            "save_image_title": "Save result",
+            "save_image_done": "Saved: {path}",
+            "save_image_error_title": "Save error",
+            "save_tiff_error": "TIFF could not be saved with OpenCV.",
             "neutralize_not_possible_title": "Cannot neutralize",
             "neutralize_rgb_required": "Background neutralization requires an RGB image.",
             "not_enough_background_title": "Not enough background",
@@ -7653,12 +9664,31 @@ class AstroStackerWindow(QMainWindow):
         self.preview_auto_display_stretch: bool = True
         self.preview_heavy_cache: Optional[np.ndarray] = None
         self.preview_heavy_cache_key: Optional[Tuple[Any, ...]] = None
+        detected_drunet_model = find_drunet_model()
+        self.ai_denoise_model_path: Optional[str] = (
+            str(detected_drunet_model) if detected_drunet_model is not None else None
+        )
+        self.preview_ai_denoise_cache: Optional[np.ndarray] = None
+        self.preview_ai_denoise_cache_key: Optional[Tuple[Any, ...]] = None
+        self.ai_denoise_layer_cache: Dict[Tuple[Any, ...], Dict[str, np.ndarray]] = {}
+        self.ai_denoise_in_progress: bool = False
+        detected_stellar_model = find_stellar_deconvolution_model()
+        self.star_deconvolution_model_path: Optional[str] = (
+            str(detected_stellar_model)
+            if detected_stellar_model is not None
+            else None
+        )
+        self.star_deconvolution_layer_cache: Dict[
+            Tuple[Any, ...], Dict[str, np.ndarray]
+        ] = {}
+        self.star_deconvolution_in_progress: bool = False
         self.preview_render_array: Optional[np.ndarray] = None
         self.preview_fast_zoom_scale: float = 1.0
         self.showing_intro_preview: bool = False
         self.preview_interactive: bool = False
         self.preview_slider_zoom_state: Optional[Dict[str, Any]] = None
         self.preview_render_pending_final: bool = False
+        self.preview_position_generation: int = 0
         self.preview_render_timer = QTimer(self)
         self.preview_render_timer.setSingleShot(True)
         self.preview_render_timer.timeout.connect(self._run_scheduled_preview_update)
@@ -7696,6 +9726,25 @@ class AstroStackerWindow(QMainWindow):
         self.manual_comet_reference_path: Optional[str] = None
         self.manual_comet_end_xy: Optional[Tuple[float, float]] = None
         self.manual_comet_end_path: Optional[str] = None
+        self.auto_stack_active: bool = False
+        self.auto_stack_timer = QTimer(self)
+        self.auto_stack_timer.setInterval(1000)
+        self.auto_stack_timer.timeout.connect(self.scan_auto_stack_folder)
+        self.auto_stack_calibration_worker: Optional[AutoStackCalibrationWorker] = None
+        self.auto_stack_worker: Optional[AutoStackFrameWorker] = None
+        self.auto_stack_pending: Dict[str, Tuple[int, int, int]] = {}
+        self.auto_stack_queued_paths: set[str] = set()
+        self.auto_stack_ready_queue: List[Path] = []
+        self.auto_stack_reference_gray: Optional[np.ndarray] = None
+        self.auto_stack_reference_shape: Optional[Tuple[int, ...]] = None
+        self.auto_stack_sum: Optional[np.ndarray] = None
+        self.auto_stack_weight: Optional[np.ndarray] = None
+        self.auto_stack_flat: Optional[np.ndarray] = None
+        self.auto_stack_bias: Optional[np.ndarray] = None
+        self.auto_stack_dark: Optional[np.ndarray] = None
+        self.auto_stack_accepted: int = 0
+        self.auto_stack_rejected: int = 0
+        self.alpaca_camera_dialog: Optional[AlpacaCameraDialog] = None
 
         self._build_ui()
         self._build_menu()
@@ -7804,6 +9853,21 @@ class AstroStackerWindow(QMainWindow):
         self.zoom_out_action.triggered.connect(self.zoom_out)
         view_menu.addAction(self.zoom_out_action)
 
+        self.auto_stack_menu = self.menuBar().addMenu("Live stack")
+        self.auto_stack_start_action = QAction("Live stacking", self)
+        self.auto_stack_start_action.triggered.connect(self.start_auto_stacking)
+        self.auto_stack_menu.addAction(self.auto_stack_start_action)
+
+        self.auto_stack_stop_action = QAction("Stop Live stacking", self)
+        self.auto_stack_stop_action.triggered.connect(self.stop_auto_stacking)
+        self.auto_stack_stop_action.setEnabled(False)
+        self.auto_stack_menu.addAction(self.auto_stack_stop_action)
+
+        self.camera_menu = self.menuBar().addMenu("Camera")
+        self.camera_control_action = QAction("ASCOM Alpaca cameras…", self)
+        self.camera_control_action.triggered.connect(self.show_alpaca_camera_dialog)
+        self.camera_menu.addAction(self.camera_control_action)
+
         self.help_menu = self.menuBar().addMenu("Nápověda")
         help_menu = self.help_menu
 
@@ -7834,6 +9898,15 @@ class AstroStackerWindow(QMainWindow):
         self.quit_action = QAction("Konec", self)
         self.quit_action.triggered.connect(self.close)
         file_menu.addAction(self.quit_action)
+
+    def show_alpaca_camera_dialog(self):
+        if self.alpaca_camera_dialog is None:
+            self.alpaca_camera_dialog = AlpacaCameraDialog(self)
+        if self.folder is not None and not self.alpaca_camera_dialog.folder_edit.text():
+            self.alpaca_camera_dialog.folder_edit.setText(str(self.folder))
+        self.alpaca_camera_dialog.show()
+        self.alpaca_camera_dialog.raise_()
+        self.alpaca_camera_dialog.activateWindow()
 
     def _build_ui(self):
         root = QWidget()
@@ -8100,7 +10173,8 @@ class AstroStackerWindow(QMainWindow):
         add_form_row("Sigma", self.sigma_spin)
         add_form_row("", self.normalize_check, advanced=True)
         add_form_row("", self.mp_check, advanced=True)
-        add_form_row("", self.gpu_check, advanced=True)
+        if not LITE_BUILD:
+            add_form_row("", self.gpu_check, advanced=True)
         process_row = QHBoxLayout()
         process_row.addWidget(self.process_mode_combo)
         process_row.addWidget(self.processes_spin)
@@ -8169,8 +10243,10 @@ class AstroStackerWindow(QMainWindow):
         self.stop_btn.clicked.connect(self.stop_stack)
         left_layout.addWidget(self.stop_btn)
 
-        self.progress = QProgressBar()
-        left_layout.addWidget(self.progress)
+        # Progress is presented in the central activity overlay. Keep this
+        # internal meter for worker state without duplicating it in the panel.
+        self.progress = QProgressBar(left)
+        self.progress.hide()
         self.status_label = QLabel("Připraveno")
         self.status_label.setWordWrap(True)
         left_layout.addWidget(self.status_label)
@@ -8315,8 +10391,69 @@ class AstroStackerWindow(QMainWindow):
         self.denoise_slider.setValue(0)
         self._connect_preview_slider(self.denoise_slider)
         self.denoise_slider.setToolTip(self.tr_ui("astro_denoise_tooltip"))
+
+        denoise_mode_widget = QWidget()
+        denoise_mode_layout = QHBoxLayout(denoise_mode_widget)
+        denoise_mode_layout.setContentsMargins(0, 0, 0, 0)
+        denoise_mode_layout.setSpacing(6)
+        self.denoise_mode_combo = ArrowComboBox()
+        self.denoise_mode_combo.addItem(self.tr_ui("denoise_classic"), "classic")
+        if not LITE_BUILD:
+            self.denoise_mode_combo.addItem(self.tr_ui("denoise_drunet"), "drunet")
+        self.denoise_mode_combo.setToolTip(self.tr_ui("drunet_tooltip"))
+        self.denoise_mode_combo.currentIndexChanged.connect(self.on_denoise_mode_changed)
+        denoise_mode_layout.addWidget(self.denoise_mode_combo, 1)
+        self.select_drunet_model_btn = QPushButton(self.tr_ui("select_drunet_model"))
+        self.select_drunet_model_btn.setToolTip(self.tr_ui("drunet_tooltip"))
+        self.select_drunet_model_btn.clicked.connect(self.choose_selected_denoise_model)
+        if not LITE_BUILD:
+            denoise_mode_layout.addWidget(self.select_drunet_model_btn)
+        add_stretch_row(self.tr_ui("denoise_mode"), denoise_mode_widget, advanced=True)
         add_stretch_row("Astro odšumění", self.slider_with_value(self.denoise_slider), advanced=True)
 
+        self.star_deconvolution_slider = QSlider(Qt.Horizontal)
+        self.star_deconvolution_slider.setRange(0, 100)
+        self.star_deconvolution_slider.setValue(0)
+        self._connect_preview_slider(self.star_deconvolution_slider)
+        self.star_deconvolution_slider.setToolTip(
+            self.tr_ui("star_deconvolution_tooltip")
+        )
+        stellar_control = QWidget()
+        stellar_control_layout = QHBoxLayout(stellar_control)
+        stellar_control_layout.setContentsMargins(0, 0, 0, 0)
+        stellar_control_layout.setSpacing(6)
+        stellar_control_layout.addWidget(
+            self.slider_with_value(self.star_deconvolution_slider),
+            1,
+        )
+        self.select_stellar_model_btn = QPushButton(
+            self.tr_ui("select_stellar_model")
+        )
+        self.select_stellar_model_btn.setToolTip(
+            self.tr_ui("star_deconvolution_tooltip")
+        )
+        self.select_stellar_model_btn.clicked.connect(
+            self.choose_stellar_deconvolution_model
+        )
+        stellar_control_layout.addWidget(self.select_stellar_model_btn)
+        add_stretch_row(
+            self.tr_ui("star_deconvolution"),
+            stellar_control,
+            advanced=True,
+        )
+
+        self.star_deconvolution_size_slider = QSlider(Qt.Horizontal)
+        self.star_deconvolution_size_slider.setRange(1, 10)
+        self.star_deconvolution_size_slider.setValue(5)
+        self._connect_preview_slider(self.star_deconvolution_size_slider)
+        self.star_deconvolution_size_slider.setToolTip(
+            self.tr_ui("star_deconvolution_tooltip")
+        )
+        add_stretch_row(
+            self.tr_ui("star_deconvolution_size"),
+            self.slider_with_value(self.star_deconvolution_size_slider),
+            advanced=True,
+        )
 
         self.scnr_green_slider = QSlider(Qt.Horizontal)
 
@@ -8584,6 +10721,141 @@ class AstroStackerWindow(QMainWindow):
         self.right_panel_scroll = right_panel_scroll
         layout.addWidget(right_panel_scroll)
         self.apply_ui_mode()
+        self._build_activity_overlay()
+
+    def _build_activity_overlay(self):
+        self.activity_overlay_generation = 0
+        self.activity_overlay = QFrame(self)
+        self.activity_overlay.setObjectName("activityOverlay")
+        self.activity_overlay.setAttribute(Qt.WA_StyledBackground, True)
+        self.activity_overlay.setFixedWidth(440)
+
+        overlay_layout = QVBoxLayout(self.activity_overlay)
+        overlay_layout.setContentsMargins(18, 14, 18, 16)
+        overlay_layout.setSpacing(9)
+
+        self.activity_title_label = QLabel(self.tr_ui("activity_title"))
+        self.activity_title_label.setObjectName("activityTitle")
+        self.activity_title_label.setAlignment(Qt.AlignCenter)
+        overlay_layout.addWidget(self.activity_title_label)
+
+        self.activity_message_label = QLabel("")
+        self.activity_message_label.setObjectName("activityMessage")
+        self.activity_message_label.setAlignment(Qt.AlignCenter)
+        self.activity_message_label.setWordWrap(True)
+        self.activity_message_label.setMinimumHeight(34)
+        overlay_layout.addWidget(self.activity_message_label)
+
+        self.activity_progress = QProgressBar()
+        self.activity_progress.setRange(0, 100)
+        self.activity_progress.setValue(0)
+        self.activity_progress.setTextVisible(True)
+        overlay_layout.addWidget(self.activity_progress)
+
+        self._update_activity_overlay_theme()
+        self.activity_overlay.hide()
+
+    def _update_activity_overlay_theme(self):
+        if not hasattr(self, "activity_overlay"):
+            return
+        theme = self.theme_combo.currentData() if hasattr(self, "theme_combo") else "dark"
+        if theme == "light":
+            background, border, title, text = "#f7f9fc", "#8b98a8", "#18202a", "#344150"
+        else:
+            background, border, title, text = "#20242b", "#5c6673", "#ffffff", "#d8dde5"
+        self.activity_overlay.setStyleSheet(
+            f"""
+            QFrame#activityOverlay {{
+                background-color: {background};
+                border: 1px solid {border};
+                border-radius: 8px;
+            }}
+            QLabel#activityTitle {{
+                color: {title};
+                border: none;
+                font-size: 15px;
+                font-weight: bold;
+            }}
+            QLabel#activityMessage {{
+                color: {text};
+                border: none;
+                font-size: 12px;
+            }}
+            """
+        )
+
+    def _position_activity_overlay(self):
+        if not hasattr(self, "activity_overlay") or not self.activity_overlay.isVisible():
+            return
+        self.activity_overlay.adjustSize()
+        width = self.activity_overlay.width()
+        height = max(112, self.activity_overlay.height())
+        self.activity_overlay.resize(width, height)
+        x = max(12, (self.width() - width) // 2)
+        y = max(self.menuBar().height() + 12, (self.height() - height) // 2)
+        self.activity_overlay.move(x, y)
+        self.activity_overlay.raise_()
+
+    def begin_activity(self, message: str, indeterminate: bool = False):
+        if not hasattr(self, "activity_overlay"):
+            return
+        self.activity_overlay_generation += 1
+        self.activity_title_label.setText(self.tr_ui("activity_title"))
+        self.activity_message_label.setText(str(message))
+        if indeterminate:
+            self.activity_progress.setRange(0, 0)
+        else:
+            self.activity_progress.setRange(0, 100)
+            self.activity_progress.setValue(0)
+        self.activity_overlay.show()
+        self._position_activity_overlay()
+        self.activity_overlay.repaint()
+
+    def flush_activity_overlay(self):
+        """Show the overlay before a blocking task without moving the preview."""
+        zoom_state = (
+            self.capture_preview_zoom_state()
+            if hasattr(self, "capture_preview_zoom_state")
+            else None
+        )
+        if hasattr(self, "preview_render_timer"):
+            self.preview_render_timer.stop()
+
+        QApplication.processEvents(
+            QEventLoop.ExcludeUserInputEvents | QEventLoop.ExcludeSocketNotifiers
+        )
+
+        if zoom_state is not None:
+            self.restore_preview_zoom_state(zoom_state)
+
+    def update_activity(self, value: int, message: str):
+        if not hasattr(self, "activity_overlay"):
+            return
+        self.activity_message_label.setText(str(message))
+        self.activity_progress.setRange(0, 100)
+        self.activity_progress.setValue(max(0, min(100, int(value))))
+        if not self.activity_overlay.isVisible():
+            self.activity_overlay.show()
+        self._position_activity_overlay()
+
+    def finish_activity(self, message: str, value: Optional[int] = None, delay_ms: int = 1200):
+        if not hasattr(self, "activity_overlay"):
+            return
+        self.activity_message_label.setText(str(message))
+        if value is not None:
+            self.activity_progress.setRange(0, 100)
+            self.activity_progress.setValue(max(0, min(100, int(value))))
+        self.activity_overlay.show()
+        self._position_activity_overlay()
+        generation = self.activity_overlay_generation
+        QTimer.singleShot(
+            max(0, int(delay_ms)),
+            lambda: (
+                self.activity_overlay.hide()
+                if generation == self.activity_overlay_generation
+                else None
+            ),
+        )
 
     def _slider(self, min_v: int, max_v: int, value: int) -> QSlider:
         slider = QSlider(Qt.Horizontal)
@@ -8649,6 +10921,8 @@ class AstroStackerWindow(QMainWindow):
             "synthetic_flat": "synthetic_flat_slider",
             "color_background": "color_background_slider",
             "denoise": "denoise_slider",
+            "star_deconvolution": "star_deconvolution_slider",
+            "star_deconvolution_size": "star_deconvolution_size_slider",
             "scnr_green": "scnr_green_slider",
         }
         for key, attr in optional.items():
@@ -8672,6 +10946,8 @@ class AstroStackerWindow(QMainWindow):
             "synthetic_flat": "synthetic_flat_slider",
             "color_background": "color_background_slider",
             "denoise": "denoise_slider",
+            "star_deconvolution": "star_deconvolution_slider",
+            "star_deconvolution_size": "star_deconvolution_size_slider",
             "scnr_green": "scnr_green_slider",
         }
         for key, attr in mapping.items():
@@ -8770,6 +11046,143 @@ class AstroStackerWindow(QMainWindow):
         slider.sliderPressed.connect(self._preview_slider_pressed)
         slider.sliderReleased.connect(self._preview_slider_released)
         slider.valueChanged.connect(self.schedule_preview_update)
+
+    def choose_drunet_model(self) -> bool:
+        current_path = find_drunet_model(getattr(self, "ai_denoise_model_path", None))
+        start_dir = str(current_path.parent if current_path is not None else Path.home())
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            self.tr_ui("select_drunet_title"),
+            start_dir,
+            "ONNX model (*.onnx)",
+        )
+        if not filename:
+            return False
+        candidate = Path(filename).expanduser()
+        DRUNET_SESSION_CACHE.clear()
+        if ort is not None:
+            try:
+                session = get_drunet_session(candidate)
+                input_meta = session.get_inputs()[0]
+                input_shape = list(input_meta.shape)
+                input_channels = (
+                    input_shape[1]
+                    if len(input_shape) == 4 and isinstance(input_shape[1], int)
+                    else 4
+                )
+                if input_channels not in (1, 2, 3, 4):
+                    raise ValueError(
+                        f"Unsupported DRUNet input channel count: {input_channels}"
+                    )
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    self.tr_ui("drunet_model_missing_title"),
+                    str(exc),
+                )
+                return False
+        self.ai_denoise_model_path = str(candidate)
+        self.preview_ai_denoise_cache = None
+        self.preview_ai_denoise_cache_key = None
+        self.ai_denoise_layer_cache.clear()
+        self.status_label.setText(
+            self.tr_ui("drunet_model_selected").format(name=Path(filename).name)
+        )
+        self.schedule_preview_update()
+        return True
+
+    def choose_selected_denoise_model(self) -> bool:
+        return self.choose_drunet_model()
+
+    def choose_stellar_deconvolution_model(self) -> bool:
+        current_path = find_stellar_deconvolution_model(
+            getattr(self, "star_deconvolution_model_path", None)
+        )
+        start_dir = str(
+            current_path.parent if current_path is not None else Path.home()
+        )
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            self.tr_ui("select_stellar_title"),
+            start_dir,
+            "ONNX model (*.onnx)",
+        )
+        if not filename:
+            return False
+        candidate = Path(filename).expanduser()
+        STELLAR_SESSION_CACHE.clear()
+        if ort is not None:
+            try:
+                session = get_stellar_deconvolution_session(candidate)
+                input_shape = list(session.get_inputs()[0].shape)
+                channels = (
+                    input_shape[1]
+                    if len(input_shape) == 4 and isinstance(input_shape[1], int)
+                    else 3
+                )
+                if channels != 3:
+                    raise ValueError(
+                        f"Stellar model must have three input channels, got {channels}."
+                    )
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    self.tr_ui("stellar_model_missing_title"),
+                    str(exc),
+                )
+                return False
+        self.star_deconvolution_model_path = str(candidate)
+        self.star_deconvolution_layer_cache.clear()
+        self.status_label.setText(
+            self.tr_ui("stellar_model_selected").format(name=candidate.name)
+        )
+        self.schedule_preview_update()
+        return True
+
+    def on_denoise_mode_changed(self, *_args):
+        mode = (
+            self.denoise_mode_combo.currentData()
+            if hasattr(self, "denoise_mode_combo")
+            else "classic"
+        )
+        if mode == "drunet":
+            if ort is None:
+                QMessageBox.warning(
+                    self,
+                    self.tr_ui("onnxruntime_missing_title"),
+                    self.tr_ui("onnxruntime_missing_message"),
+                )
+                self.denoise_mode_combo.blockSignals(True)
+                self.denoise_mode_combo.setCurrentIndex(
+                    max(0, self.denoise_mode_combo.findData("classic"))
+                )
+                self.denoise_mode_combo.blockSignals(False)
+                return
+            model_path = find_drunet_model(
+                getattr(self, "ai_denoise_model_path", None)
+            )
+            if model_path is None:
+                QMessageBox.information(
+                    self,
+                    self.tr_ui("drunet_model_missing_title"),
+                    self.tr_ui("drunet_model_missing_message"),
+                )
+                selected = self.choose_drunet_model()
+                if not selected:
+                    self.denoise_mode_combo.blockSignals(True)
+                    self.denoise_mode_combo.setCurrentIndex(
+                        max(0, self.denoise_mode_combo.findData("classic"))
+                    )
+                    self.denoise_mode_combo.blockSignals(False)
+                    return
+            else:
+                self.ai_denoise_model_path = str(model_path)
+        if hasattr(self, "denoise_mode_combo"):
+            self.denoise_mode_combo.setToolTip(self.tr_ui("drunet_tooltip"))
+        self.preview_ai_denoise_cache = None
+        self.preview_ai_denoise_cache_key = None
+        self.ai_denoise_layer_cache.clear()
+        self.schedule_preview_update()
 
     def change_ui_mode(self, *_args):
         self.apply_ui_mode()
@@ -9235,6 +11648,33 @@ class AstroStackerWindow(QMainWindow):
             current = self.current_preview_path()
             self.set_preview_sequence(self.preview_sequence_paths, current)
 
+    def reset_denoise_for_new_preview_source(self):
+        """Do not automatically run old AI processing settings on a new file."""
+        if hasattr(self, "denoise_slider"):
+            self.denoise_slider.blockSignals(True)
+            self.denoise_slider.setValue(0)
+            self.denoise_slider.blockSignals(False)
+        self.preview_ai_denoise_cache = None
+        self.preview_ai_denoise_cache_key = None
+        self.ai_denoise_layer_cache.clear()
+        if hasattr(self, "star_deconvolution_slider"):
+            self.star_deconvolution_slider.blockSignals(True)
+            self.star_deconvolution_slider.setValue(0)
+            self.star_deconvolution_slider.blockSignals(False)
+        self.star_deconvolution_layer_cache.clear()
+
+    def reset_preview_render_state_for_new_source(self):
+        """Discard delayed renders and positions that belong to another image."""
+        if hasattr(self, "preview_render_timer"):
+            self.preview_render_timer.stop()
+        self.preview_interactive = False
+        self.preview_render_pending_final = False
+        self.preview_slider_zoom_state = None
+        self.preview_fast_zoom_scale = 1.0
+        self.preview_position_generation += 1
+        self.stop_preview_pan_inertia()
+        self.preview_pan_scroll = (0.0, 0.0)
+
     def load_preview_image(self, path: Path):
         try:
             set_bayer_pattern_override(self.bayer_combo.currentData() if hasattr(self, "bayer_combo") else "auto")
@@ -9243,17 +11683,25 @@ class AstroStackerWindow(QMainWindow):
             QMessageBox.critical(self, "Chyba" if self.language == "cz" else "Error", f"Snímek se nepodařilo načíst:\n{exc}" if self.language == "cz" else f"Could not load image:\n{exc}")
             return
 
+        self.reset_preview_render_state_for_new_source()
         self.preview_override = img
         self.preview_override_path = str(path)
         self.preview_source_shape = img.shape[:2]
+        self.reset_denoise_for_new_preview_source()
+        self.invalidate_preview_cache()
         self.preview_auto_display_stretch = True
-        self.reset_preview_display_limits()
         self.awaiting_comet_click = False
         self.comet_click_mode = None
         if hasattr(self, "image_label"):
             self.image_label.set_marking_mode(False)
         self.zoom_mode = "fit"
+        self.zoom_factor = 1.0
         self.update_metadata_panel(path, img)
+        self.apply_balance_to_current_preview(
+            record_undo=False,
+            refresh_preview=False,
+            set_status=False,
+        )
         self.status_label.setText(self.tr_ui("open_preview_status").format(name=path.name))
         self.update_preview()
         self.update_preview_nav_state()
@@ -9714,6 +12162,332 @@ class AstroStackerWindow(QMainWindow):
         self.flip_vertical = False
         self.preview_rotation_degrees = 0
 
+    def auto_stack_status_text(self, last_name: Optional[str] = None) -> str:
+        if self.language == "cz":
+            text = (
+                f"Live stacking: složeno {self.auto_stack_accepted}, "
+                f"vyřazeno {self.auto_stack_rejected}"
+            )
+            if last_name:
+                text += f"; poslední: {last_name}"
+            return text
+        text = (
+            f"Live stacking: stacked {self.auto_stack_accepted}, "
+            f"rejected {self.auto_stack_rejected}"
+        )
+        if last_name:
+            text += f"; last: {last_name}"
+        return text
+
+    def start_auto_stacking(self):
+        if self.auto_stack_calibration_worker is not None:
+            return
+        if self.auto_stack_worker is not None:
+            return
+        if self.folder is None:
+            folder = QFileDialog.getExistingDirectory(self, self.tr_ui("choose_images_folder"))
+            if not folder:
+                return
+            self.folder = Path(folder)
+            self.folder_label.setText(f"{self.tr_ui('folder_prefix')}: {self.folder}")
+
+        self.auto_stack_active = True
+        self.auto_stack_pending = {}
+        self.auto_stack_queued_paths = set()
+        self.auto_stack_ready_queue = []
+        self.auto_stack_reference_gray = None
+        self.auto_stack_reference_shape = None
+        self.auto_stack_sum = None
+        self.auto_stack_weight = None
+        self.auto_stack_flat = None
+        self.auto_stack_bias = None
+        self.auto_stack_dark = None
+        self.auto_stack_accepted = 0
+        self.auto_stack_rejected = 0
+
+        self.linear_result = None
+        self.original_linear_result = None
+        self.preview_override = None
+        self.preview_override_path = None
+        self.neutralized_preview_layer = None
+        self.neutralized_preview_base_source_id = None
+        self.gradient_preview_layer = None
+        self.gradient_preview_base_source_id = None
+        self.preview_auto_display_stretch = True
+        self.reset_preview_display_limits()
+        self.zoom_mode = "fit"
+        self.progress.setValue(0)
+        self.status_label.setText(
+            "Live stacking připravuje Flat/Bias/Dark kalibraci…"
+            if self.language == "cz"
+            else "Live stacking is preparing Flat/Bias/Dark calibration…"
+        )
+        self.auto_stack_start_action.setEnabled(False)
+        self.auto_stack_stop_action.setEnabled(True)
+        self.stack_btn.setEnabled(False)
+        self.open_action.setEnabled(False)
+        self.open_image_action.setEnabled(False)
+        settings = self.current_stack_settings()
+        settings = replace(settings, align_mode="star_affine", stack_mode="mean")
+        self.auto_stack_calibration_worker = AutoStackCalibrationWorker(settings)
+        self.auto_stack_calibration_worker.progress.connect(self.on_auto_stack_calibration_progress)
+        self.auto_stack_calibration_worker.masters_ready.connect(self.on_auto_stack_calibration_ready)
+        self.auto_stack_calibration_worker.failed.connect(self.on_auto_stack_calibration_failed)
+        self.auto_stack_calibration_worker.finished.connect(self.on_auto_stack_calibration_finished)
+        self.auto_stack_calibration_worker.start()
+
+    def stop_auto_stacking(self):
+        if not self.auto_stack_active and self.auto_stack_worker is None:
+            return
+        self.auto_stack_active = False
+        self.auto_stack_timer.stop()
+        self.auto_stack_ready_queue.clear()
+        if self.auto_stack_calibration_worker is not None and self.auto_stack_calibration_worker.isRunning():
+            self.auto_stack_calibration_worker.requestInterruption()
+        if self.auto_stack_worker is not None and self.auto_stack_worker.isRunning():
+            self.auto_stack_worker.requestInterruption()
+        elif self.auto_stack_calibration_worker is None or not self.auto_stack_calibration_worker.isRunning():
+            self.auto_stack_start_action.setEnabled(True)
+            self.stack_btn.setEnabled(True)
+            self.open_action.setEnabled(True)
+            self.open_image_action.setEnabled(True)
+        self.auto_stack_stop_action.setEnabled(False)
+        self.status_label.setText(
+            (
+                f"Live stacking zastaven. Složeno {self.auto_stack_accepted} snímků, "
+                f"vyřazeno {self.auto_stack_rejected}."
+            )
+            if self.language == "cz"
+            else (
+                f"Live stacking stopped. Stacked {self.auto_stack_accepted} frames, "
+                f"rejected {self.auto_stack_rejected}."
+            )
+        )
+
+    def on_auto_stack_calibration_progress(self, message: str):
+        if self.auto_stack_active:
+            self.status_label.setText(message)
+
+    def on_auto_stack_calibration_ready(
+        self,
+        flat: Optional[np.ndarray],
+        bias: Optional[np.ndarray],
+        dark: Optional[np.ndarray],
+    ):
+        if not self.auto_stack_active:
+            return
+        self.auto_stack_flat = flat
+        self.auto_stack_bias = bias
+        self.auto_stack_dark = dark
+        active = []
+        if flat is not None:
+            active.append("Flat")
+        if bias is not None:
+            active.append("Bias")
+        if dark is not None:
+            active.append("Dark")
+        calibration_text = ", ".join(active) if active else (
+            "bez kalibrace" if self.language == "cz" else "no calibration"
+        )
+        self.status_label.setText(
+            f"Live stacking sleduje složku; kalibrace: {calibration_text}."
+            if self.language == "cz"
+            else f"Live stacking is watching the folder; calibration: {calibration_text}."
+        )
+        self.auto_stack_timer.start()
+        self.scan_auto_stack_folder()
+
+    def on_auto_stack_calibration_failed(self, message: str):
+        self.auto_stack_active = False
+        self.auto_stack_stop_action.setEnabled(False)
+        self.auto_stack_start_action.setEnabled(True)
+        self.stack_btn.setEnabled(True)
+        self.open_action.setEnabled(True)
+        self.open_image_action.setEnabled(True)
+        QMessageBox.critical(
+            self,
+            "Chyba kalibrace" if self.language == "cz" else "Calibration error",
+            message,
+        )
+
+    def on_auto_stack_calibration_finished(self):
+        worker = self.auto_stack_calibration_worker
+        self.auto_stack_calibration_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if not self.auto_stack_active:
+            self.auto_stack_start_action.setEnabled(True)
+            self.stack_btn.setEnabled(True)
+            self.open_action.setEnabled(True)
+            self.open_image_action.setEnabled(True)
+
+    def scan_auto_stack_folder(self):
+        if not self.auto_stack_active or self.folder is None:
+            return
+        extensions = (
+            RAW_STACK_EXTENSIONS
+            if hasattr(self, "fit_only_check") and self.fit_only_check.isChecked()
+            else IMAGE_EXTENSIONS
+        )
+        try:
+            candidates = [
+                path for path in self.folder.iterdir()
+                if path.is_file()
+                and path.suffix.lower() in extensions
+                and not path.name.startswith(".")
+                and not path.name.lower().startswith(("master", "stacked_result"))
+            ]
+            candidates.sort(key=lambda path: (path.stat().st_mtime_ns, path.name.lower()))
+        except Exception as exc:
+            self.status_label.setText(
+                f"Chyba sledování složky: {exc}"
+                if self.language == "cz"
+                else f"Folder watch error: {exc}"
+            )
+            return
+
+        now_ns = time.time_ns()
+        present = set()
+        for path in candidates:
+            key = str(path.resolve())
+            present.add(key)
+            if key in self.auto_stack_queued_paths:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            old = self.auto_stack_pending.get(key)
+            stable_count = old[2] + 1 if old and old[:2] == (stat.st_size, stat.st_mtime_ns) else 0
+            self.auto_stack_pending[key] = (stat.st_size, stat.st_mtime_ns, stable_count)
+            age_seconds = max(0.0, (now_ns - stat.st_mtime_ns) / 1_000_000_000.0)
+            # Two cameras may write large frames concurrently and briefly
+            # pause between chunks. Require three unchanged polls plus age.
+            if stable_count >= 3 and age_seconds >= 2.5 and stat.st_size > 0:
+                self.auto_stack_queued_paths.add(key)
+                self.auto_stack_ready_queue.append(path)
+                self.auto_stack_pending.pop(key, None)
+
+        for key in list(self.auto_stack_pending):
+            if key not in present:
+                self.auto_stack_pending.pop(key, None)
+        self.start_next_auto_stack_frame()
+
+    def start_next_auto_stack_frame(self):
+        if not self.auto_stack_active:
+            return
+        # Keep strict ownership until the worker's finished signal is handled.
+        # isRunning() may already be false while that queued signal is still
+        # waiting in the GUI event loop.
+        if self.auto_stack_worker is not None:
+            return
+        if not self.auto_stack_ready_queue:
+            return
+        path = self.auto_stack_ready_queue.pop(0)
+        settings = self.current_stack_settings()
+        settings = replace(settings, align_mode="star_affine", stack_mode="mean")
+        self.status_label.setText(
+            f"Live stacking zpracovává: {path.name}"
+            if self.language == "cz"
+            else f"Live stacking is processing: {path.name}"
+        )
+        worker = AutoStackFrameWorker(
+            path,
+            settings,
+            self.auto_stack_reference_gray,
+            self.auto_stack_reference_shape,
+            self.auto_stack_flat,
+            self.auto_stack_bias,
+            self.auto_stack_dark,
+        )
+        self.auto_stack_worker = worker
+        worker.frame_ready.connect(self.on_auto_stack_frame_ready)
+        worker.failed.connect(self.on_auto_stack_frame_failed)
+        worker.finished.connect(
+            lambda finished_worker=worker: self.on_auto_stack_worker_finished(
+                finished_worker
+            )
+        )
+        worker.start()
+
+    def on_auto_stack_frame_ready(
+        self,
+        path_text: str,
+        aligned: np.ndarray,
+        coverage: np.ndarray,
+        detail: Dict[str, Any],
+    ):
+        if not self.auto_stack_active:
+            return
+        image = np.asarray(aligned, dtype=np.float32)
+        mask = np.asarray(coverage, dtype=np.float32)
+        if self.auto_stack_reference_gray is None:
+            self.auto_stack_reference_gray = np.ascontiguousarray(to_gray_float(image))
+            self.auto_stack_reference_shape = tuple(image.shape)
+            self.auto_stack_sum = np.zeros_like(image, dtype=np.float32)
+            self.auto_stack_weight = np.zeros(image.shape[:2], dtype=np.float32)
+            self.update_metadata_panel(Path(path_text), image)
+
+        if self.auto_stack_sum is None or self.auto_stack_weight is None:
+            return
+        if image.ndim == 3:
+            self.auto_stack_sum += image * mask[..., None]
+        else:
+            self.auto_stack_sum += image * mask
+        self.auto_stack_weight += mask
+        safe_weight = np.maximum(self.auto_stack_weight, 1.0)
+        if image.ndim == 3:
+            result = self.auto_stack_sum / safe_weight[..., None]
+            result[self.auto_stack_weight <= 0.0] = 0.0
+        else:
+            result = self.auto_stack_sum / safe_weight
+            result[self.auto_stack_weight <= 0.0] = 0.0
+
+        self.auto_stack_accepted += 1
+        self.linear_result = np.ascontiguousarray(result.astype(np.float32))
+        self.original_linear_result = self.linear_result
+        self.preview_override = None
+        self.preview_override_path = None
+        self.preview_source_shape = self.linear_result.shape[:2]
+        self.preview_auto_display_stretch = True
+        self.reset_preview_display_limits()
+        self.apply_balance_to_current_preview(
+            record_undo=False,
+            refresh_preview=False,
+            set_status=False,
+        )
+        self.update_preview()
+        self.progress.setValue(min(99, self.auto_stack_accepted))
+        self.status_label.setText(self.auto_stack_status_text(Path(path_text).name))
+
+    def on_auto_stack_frame_failed(self, path_text: str, message: str):
+        if not self.auto_stack_active:
+            return
+        self.auto_stack_rejected += 1
+        log_debug(f"Automatic stacking rejected {path_text}: {message}")
+        self.status_label.setText(
+            (
+                f"{self.auto_stack_status_text(Path(path_text).name)}; důvod: {message}"
+                if self.language == "cz"
+                else f"{self.auto_stack_status_text(Path(path_text).name)}; reason: {message}"
+            )
+        )
+
+    def on_auto_stack_worker_finished(self, worker: AutoStackFrameWorker):
+        # A stale completion must never clear a newer worker.
+        if self.auto_stack_worker is not worker:
+            worker.deleteLater()
+            return
+        self.auto_stack_worker = None
+        worker.deleteLater()
+        if self.auto_stack_active and self.auto_stack_worker is None:
+            QTimer.singleShot(0, self.start_next_auto_stack_frame)
+        else:
+            self.auto_stack_start_action.setEnabled(True)
+            self.stack_btn.setEnabled(True)
+            self.open_action.setEnabled(True)
+            self.open_image_action.setEnabled(True)
+
     def open_image_file(self):
         """Otevře jeden samostatný obrázek nebo FIT/FITS do náhledu.
 
@@ -9871,9 +12645,12 @@ class AstroStackerWindow(QMainWindow):
                 self.histogram_label.setStyleSheet("background: #121212; border: 1px solid #444; border-radius: 4px;")
             if hasattr(self, "metadata_label"):
                 self.metadata_label.setStyleSheet("font-family: Consolas, monospace; font-size: 11px; color: #ddd; background: #151515; border: 1px solid #444; border-radius: 4px; padding: 6px;")
+        self._update_activity_overlay_theme()
 
     def apply_language(self):
         self.setWindowTitle(self.tr_ui("window_title"))
+        if hasattr(self, "activity_title_label"):
+            self.activity_title_label.setText(self.tr_ui("activity_title"))
         if hasattr(self, "title_label"):
             self.title_label.setText(self.tr_ui("settings"))
         if hasattr(self, "folder_label") and self.folder is None:
@@ -9901,6 +12678,21 @@ class AstroStackerWindow(QMainWindow):
             self.theme_combo.addItem(self.tr_ui("theme_light"), "light")
             self.theme_combo.setCurrentIndex(max(0, self.theme_combo.findData(current)))
             self.theme_combo.blockSignals(False)
+        if hasattr(self, "denoise_mode_combo"):
+            current = self.denoise_mode_combo.currentData() or "classic"
+            self.denoise_mode_combo.blockSignals(True)
+            self.denoise_mode_combo.clear()
+            self.denoise_mode_combo.addItem(self.tr_ui("denoise_classic"), "classic")
+            if not LITE_BUILD:
+                self.denoise_mode_combo.addItem(self.tr_ui("denoise_drunet"), "drunet")
+            self.denoise_mode_combo.setCurrentIndex(
+                max(0, self.denoise_mode_combo.findData(current))
+            )
+            self.denoise_mode_combo.setToolTip(self.tr_ui("drunet_tooltip"))
+            self.denoise_mode_combo.blockSignals(False)
+        if hasattr(self, "select_drunet_model_btn"):
+            self.select_drunet_model_btn.setText(self.tr_ui("select_drunet_model"))
+            self.select_drunet_model_btn.setToolTip(self.tr_ui("drunet_tooltip"))
         if hasattr(self, "ui_mode_combo"):
             current = self.ui_mode_combo.currentData() or "advanced"
             self.ui_mode_combo.blockSignals(True)
@@ -10017,6 +12809,21 @@ class AstroStackerWindow(QMainWindow):
             self.crop_select_btn.setToolTip(self.tr_ui("crop_select_tooltip"))
         if hasattr(self, "denoise_slider"):
             self.denoise_slider.setToolTip(self.tr_ui("astro_denoise_tooltip"))
+        if hasattr(self, "star_deconvolution_slider"):
+            self.star_deconvolution_slider.setToolTip(
+                self.tr_ui("star_deconvolution_tooltip")
+            )
+        if hasattr(self, "star_deconvolution_size_slider"):
+            self.star_deconvolution_size_slider.setToolTip(
+                self.tr_ui("star_deconvolution_tooltip")
+            )
+        if hasattr(self, "select_stellar_model_btn"):
+            self.select_stellar_model_btn.setText(
+                self.tr_ui("select_stellar_model")
+            )
+            self.select_stellar_model_btn.setToolTip(
+                self.tr_ui("star_deconvolution_tooltip")
+            )
         if hasattr(self, "stf_strength_slider"):
             self.stf_strength_slider.setToolTip(self.tr_ui("stf_strength_tooltip"))
         if hasattr(self, "remove_gradient_btn"):
@@ -10035,7 +12842,7 @@ class AstroStackerWindow(QMainWindow):
 
         menu_texts = {
             "cz": {
-                "file_menu": "Soubor", "view_menu": "Zobrazení", "help_menu": "Nápověda",
+                "file_menu": "Soubor", "view_menu": "Zobrazení", "auto_stack_menu": "Live stack", "camera_menu": "Camera", "help_menu": "Nápověda",
                 "open_action": "Vybrat složku…", "open_image_action": "Otevřít obrázek/FIT…",
                 "save_action": "Uložit výsledek jako…", "save_profile_action": "Uložit profil nastavení…",
                 "load_profile_action": "Načíst profil nastavení…", "comet_action": "Označit kometu v prvním snímku…",
@@ -10046,9 +12853,12 @@ class AstroStackerWindow(QMainWindow):
                 "check_updates_action": "Zkontrolovat aktualizace…",
                 "help_about_action": "About...",
                 "open_log_action": "Zobrazit / smazat logy…", "quit_action": "Konec",
+                "auto_stack_start_action": "Live stacking",
+                "auto_stack_stop_action": "Stop Live stacking",
+                "camera_control_action": "ASCOM Alpaca kamery…",
             },
             "en": {
-                "file_menu": "File", "view_menu": "View", "help_menu": "Help",
+                "file_menu": "File", "view_menu": "View", "auto_stack_menu": "Live stack", "camera_menu": "Camera", "help_menu": "Help",
                 "open_action": "Choose folder…", "open_image_action": "Open image/FIT…",
                 "save_action": "Save result as…", "save_profile_action": "Save settings profile…",
                 "load_profile_action": "Load settings profile…", "comet_action": "Mark comet in first frame…",
@@ -10059,6 +12869,9 @@ class AstroStackerWindow(QMainWindow):
                 "check_updates_action": "Check for updates…",
                 "help_about_action": "About...",
                 "open_log_action": "View / delete logs…", "quit_action": "Quit",
+                "auto_stack_start_action": "Live stacking",
+                "auto_stack_stop_action": "Stop Live stacking",
+                "camera_control_action": "ASCOM Alpaca cameras…",
             },
         }
         for attr, text in menu_texts[self.language].items():
@@ -10106,7 +12919,10 @@ class AstroStackerWindow(QMainWindow):
             "Odstranění vinětace": "vignette", "Vignette removal": "vignette",
             "Umělý flat": "synthetic_flat", "Synthetic flat": "synthetic_flat",
             "Korekce barevného pozadí": "color_background", "Color background correction": "color_background",
+            "Metoda odšumění": "denoise_mode", "Denoise method": "denoise_mode",
             "Astro odšumění": "astro_denoise", "Astro Denoise": "astro_denoise",
+            "AI dekonvoluce hvězd": "star_deconvolution", "AI Star Deconvolution": "star_deconvolution",
+            "Velikost hvězd": "star_deconvolution_size", "Star size": "star_deconvolution_size",
             "Kontrast": "contrast", "Contrast": "contrast",
             "Saturace": "saturation", "Saturation": "saturation",
             "Červená": "red", "Red": "red",
@@ -10598,6 +13414,11 @@ class AstroStackerWindow(QMainWindow):
                 "synthetic_flat": self.synthetic_flat_slider.value() if hasattr(self, "synthetic_flat_slider") else 0,
                 "color_background_correction": self.color_background_slider.value() if hasattr(self, "color_background_slider") else 0,
                 "denoise_strength": self.denoise_slider.value() if hasattr(self, "denoise_slider") else 0,
+                "denoise_mode": self.denoise_mode_combo.currentData() if hasattr(self, "denoise_mode_combo") else "classic",
+                "ai_denoise_model_path": getattr(self, "ai_denoise_model_path", None),
+                "star_deconvolution_strength": self.star_deconvolution_slider.value() if hasattr(self, "star_deconvolution_slider") else 0,
+                "star_deconvolution_size": self.star_deconvolution_size_slider.value() if hasattr(self, "star_deconvolution_size_slider") else 5,
+                "star_deconvolution_model_path": getattr(self, "star_deconvolution_model_path", None),
                 "contrast": self.contrast_slider.value(),
                 "saturation": self.saturation_slider.value(),
                 "red": self.red_slider.value(),
@@ -10694,6 +13515,40 @@ class AstroStackerWindow(QMainWindow):
             set_slider(self.color_background_slider, "color_background_correction", stretch)
         if hasattr(self, "denoise_slider"):
             set_slider(self.denoise_slider, "denoise_strength", stretch)
+        if hasattr(self, "denoise_mode_combo"):
+            self.ai_denoise_model_path = stretch.get(
+                "ai_denoise_model_path",
+                getattr(self, "ai_denoise_model_path", None),
+            )
+            self.denoise_mode_combo.blockSignals(True)
+            saved_denoise_mode = stretch.get("denoise_mode", "classic")
+            if saved_denoise_mode not in {"classic", "drunet"}:
+                saved_denoise_mode = "classic"
+            set_combo_by_data(
+                self.denoise_mode_combo,
+                saved_denoise_mode,
+            )
+            self.denoise_mode_combo.blockSignals(False)
+            self.preview_ai_denoise_cache = None
+            self.preview_ai_denoise_cache_key = None
+            self.ai_denoise_layer_cache.clear()
+        if hasattr(self, "star_deconvolution_slider"):
+            set_slider(
+                self.star_deconvolution_slider,
+                "star_deconvolution_strength",
+                stretch,
+            )
+        if hasattr(self, "star_deconvolution_size_slider"):
+            set_slider(
+                self.star_deconvolution_size_slider,
+                "star_deconvolution_size",
+                stretch,
+            )
+        self.star_deconvolution_model_path = stretch.get(
+            "star_deconvolution_model_path",
+            getattr(self, "star_deconvolution_model_path", None),
+        )
+        self.star_deconvolution_layer_cache.clear()
         set_slider(self.contrast_slider, "contrast", stretch)
         set_slider(self.saturation_slider, "saturation", stretch)
         set_slider(self.red_slider, "red", stretch)
@@ -10807,11 +13662,16 @@ class AstroStackerWindow(QMainWindow):
             black=black,
             white=white,
             gamma=self.gamma_slider.value() / 100.0,
-            stf_strength=(self.stf_strength_slider.value()) / 10.0 if hasattr(self, "stf_strength_slider") else 5.0,
+            stf_strength=(100 - self.stf_strength_slider.value()) / 10.0 if hasattr(self, "stf_strength_slider") else 5.0,
             vignette_removal=(self.vignette_removal_slider.value() / 100.0 * 0.30) if hasattr(self, "vignette_removal_slider") else 0.0,
             synthetic_flat=(self.synthetic_flat_slider.value() / 100.0) if hasattr(self, "synthetic_flat_slider") else 0.0,
             color_background_correction=(self.color_background_slider.value() / 100.0) if hasattr(self, "color_background_slider") else 0.0,
             denoise_strength=(self.denoise_slider.value() / 100.0) if hasattr(self, "denoise_slider") else 0.0,
+            denoise_mode=self.denoise_mode_combo.currentData() if hasattr(self, "denoise_mode_combo") else "classic",
+            ai_denoise_model_path=getattr(self, "ai_denoise_model_path", None),
+            star_deconvolution_strength=(self.star_deconvolution_slider.value() / 100.0) if hasattr(self, "star_deconvolution_slider") else 0.0,
+            star_deconvolution_size=float(self.star_deconvolution_size_slider.value()) if hasattr(self, "star_deconvolution_size_slider") else 5.0,
+            star_deconvolution_model_path=getattr(self, "star_deconvolution_model_path", None),
             contrast=self.contrast_slider.value() / 100.0,
             saturation=self.saturation_slider.value() / 100.0,
             red=self.red_slider.value() / 100.0,
@@ -10842,6 +13702,7 @@ class AstroStackerWindow(QMainWindow):
 
         self.progress.setValue(0)
         self.status_label.setText(self.tr_ui("starting"))
+        self.begin_activity(self.tr_ui("starting"))
         self.stack_start_time = time.perf_counter()
         self.last_total_processing_time = None
         self.last_estimated_used_ram_bytes = None
@@ -10879,6 +13740,7 @@ class AstroStackerWindow(QMainWindow):
             return
         self.progress.setValue(0)
         self.status_label.setText(self.tr_ui("starting"))
+        self.begin_activity(self.tr_ui("starting"))
         self.manual_excluded_paths = set()
         self.review_ready = False
         LAST_STACK_SELECTION = {}
@@ -10896,11 +13758,13 @@ class AstroStackerWindow(QMainWindow):
         self.review_ready = True
         self.progress.setValue(100)
         self.status_label.setText(self.tr_ui("review_ready"))
+        self.finish_activity(self.tr_ui("review_ready"), value=100)
         self.stack_btn.setText(self.tr_ui("continue_stack"))
         self.stack_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
 
     def on_frame_review_failed(self, message: str):
+        self.finish_activity(message, delay_ms=1800)
         QMessageBox.critical(self, "Chyba" if self.language == "cz" else "Error", message)
         self.status_label.setText(self.tr_ui("failed"))
         self.stack_btn.setText(self.tr_ui("start_stack"))
@@ -10912,10 +13776,12 @@ class AstroStackerWindow(QMainWindow):
             self.worker.requestInterruption()
             self.stop_btn.setEnabled(False)
             self.status_label.setText(self.tr_ui("cancel_requested"))
+            self.update_activity(self.progress.value(), self.tr_ui("cancel_requested"))
 
     def on_progress(self, value: int, message: str):
         self.progress.setValue(value)
         self.status_label.setText(message)
+        self.update_activity(value, message)
 
     def play_completion_sound(self):
         try:
@@ -10959,6 +13825,7 @@ class AstroStackerWindow(QMainWindow):
             self.stack_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self.play_completion_sound()
+            self.finish_activity(self.tr_ui("star_comet_done"), value=100)
             return
 
         self.linear_result = result
@@ -10974,8 +13841,10 @@ class AstroStackerWindow(QMainWindow):
         self.stack_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.play_completion_sound()
+        self.finish_activity(self.tr_ui("done_edit"), value=100)
 
     def on_failed(self, message: str):
+        self.finish_activity(message, delay_ms=1800)
         QMessageBox.critical(self, "Chyba", message)
         self.status_label.setText(self.tr_ui("failed"))
         self.review_ready = False
@@ -10986,6 +13855,7 @@ class AstroStackerWindow(QMainWindow):
     def on_cancelled(self):
         self.status_label.setText(self.tr_ui("cancelled"))
         self.progress.setValue(0)
+        self.finish_activity(self.tr_ui("cancelled"), value=0)
         self.review_ready = False
         self.stack_btn.setText(self.tr_ui("start_stack"))
         self.stack_btn.setEnabled(True)
@@ -11018,6 +13888,14 @@ class AstroStackerWindow(QMainWindow):
             self.color_background_slider.setValue(0)
         if hasattr(self, "denoise_slider"):
             self.denoise_slider.setValue(0)
+        if hasattr(self, "star_deconvolution_slider"):
+            self.star_deconvolution_slider.setValue(0)
+        if hasattr(self, "star_deconvolution_size_slider"):
+            self.star_deconvolution_size_slider.setValue(5)
+        if hasattr(self, "star_deconvolution_slider"):
+            self.star_deconvolution_slider.setValue(0)
+        if hasattr(self, "star_deconvolution_size_slider"):
+            self.star_deconvolution_size_slider.setValue(5)
         self.contrast_slider.setValue(100)
         self.saturation_slider.setValue(100)
         self.black_slider.blockSignals(False)
@@ -11026,7 +13904,7 @@ class AstroStackerWindow(QMainWindow):
         self.contrast_slider.blockSignals(False)
         self.saturation_slider.blockSignals(False)
 
-    def invalidate_preview_cache(self):
+    def invalidate_preview_cache(self, preserve_ai: bool = False):
         self.preview_display_cache = None
         self.preview_display_cache_source_id = None
         self.preview_display_cache_neutralized = False
@@ -11037,7 +13915,47 @@ class AstroStackerWindow(QMainWindow):
         self.preview_fast_display_cache_key = None
         self.preview_heavy_cache = None
         self.preview_heavy_cache_key = None
+        self.preview_ai_denoise_cache = None
+        self.preview_ai_denoise_cache_key = None
+        if not preserve_ai:
+            self.ai_denoise_layer_cache.clear()
+            self.star_deconvolution_layer_cache.clear()
         self.preview_render_array = None
+
+    def transform_ai_denoise_cache(
+        self,
+        old_source_id: int,
+        new_source_id: int,
+        transform,
+    ):
+        """Apply the same crop/rotation to cached AI reference and residual."""
+        transformed: Dict[Tuple[Any, ...], Dict[str, np.ndarray]] = {}
+        for key, payload in list(self.ai_denoise_layer_cache.items()):
+            if not key or key[0] != old_source_id:
+                continue
+            try:
+                reference = np.ascontiguousarray(
+                    transform(np.asarray(payload["reference"], dtype=np.float32))
+                )
+                residual = np.ascontiguousarray(
+                    transform(np.asarray(payload["residual"], dtype=np.float32))
+                )
+            except Exception:
+                log_debug(
+                    "Could not transform cached AI denoise layer:\n"
+                    + traceback.format_exc()
+                )
+                continue
+            transformed[(new_source_id, *key[1:])] = {
+                "reference": reference,
+                "residual": residual,
+            }
+
+        for key in [key for key in self.ai_denoise_layer_cache if key and key[0] == old_source_id]:
+            self.ai_denoise_layer_cache.pop(key, None)
+        self.ai_denoise_layer_cache.update(transformed)
+        self.preview_ai_denoise_cache = None
+        self.preview_ai_denoise_cache_key = None
 
     def reset_preview_display_limits(self):
         self.preview_display_limits = None
@@ -11049,17 +13967,24 @@ class AstroStackerWindow(QMainWindow):
             1.0,
             float(max_preview_edge) / float(max(source_h, source_w)),
         )
+        target_w = max(1, int(round(source_w * source_scale)))
+        target_h = max(1, int(round(source_h * source_scale)))
 
         def preview_sized_linear(image: np.ndarray) -> np.ndarray:
-            """Downsample linear data before expensive display-only STF work."""
+            """Match every preview layer to one source-derived pixel grid."""
             arr = np.asarray(image, dtype=np.float32)
-            h, w = arr.shape[:2]
-            scale = min(1.0, float(max_preview_edge) / float(max(h, w)))
-            if scale >= 0.999:
+            if arr.shape[:2] == (target_h, target_w):
                 return arr
-            new_w = max(1, int(round(w * scale)))
-            new_h = max(1, int(round(h * scale)))
-            return cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            interpolation = (
+                cv2.INTER_AREA
+                if arr.shape[0] >= target_h and arr.shape[1] >= target_w
+                else cv2.INTER_LINEAR
+            )
+            return cv2.resize(
+                arr,
+                (target_w, target_h),
+                interpolation=interpolation,
+            )
 
         gradient_corrected = (
             getattr(self, "gradient_preview_layer", None) is not None
@@ -11089,26 +14014,22 @@ class AstroStackerWindow(QMainWindow):
         ):
             base = self.preview_display_cache
             fast_key = (id(base), int(max_preview_edge))
-            h, w = base.shape[:2]
-            scale_from_cache = min(1.0, float(max_preview_edge) / float(max(h, w)))
-            source_h, source_w = source.shape[:2]
-            self.preview_display_scale = min(
-                1.0,
-                float(max_preview_edge) / float(max(source_h, source_w)),
-            )
+            self.preview_display_scale = source_scale
             if self.preview_fast_display_cache is not None and self.preview_fast_display_cache_key == fast_key:
                 return self.preview_fast_display_cache
-            if scale_from_cache < 0.999:
-                new_w = max(1, int(round(w * scale_from_cache)))
-                new_h = max(1, int(round(h * scale_from_cache)))
-                base = cv2.resize(base, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            if base.shape[:2] != (target_h, target_w):
+                base = cv2.resize(
+                    base,
+                    (target_w, target_h),
+                    interpolation=cv2.INTER_AREA,
+                )
             fast_base = np.ascontiguousarray(base.astype(np.float32))
             self.preview_fast_display_cache = fast_base
             self.preview_fast_display_cache_key = fast_key
             return fast_base
         else:
             if neutralized:
-                base = self.neutralized_preview_layer
+                base = preview_sized_linear(self.neutralized_preview_layer)
             elif gradient_corrected:
                 base = preview_sized_linear(self.gradient_preview_layer)
                 if self.preview_auto_display_stretch:
@@ -11130,14 +14051,12 @@ class AstroStackerWindow(QMainWindow):
                         0.0,
                         1.0,
                     )
-        h, w = base.shape[:2]
-        scale = min(1.0, float(max_preview_edge) / float(max(h, w)))
-        if scale < 0.999:
-            new_w = max(1, int(round(w * scale)))
-            new_h = max(1, int(round(h * scale)))
-            base = cv2.resize(base, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        else:
-            scale = 1.0
+        if base.shape[:2] != (target_h, target_w):
+            base = cv2.resize(
+                base,
+                (target_w, target_h),
+                interpolation=cv2.INTER_AREA,
+            )
 
         self.preview_display_cache = np.ascontiguousarray(base.astype(np.float32))
         self.preview_display_cache_source_id = cache_source_id
@@ -11178,15 +14097,255 @@ class AstroStackerWindow(QMainWindow):
         self.preview_heavy_cache_key = key
         return self.preview_heavy_cache
 
+    def apply_cached_preview_denoise(
+        self,
+        stretched_preview: np.ndarray,
+        settings: StretchSettings,
+        layer_key: Tuple[Any, ...],
+        fast: bool = False,
+    ) -> np.ndarray:
+        mode = str(getattr(settings, "denoise_mode", "classic") or "classic")
+        strength = float(getattr(settings, "denoise_strength", 0.0))
+        if strength <= 1e-6:
+            return stretched_preview
+
+        model_path = None
+        if mode == "drunet":
+            model_path = find_drunet_model(
+                getattr(settings, "ai_denoise_model_path", None)
+            )
+
+        key = (
+            *layer_key,
+            mode,
+            str(model_path) if model_path is not None else "",
+            round(strength, 4),
+        )
+        cached = self.ai_denoise_layer_cache.get(key)
+        if cached is not None:
+            reference = np.asarray(cached["reference"], dtype=np.float32)
+            residual = np.asarray(cached["residual"], dtype=np.float32)
+            target_h, target_w = stretched_preview.shape[:2]
+            if reference.shape[:2] != (target_h, target_w):
+                reference = cv2.resize(
+                    reference,
+                    (target_w, target_h),
+                    interpolation=cv2.INTER_AREA,
+                )
+                residual = cv2.resize(
+                    residual,
+                    (target_w, target_h),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            # Gamma/STF/contrast alter the visible amplitude of the same noise.
+            # Scale the cached residual by robust high-frequency energy so the
+            # denoise remains equally visible without running the model again.
+            reference_hp = reference - cv2.GaussianBlur(reference, (0, 0), 1.0)
+            current = np.asarray(stretched_preview, dtype=np.float32)
+            current_hp = current - cv2.GaussianBlur(current, (0, 0), 1.0)
+            ref_energy = np.median(np.abs(reference_hp), axis=(0, 1))
+            cur_energy = np.median(np.abs(current_hp), axis=(0, 1))
+            energy_ratio = cur_energy / np.maximum(ref_energy, 1e-6)
+            residual_scale = np.clip(
+                1.0 + (energy_ratio - 1.0) * 1.45,
+                0.35,
+                3.0,
+            ).astype(np.float32)
+            result = np.clip(
+                current
+                - residual
+                * residual_scale.reshape(1, 1, -1),
+                0.0,
+                1.0,
+            ).astype(np.float32)
+            self.preview_ai_denoise_cache = np.ascontiguousarray(result)
+            self.preview_ai_denoise_cache_key = key
+            return self.preview_ai_denoise_cache
+
+        # While a slider is moving, use an existing residual if available.
+        # A new source/strength is calculated once on the final render.
+        if fast:
+            return stretched_preview
+
+        source = np.ascontiguousarray(
+            np.clip(stretched_preview, 0.0, 1.0).astype(np.float32)
+        )
+        ai_activity = mode == "drunet" and model_path is not None and ort is not None
+        if ai_activity and self.ai_denoise_in_progress:
+            return stretched_preview
+        if ai_activity:
+            self.ai_denoise_in_progress = True
+            is_export = "export" in layer_key
+            self.begin_activity(
+                self.tr_ui("ai_denoise_export" if is_export else "ai_denoise_preview"),
+                indeterminate=True,
+            )
+            self.flush_activity_overlay()
+        try:
+            if mode == "drunet" and model_path is not None and ort is not None:
+                result = apply_drunet_onnx(source, strength, model_path)
+            else:
+                result = apply_astro_denoise(source, strength)
+        except Exception:
+            log_debug(f"AI denoise preview failed:\n{traceback.format_exc()}")
+            result = apply_astro_denoise(source, strength)
+        finally:
+            if ai_activity:
+                self.finish_activity(
+                    self.tr_ui("ai_denoise_done"),
+                    value=100,
+                    delay_ms=1000,
+                )
+                self.ai_denoise_in_progress = False
+        full_result = np.ascontiguousarray(result.astype(np.float32))
+        self.preview_ai_denoise_cache = full_result
+        self.preview_ai_denoise_cache_key = key
+        self.ai_denoise_layer_cache[key] = {
+            "reference": source,
+            "residual": np.ascontiguousarray(
+                (source - full_result).astype(np.float32)
+            ),
+        }
+        while len(self.ai_denoise_layer_cache) > 2:
+            self.ai_denoise_layer_cache.pop(next(iter(self.ai_denoise_layer_cache)))
+        return self.preview_ai_denoise_cache
+
+    def apply_cached_star_deconvolution(
+        self,
+        preview: np.ndarray,
+        settings: StretchSettings,
+        layer_key: Tuple[Any, ...],
+        fast: bool = False,
+    ) -> np.ndarray:
+        strength = float(
+            getattr(settings, "star_deconvolution_strength", 0.0)
+        )
+        if strength <= 1e-6:
+            return preview
+        model_path = find_stellar_deconvolution_model(
+            getattr(settings, "star_deconvolution_model_path", None)
+        )
+        if model_path is None or ort is None:
+            return preview
+
+        key = (*layer_key, str(model_path))
+        current = np.ascontiguousarray(
+            np.clip(preview, 0.0, 1.0).astype(np.float32)
+        )
+        cached = self.star_deconvolution_layer_cache.get(key)
+        if cached is None:
+            if fast or self.star_deconvolution_in_progress:
+                return preview
+            self.star_deconvolution_in_progress = True
+            is_export = "export" in layer_key
+            self.begin_activity(
+                self.tr_ui(
+                    "ai_stellar_export" if is_export else "ai_stellar_preview"
+                ),
+                indeterminate=True,
+            )
+            self.flush_activity_overlay()
+            try:
+                model_result = run_stellar_deconvolution_onnx(
+                    current,
+                    model_path,
+                )
+                cached = {
+                    "reference": current,
+                    "residual": np.ascontiguousarray(
+                        (model_result - current).astype(np.float32)
+                    ),
+                }
+                self.star_deconvolution_layer_cache[key] = cached
+                while len(self.star_deconvolution_layer_cache) > 2:
+                    self.star_deconvolution_layer_cache.pop(
+                        next(iter(self.star_deconvolution_layer_cache))
+                    )
+            except Exception:
+                log_debug(
+                    "AI stellar deconvolution failed:\n"
+                    + traceback.format_exc()
+                )
+                return preview
+            finally:
+                self.star_deconvolution_in_progress = False
+                self.finish_activity(
+                    self.tr_ui("ai_stellar_done"),
+                    value=100,
+                    delay_ms=1000,
+                )
+
+        reference = np.asarray(cached["reference"], dtype=np.float32)
+        residual = np.asarray(cached["residual"], dtype=np.float32)
+        target_h, target_w = current.shape[:2]
+        if reference.shape[:2] != (target_h, target_w):
+            reference = cv2.resize(
+                reference,
+                (target_w, target_h),
+                interpolation=cv2.INTER_AREA,
+            )
+            residual = cv2.resize(
+                residual,
+                (target_w, target_h),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        reference_hp = reference - cv2.GaussianBlur(reference, (0, 0), 1.0)
+        current_hp = current - cv2.GaussianBlur(current, (0, 0), 1.0)
+        reference_energy = float(np.median(np.abs(reference_hp)))
+        current_energy = float(np.median(np.abs(current_hp)))
+        residual_scale = float(
+            np.clip(
+                current_energy / max(reference_energy, 1e-6),
+                0.4,
+                2.5,
+            )
+        )
+        star_mask = stellar_deconvolution_mask(
+            current,
+            getattr(settings, "star_deconvolution_size", 5.0),
+        )
+        blend = np.clip(strength * star_mask, 0.0, 1.0)[..., None]
+        return np.clip(
+            current + residual * residual_scale * blend,
+            0.0,
+            1.0,
+        ).astype(np.float32)
+
+    def processed_display_base(
+        self,
+        source: np.ndarray,
+        settings: StretchSettings,
+        max_preview_edge: Optional[int] = None,
+        fast: bool = False,
+    ) -> Tuple[np.ndarray, StretchSettings]:
+        """Build and cache slow display corrections before interactive curves."""
+        edge = max_preview_edge or max(
+            int(source.shape[0]),
+            int(source.shape[1]),
+        )
+        corrected_display_source = self.preview_display_base(
+            source,
+            max_preview_edge=edge,
+        )
+        post_settings = replace(
+            settings,
+            vignette_removal=0.0,
+            synthetic_flat=0.0,
+            color_background_correction=0.0,
+        )
+        display_source = self.preview_heavy_corrected_base(
+            corrected_display_source,
+            settings,
+            fast=fast,
+        )
+        return np.ascontiguousarray(display_source.astype(np.float32)), post_settings
+
     def _preview_slider_pressed(self, *_args):
         if not self.preview_interactive:
-            self.preview_slider_zoom_state = {
-                "mode": self.zoom_mode,
-                "factor": self.zoom_factor,
-                "hbar": self.scroll.horizontalScrollBar().value() if hasattr(self, "scroll") else 0,
-                "vbar": self.scroll.verticalScrollBar().value() if hasattr(self, "scroll") else 0,
-                "render_shape": tuple(self.preview_render_array.shape[:2]) if self.preview_render_array is not None else None,
-            }
+            self.preview_slider_zoom_state = self.capture_preview_zoom_state()
+        self.preview_position_generation += 1
         self.preview_interactive = True
         self.preview_render_pending_final = False
         self.update_zoom_status_label()
@@ -11226,7 +14385,38 @@ class AstroStackerWindow(QMainWindow):
 
         self.update_preview(fast=False)
 
+    def capture_preview_zoom_state(self) -> Dict[str, Any]:
+        state: Dict[str, Any] = {
+            "mode": self.zoom_mode,
+            "factor": self.zoom_factor,
+            "hbar": 0,
+            "vbar": 0,
+            "render_shape": (
+                tuple(self.preview_render_array.shape[:2])
+                if self.preview_render_array is not None
+                else None
+            ),
+        }
+        if not hasattr(self, "scroll"):
+            return state
+        hbar = self.scroll.horizontalScrollBar()
+        vbar = self.scroll.verticalScrollBar()
+        state["hbar"] = hbar.value()
+        state["vbar"] = vbar.value()
+        pixmap = self.image_label.pixmap() if hasattr(self, "image_label") else None
+        if pixmap is not None and not pixmap.isNull():
+            viewport = self.scroll.viewport()
+            state["center_rel_x"] = (
+                float(hbar.value()) + float(viewport.width()) / 2.0
+            ) / max(1.0, float(pixmap.width()))
+            state["center_rel_y"] = (
+                float(vbar.value()) + float(viewport.height()) / 2.0
+            ) / max(1.0, float(pixmap.height()))
+        return state
+
     def restore_preview_zoom_state(self, state: Dict[str, Any]):
+        self.preview_position_generation += 1
+        position_generation = self.preview_position_generation
         self.zoom_mode = str(state.get("mode", self.zoom_mode))
         self.zoom_factor = float(state.get("factor", self.zoom_factor))
         self.update_zoom_status_label()
@@ -11237,10 +14427,37 @@ class AstroStackerWindow(QMainWindow):
         vbar = self.scroll.verticalScrollBar()
         target_h = int(state.get("hbar", hbar.value()))
         target_v = int(state.get("vbar", vbar.value()))
+        center_rel_x = state.get("center_rel_x")
+        center_rel_y = state.get("center_rel_y")
 
         def apply_saved_scroll():
-            hbar.setValue(target_h)
-            vbar.setValue(target_v)
+            if position_generation != self.preview_position_generation:
+                return
+            pixmap = self.image_label.pixmap() if hasattr(self, "image_label") else None
+            if (
+                pixmap is not None
+                and not pixmap.isNull()
+                and center_rel_x is not None
+                and center_rel_y is not None
+            ):
+                viewport = self.scroll.viewport()
+                restored_h = int(
+                    round(
+                        float(center_rel_x) * float(pixmap.width())
+                        - float(viewport.width()) / 2.0
+                    )
+                )
+                restored_v = int(
+                    round(
+                        float(center_rel_y) * float(pixmap.height())
+                        - float(viewport.height()) / 2.0
+                    )
+                )
+                hbar.setValue(restored_h)
+                vbar.setValue(restored_v)
+            else:
+                hbar.setValue(target_h)
+                vbar.setValue(target_v)
             self.preview_pan_scroll = (float(hbar.value()), float(vbar.value()))
 
         apply_saved_scroll()
@@ -11312,16 +14529,39 @@ class AstroStackerWindow(QMainWindow):
         self.preview_fast_zoom_scale = 1.0
 
         max_preview_edge = self.interactive_preview_max_edge() if fast else 2200
-        display_source = self.preview_display_base(source, max_preview_edge=max_preview_edge)
         stretch_settings = self.current_stretch_settings()
-        display_source = self.preview_heavy_corrected_base(display_source, stretch_settings, fast=fast)
-        stretch_settings = replace(
+        display_source, stretch_settings = self.processed_display_base(
+            source,
             stretch_settings,
-            vignette_removal=0.0,
-            synthetic_flat=0.0,
-            color_background_correction=0.0,
+            max_preview_edge=max_preview_edge,
+            fast=fast,
         )
-        preview = apply_stretch(display_source, stretch_settings)
+        preview = apply_stretch(
+            display_source,
+            replace(stretch_settings, denoise_strength=0.0),
+        )
+        preview = self.apply_cached_preview_denoise(
+            preview,
+            stretch_settings,
+            (
+                id(source),
+                "preview",
+                bool(self.preview_auto_display_stretch),
+                tuple(self.preview_display_limits or ()),
+            ),
+            fast=fast,
+        )
+        preview = self.apply_cached_star_deconvolution(
+            preview,
+            stretch_settings,
+            (
+                id(source),
+                "preview",
+                bool(self.preview_auto_display_stretch),
+                tuple(self.preview_display_limits or ()),
+            ),
+            fast=fast,
+        )
         if not fast and hasattr(self, "histogram_label"):
             hist_w = max(180, self.histogram_label.width())
             self.histogram_label.setPixmap(make_histogram_pixmap(preview, hist_w, 120))
@@ -11389,6 +14629,8 @@ class AstroStackerWindow(QMainWindow):
         preview = getattr(self, "preview_render_array", None)
         if preview is None:
             return
+        self.preview_position_generation += 1
+        position_generation = self.preview_position_generation
         self.showing_intro_preview = False
 
         if self.zoom_mode == "fit":
@@ -11421,6 +14663,8 @@ class AstroStackerWindow(QMainWindow):
             target_v = int(round(center_rel_y * float(pixmap.height()) - float(viewport.height()) / 2.0))
 
             def apply_scroll_position():
+                if position_generation != self.preview_position_generation:
+                    return
                 hbar.setValue(target_h)
                 vbar.setValue(target_v)
                 self.preview_pan_scroll = (float(hbar.value()), float(vbar.value()))
@@ -11479,10 +14723,14 @@ class AstroStackerWindow(QMainWindow):
     def center_preview_scroll(self):
         if not hasattr(self, "scroll"):
             return
+        self.preview_position_generation += 1
+        position_generation = self.preview_position_generation
         hbar = self.scroll.horizontalScrollBar()
         vbar = self.scroll.verticalScrollBar()
 
         def apply_center():
+            if position_generation != self.preview_position_generation:
+                return
             hbar.setValue((hbar.maximum() + hbar.minimum()) // 2)
             vbar.setValue((vbar.maximum() + vbar.minimum()) // 2)
             self.preview_pan_scroll = (float(hbar.value()), float(vbar.value()))
@@ -11553,8 +14801,12 @@ class AstroStackerWindow(QMainWindow):
         new_oy = max(0.0, (new_label_h - float(new_pixmap.height())) / 2.0)
         target_x = new_ox + rel_x * float(new_pixmap.width()) - viewport_x
         target_y = new_oy + rel_y * float(new_pixmap.height()) - viewport_y
+        self.preview_position_generation += 1
+        position_generation = self.preview_position_generation
 
         def apply_anchor():
+            if position_generation != self.preview_position_generation:
+                return
             hbar.setValue(int(round(target_x)))
             vbar.setValue(int(round(target_y)))
             self.preview_pan_scroll = (float(hbar.value()), float(vbar.value()))
@@ -11682,9 +14934,17 @@ class AstroStackerWindow(QMainWindow):
         if getattr(self, "flip_horizontal", False):
             bx = float(base_w - 1) - bx
 
-        scale = max(1e-6, float(getattr(self, "preview_display_scale", 1.0) or 1.0))
-        sx = bx / scale
-        sy = by / scale
+        # Derive the mapping from the preview that is actually on screen.
+        # preview_display_scale can briefly describe a different fast-preview
+        # resolution while sliders are being adjusted.
+        if base_w > 1 and source_w > 1:
+            sx = bx * float(source_w - 1) / float(base_w - 1)
+        else:
+            sx = 0.0
+        if base_h > 1 and source_h > 1:
+            sy = by * float(source_h - 1) / float(base_h - 1)
+        else:
+            sy = 0.0
         sx = max(0.0, min(float(source_w - 1), sx))
         sy = max(0.0, min(float(source_h - 1), sy))
         return sx, sy
@@ -11767,7 +15027,20 @@ class AstroStackerWindow(QMainWindow):
         self.neutralized_preview_base_source_id = id(new_source) if cropped_neutralized is not None else None
         self.gradient_preview_layer = cropped_gradient
         self.gradient_preview_base_source_id = id(new_source) if cropped_gradient is not None else None
-        self.invalidate_preview_cache()
+        def crop_cached_layer(layer: np.ndarray) -> np.ndarray:
+            layer_h, layer_w = layer.shape[:2]
+            cache_left = int(round(left * layer_w / max(1, w)))
+            cache_right = int(round(right * layer_w / max(1, w)))
+            cache_top = int(round(top * layer_h / max(1, h)))
+            cache_bottom = int(round(bottom * layer_h / max(1, h)))
+            cache_left = max(0, min(layer_w - 1, cache_left))
+            cache_right = max(cache_left + 1, min(layer_w, cache_right))
+            cache_top = max(0, min(layer_h - 1, cache_top))
+            cache_bottom = max(cache_top + 1, min(layer_h, cache_bottom))
+            return layer[cache_top:cache_bottom, cache_left:cache_right, ...]
+
+        self.transform_ai_denoise_cache(old_source_id, id(new_source), crop_cached_layer)
+        self.invalidate_preview_cache(preserve_ai=True)
         if manual:
             self.status_label.setText(self.tr_ui("crop_selection_applied").format(w=cropped.shape[1], h=cropped.shape[0]))
         else:
@@ -11816,7 +15089,12 @@ class AstroStackerWindow(QMainWindow):
         self.neutralized_preview_base_source_id = id(new_source) if rotated_neutralized is not None else None
         self.gradient_preview_layer = rotated_gradient
         self.gradient_preview_base_source_id = id(new_source) if rotated_gradient is not None else None
-        self.invalidate_preview_cache()
+        self.transform_ai_denoise_cache(
+            old_source_id,
+            id(new_source),
+            lambda layer: rotate_image_expand(layer, angle),
+        )
+        self.invalidate_preview_cache(preserve_ai=True)
         self.status_label.setText(self.tr_ui("crop_applied").format(angle=angle, w=rotated.shape[1], h=rotated.shape[0]))
         self.update_preview()
 
@@ -11841,8 +15119,11 @@ class AstroStackerWindow(QMainWindow):
         # Any previous neutralized layer and black point were calculated from
         # the pre-correction tonal scale. Reusing them can clip an entire RGB
         # channel after a strong gradient correction.
-        self.preview_auto_display_stretch = True
-        self.reset_preview_display_limits()
+        # Keep the current display stretch when a DRUNet layer already exists.
+        # The gradient is applied afterwards as a cached correction, so it does
+        # not need to invalidate the expensive AI inference.
+        if not self.ai_denoise_layer_cache:
+            self.preview_auto_display_stretch = True
         neutralized = self.build_neutralized_preview_layer(corrected, show_errors=False)
         if neutralized is not None:
             display, _status = neutralized
@@ -11853,7 +15134,7 @@ class AstroStackerWindow(QMainWindow):
             self.neutralized_preview_base_source_id = None
             display = make_display_preview_base(corrected)
         self._set_auto_stretch_sliders(display)
-        self.invalidate_preview_cache()
+        self.invalidate_preview_cache(preserve_ai=True)
         self.status_label.setText(self.tr_ui("gradient_removed"))
         self.update_preview()
 
@@ -11865,7 +15146,7 @@ class AstroStackerWindow(QMainWindow):
         self.gradient_preview_base_source_id = None
         self.neutralized_preview_layer = None
         self.neutralized_preview_base_source_id = None
-        self.invalidate_preview_cache()
+        self.invalidate_preview_cache(preserve_ai=True)
         self.status_label.setText(self.tr_ui("gradient_cleared"))
         self.update_preview()
 
@@ -11893,7 +15174,7 @@ class AstroStackerWindow(QMainWindow):
         # make_display_preview_base(source). Lineární data se nemění.
         self.neutralized_preview_layer = corrected
         self.neutralized_preview_base_source_id = id(source)
-        self.invalidate_preview_cache()
+        self.invalidate_preview_cache(preserve_ai=True)
 
         self.status_label.setText(status)
         self.update_preview()
@@ -12046,7 +15327,7 @@ class AstroStackerWindow(QMainWindow):
             self.push_preview_undo_state(copy_pixels=False)
         self.neutralized_preview_layer = None
         self.neutralized_preview_base_source_id = None
-        self.invalidate_preview_cache()
+        self.invalidate_preview_cache(preserve_ai=True)
         self.status_label.setText(self.tr_ui("neutralization_cleared"))
         self.update_preview()
 
@@ -12131,6 +15412,9 @@ class AstroStackerWindow(QMainWindow):
         self.green_slider.blockSignals(False)
         self.blue_slider.blockSignals(False)
 
+        # RGB gains are applied after the cached denoise residual. Keep the
+        # expensive model result and only rebuild the lightweight preview.
+        self.invalidate_preview_cache(preserve_ai=True)
         source_label = self.tr_ui("awb_source_open") if self.preview_override is not None else self.tr_ui("awb_source_stack")
         self.status_label.setText(self.tr_ui("awb_status").format(source=source_label, r=gains[0], g=gains[1], b=gains[2]))
         self.update_preview()
@@ -12190,17 +15474,18 @@ class AstroStackerWindow(QMainWindow):
             slider.blockSignals(False)
         return True
 
-    def auto_stretch_preview(self):
+    def apply_balance_to_current_preview(
+        self,
+        record_undo: bool = True,
+        refresh_preview: bool = True,
+        set_status: bool = True,
+    ) -> bool:
         source = self.preview_override if self.preview_override is not None else self.linear_result
         if source is None:
-            QMessageBox.information(
-                self,
-                self.tr_ui("missing_image_title"),
-                self.tr_ui("missing_image_message"),
-            )
-            return
+            return False
 
-        self.push_preview_undo_state(copy_pixels=False)
+        if record_undo:
+            self.push_preview_undo_state(copy_pixels=False)
         self.preview_auto_display_stretch = True
         balance_source = source
         if (
@@ -12213,15 +15498,29 @@ class AstroStackerWindow(QMainWindow):
             display, _status = neutralized
             self.neutralized_preview_layer = display
             self.neutralized_preview_base_source_id = id(source)
-            self.invalidate_preview_cache()
+            self.invalidate_preview_cache(preserve_ai=True)
         else:
             display = make_display_preview_base(source)
 
         if not self._set_auto_stretch_sliders(display):
-            return
+            return False
 
-        self.status_label.setText(self.tr_ui("auto_stretch_done"))
-        self.update_preview()
+        if set_status:
+            self.status_label.setText(self.tr_ui("auto_stretch_done"))
+        if refresh_preview:
+            self.update_preview()
+        return True
+
+    def auto_stretch_preview(self):
+        source = self.preview_override if self.preview_override is not None else self.linear_result
+        if source is None:
+            QMessageBox.information(
+                self,
+                self.tr_ui("missing_image_title"),
+                self.tr_ui("missing_image_message"),
+            )
+            return
+        self.apply_balance_to_current_preview()
 
     def export_display_base(self) -> np.ndarray:
         """Return the full-resolution visual base exactly as used by the preview."""
@@ -12251,18 +15550,30 @@ class AstroStackerWindow(QMainWindow):
         )
 
     def save_preview(self):
-        if self.linear_result is None:
-            QMessageBox.information(self, "Nic k uložení", "Nejdřív slož snímky.")
+        source = self.preview_override if self.preview_override is not None else self.linear_result
+        if source is None:
+            QMessageBox.information(
+                self,
+                self.tr_ui("missing_image_title"),
+                self.tr_ui("missing_image_message"),
+            )
             return
 
-        default_path = (
-            self.folder / "stacked_result.tif"
-            if self.folder is not None
-            else Path("stacked_result.tif")
+        opened_path = (
+            Path(self.preview_override_path)
+            if self.preview_override is not None and self.preview_override_path
+            else None
         )
+        if opened_path is not None:
+            default_path = opened_path.with_name(f"{opened_path.stem}_edited.tif")
+        elif self.folder is not None:
+            default_path = self.folder / "stacked_result.tif"
+        else:
+            default_path = Path("stacked_result.tif")
+
         filename, selected_filter = QFileDialog.getSaveFileName(
             self,
-            "Uložit výsledek",
+            self.tr_ui("save_image_title"),
             str(default_path),
             "TIFF 16-bit (*.tif *.tiff);;PNG 8-bit (*.png);;FITS 32-bit linear (*.fits *.fit);;XISF 32-bit linear (*.xisf)",
         )
@@ -12288,14 +15599,17 @@ class AstroStackerWindow(QMainWindow):
             if suffix in {".fits", ".fit"}:
                 # FITS ukládáme vždy lineárně, bez apply_stretch(), black/white pointu, gammy a RGB sliderů.
                 settings = self.current_stack_settings()
-                source_header = find_reference_fits_header(self.folder, settings)
+                if opened_path is not None and opened_path.suffix.lower() in {".fit", ".fits"}:
+                    source_header = get_first_fits_header_safely(opened_path)
+                else:
+                    source_header = find_reference_fits_header(self.folder, settings)
                 stack_info = {
                     "align_mode": settings.align_mode,
                     "stack_mode": settings.stack_mode,
                     "sigma": float(settings.sigma),
                     "bayer_pattern": getattr(settings, "bayer_pattern", "auto"),
                 }
-                save_stack_fits(Path(filename), self.linear_result, source_header=source_header, stack_info=stack_info)
+                save_stack_fits(Path(filename), source, source_header=source_header, stack_info=stack_info)
             elif suffix in XISF_EXTENSIONS:
                 settings = self.current_stack_settings()
                 stack_info = {
@@ -12305,32 +15619,115 @@ class AstroStackerWindow(QMainWindow):
                     "num_images": len(LAST_STACK_SELECTION.get("used_paths", [])),
                     "bayer_pattern": getattr(settings, "bayer_pattern", "auto"),
                 }
-                save_stack_xisf(Path(filename), self.linear_result, stack_info=stack_info)
+                save_stack_xisf(Path(filename), source, stack_info=stack_info)
             elif suffix in {".tif", ".tiff"}:
                 # TIFF ukládáme jako vizuální 16bit náhled:
                 # nejdřív stejný display stretch jako v GUI, potom uživatelské křivky/slidery.
                 # Lineární master zůstává ve FIT exportu.
-                display_base = self.export_display_base()
-                preview = apply_stretch(display_base, self.current_stretch_settings())
+                stretch_settings = self.current_stretch_settings()
+                display_base, stretch_settings = self.processed_display_base(
+                    source,
+                    stretch_settings,
+                )
+                preview = apply_stretch(
+                    display_base,
+                    replace(stretch_settings, denoise_strength=0.0),
+                )
+                preview = self.apply_cached_preview_denoise(
+                    preview,
+                    stretch_settings,
+                    (
+                        id(source),
+                        "export",
+                        bool(self.preview_auto_display_stretch),
+                        tuple(self.preview_display_limits or ()),
+                    ),
+                )
+                preview = self.apply_cached_star_deconvolution(
+                    preview,
+                    stretch_settings,
+                    (
+                        id(source),
+                        "export",
+                        bool(self.preview_auto_display_stretch),
+                        tuple(self.preview_display_limits or ()),
+                    ),
+                )
                 img16_rgb = (np.clip(preview, 0, 1) * 65535).astype(np.uint16)
                 img16_bgr = cv2.cvtColor(img16_rgb, cv2.COLOR_RGB2BGR)
                 ok = cv2.imwrite(filename, img16_bgr)
                 if not ok:
-                    raise RuntimeError("TIFF se nepodařilo uložit přes OpenCV.")
+                    raise RuntimeError(self.tr_ui("save_tiff_error"))
             else:
                 # PNG ukládáme jako vizuální 8bit náhled:
                 # používá stejný display stretch jako zobrazení v programu.
-                display_base = self.export_display_base()
-                preview = apply_stretch(display_base, self.current_stretch_settings())
+                stretch_settings = self.current_stretch_settings()
+                display_base, stretch_settings = self.processed_display_base(
+                    source,
+                    stretch_settings,
+                )
+                preview = apply_stretch(
+                    display_base,
+                    replace(stretch_settings, denoise_strength=0.0),
+                )
+                preview = self.apply_cached_preview_denoise(
+                    preview,
+                    stretch_settings,
+                    (
+                        id(source),
+                        "export",
+                        bool(self.preview_auto_display_stretch),
+                        tuple(self.preview_display_limits or ()),
+                    ),
+                )
+                preview = self.apply_cached_star_deconvolution(
+                    preview,
+                    stretch_settings,
+                    (
+                        id(source),
+                        "export",
+                        bool(self.preview_auto_display_stretch),
+                        tuple(self.preview_display_limits or ()),
+                    ),
+                )
                 Image.fromarray((np.clip(preview, 0, 1) * 255).astype(np.uint8)).save(filename)
 
-            self.status_label.setText(f"Uloženo: {filename}")
+            self.status_label.setText(
+                self.tr_ui("save_image_done").format(path=filename)
+            )
         except Exception as exc:
-            QMessageBox.critical(self, "Chyba při ukládání", str(exc))
+            QMessageBox.critical(
+                self,
+                self.tr_ui("save_image_error_title"),
+                str(exc),
+            )
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._position_activity_overlay()
         self.update_preview()
+
+    def closeEvent(self, event):
+        if (
+            self.alpaca_camera_dialog is not None
+            and self.alpaca_camera_dialog.capture_workers
+        ):
+            camera_workers = list(
+                self.alpaca_camera_dialog.capture_workers.values()
+            )
+            for camera_worker in camera_workers:
+                camera_worker.requestInterruption()
+            for camera_worker in camera_workers:
+                camera_worker.wait(5000)
+        self.auto_stack_timer.stop()
+        self.auto_stack_active = False
+        if self.auto_stack_calibration_worker is not None and self.auto_stack_calibration_worker.isRunning():
+            self.auto_stack_calibration_worker.requestInterruption()
+            self.auto_stack_calibration_worker.wait(3000)
+        if self.auto_stack_worker is not None and self.auto_stack_worker.isRunning():
+            self.auto_stack_worker.requestInterruption()
+            self.auto_stack_worker.wait(3000)
+        super().closeEvent(event)
 
 
 def main():

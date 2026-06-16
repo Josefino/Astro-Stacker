@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>Astro Stacker 2.8 - User Manual</title>
+<title>Astro Stacker 3.0 - User Manual</title>
 <style>
 @page { margin: 18mm 16mm; }
 body {
@@ -41,7 +41,7 @@ strong { color: #111827; }
 </style>
 </head>
 <body>
-<h1>Astro Stacker 2.8 - User Manual</h1>
+<h1>Astro Stacker 3.0 - User Manual</h1>
 <p>Astro Stacker is an application for stacking astronomical images from DSLR and mirrorless cameras, astronomy cameras, and smart telescopes. It loads a sequence of Light frames, optionally applies Flat/Bias/Dark calibration, aligns the frames on stars or a comet, stacks the result, and provides preview tools for inspection and export.</p>
 <p>The program is designed so the linear XISF/FIT output remains suitable for further processing. Most controls in the right panel affect the preview and PNG/TIFF export, not the original linear data.</p>
 <h2>1. What Astro Stacker Does</h2>
@@ -57,6 +57,7 @@ strong { color: #111827; }
 <li>Saves and loads settings profiles.</li>
 <li>Provides preview tools with histogram, curves, color controls, background balancing, and Balance.</li>
 <li>Exports linear XISF/FIT or visually adjusted PNG/TIFF.</li>
+<li>Controls one or more ASCOM Alpaca cameras and sends their exposures to a shared Live Stack folder.</li>
 <li>Can launch the PixInsight wrapper.</li>
 </ul>
 <h2>2. Quick Start for Normal Stacking</h2>
@@ -76,6 +77,21 @@ strong { color: #111827; }
 <li>After stacking, check the preview, diagnostic table, and the used/excluded frame summary.</li>
 <li>Save the result with <strong>File &gt; Save result as</strong>.</li>
 </ol>
+<h2>2A. ASCOM Alpaca Cameras and Multi-Camera Live Stack</h2>
+<p>Open <strong>Camera &gt; ASCOM Alpaca cameras...</strong>. The same window is used for one camera or for a synchronized group of cameras.</p>
+<ol>
+<li>Enter the Alpaca server address and port. The default is <code>10.42.42.1:80</code>.</li>
+<li>Click <strong>Refresh</strong> to discover available cameras.</li>
+<li>Enable <strong>Use</strong> for every camera that should take part in the sequence.</li>
+<li>Click <strong>Connect selected</strong>.</li>
+<li>Set exposure, count, interval, gain, binning, cooling, and target temperature.</li>
+<li>Select one shared output folder. Enable automatic Live Stack startup when required.</li>
+<li>Click <strong>Start synchronized sequence</strong>.</li>
+</ol>
+<p>The <strong>Camera/ID file</strong> column combines the camera name with its unique file identifier. The identifier is included in generated file names and in the FIT <code>CAMID</code> keyword, so frames from several identical cameras remain distinguishable.</p>
+<p>Each selected camera runs independently, reports its own status, and writes completed exposures into the same folder. Live Stack waits for complete files and can safely process frames arriving from several cameras at nearly the same time.</p>
+<p>All cameras must be reachable from the computer at the same time, normally through one LAN, Wi-Fi router, or multiple correctly configured network adapters. Direct camera Wi-Fi may disconnect normal Internet access. Camera discovery uses Alpaca discovery plus a direct query to the entered address.</p>
+<p>Astro Stacker accepts Alpaca JSON images and binary <code>ImageBytes</code> responses. Bayer FIT metadata supplied by the camera is preserved for automatic debayering. The interface has been tested with Pegasus SmartEye and Seestar cameras.</p>
 <h2>3. Left Panel - Stacking Controls</h2>
 <p>The left and right side panels can be collapsed with the small arrow button in</p>
 <p>the top-left corner of each panel. When a panel is hidden, only a narrow arrow</p>
@@ -232,7 +248,24 @@ strong { color: #111827; }
 </ul>
 <p>Black point and White point can be adjusted in fine <strong>0.05</strong> increments, for example to 2.25.</p>
 <h3>STF Strength</h3>
-<p>Controls the Screen Transfer Function intensity for the preview and visual PNG/TIFF export only. <strong>0</strong> gives a gentler, darker STF with more contrast, <strong>5</strong> is the standard preview, and <strong>10</strong> strongly reveals very faint structures. Black and white endpoints remain fixed; linear XISF/FIT export is unchanged.</p>
+<p>Controls the Screen Transfer Function intensity for the preview and visual PNG/TIFF export only. The displayed scale runs normally from left to right: <strong>0</strong> on the left and <strong>10</strong> on the right. Its effect is intentionally reversed: <strong>0</strong> gives the strongest STF for faint structures, <strong>5</strong> is the standard preview, and <strong>10</strong> gives the gentlest STF. Linear XISF/FIT export is unchanged.</p>
+<h3>Classic and AI DRUNet Denoising</h3>
+<p><strong>Classic</strong> uses the built-in CPU denoiser. <strong>AI DRUNet</strong> uses an ONNX neural-network model and normally produces stronger luminance and color-noise reduction.</p>
+<ul>
+<li><code>models/drunet_color.onnx</code> is the default model for RGB images.</li>
+<li><code>models/drunet_gray.onnx</code> is available for monochrome images.</li>
+<li>After the first calculation, Astro Stacker stores an adaptive noise map. Gamma, STF, contrast, color, Balance, gradient removal, and other preview controls reuse this map instead of running the neural network again.</li>
+<li>Changing the denoise strength, model, source image, or crop starts a new denoise calculation.</li>
+</ul>
+<p>ONNX Runtime prefers CoreML on macOS and CUDA or DirectML on Windows when available. Otherwise it automatically uses the CPU. CPU processing is slower but remains fully functional.</p>
+<h3>AI Star Deconvolution</h3>
+<p><strong>AI Star Deconvolution</strong> sharpens and gently reduces compact stars with the bundled Cosmic Clarity stellar ONNX model. The <strong>Star size</strong> control changes the radius of the star-only protection mask so broad galaxy and nebula structures are not processed as stars.</p>
+<ul>
+<li><code>models/cosmic_clarity_stellar.onnx</code> is selected automatically.</li>
+<li>The first calculation is cached. Strength, Star size, STF, gamma, contrast, and color changes reuse the cached model result.</li>
+<li>CoreML is preferred on macOS; CUDA or DirectML is preferred on Windows when available.</li>
+<li>The effect is applied only to the preview and visual PNG/TIFF export. Linear XISF/FIT output remains unchanged.</li>
+</ul>
 <h3>Vignette Removal</h3>
 <p>Gently brightens edges and corners. It is not a replacement for real Flat calibration, but it can help with quick visual inspection.</p>
 <h3>Synthetic Flat</h3>
@@ -240,7 +273,7 @@ strong { color: #111827; }
 <h3>Color Background Correction</h3>
 <p>Suppresses smooth color casts in the background per RGB channel. This is useful for strongly unbalanced images, such as pink or purple backgrounds from smart telescopes.</p>
 <h3>SCNR Green</h3>
-<p>Suppresses green cast. Use it only when green is visibly problematic.</p>
+<p>Gently suppresses only excess green using a Maximum Neutral method. Green moves toward the stronger red or blue channel, preserving more real green-cyan nebulosity than reducing green to the R/B average.</p>
 <h3>Contrast, Saturation, RGB</h3>
 <ul>
 <li><strong>Contrast</strong> adjusts preview contrast.</li>
@@ -272,7 +305,7 @@ strong { color: #111827; }
 <h2>9. PixInsight Wrapper</h2>
 <p>The <strong>PixInsight</strong> button opens PixInsight and runs the AS_Stacker wrapper if it is available. The wrapper can run the CLI stacker from PixInsight and open the resulting FIT file after completion.</p>
 <p>The wrapper needs a Python environment with the required packages installed.</p>
-<p>The wrapper in version 2.8 also provides the <strong>Satellite trail</strong> option and uses Star alignment + RANSAC with Median as the defaults for a new configuration.</p>
+<p>The wrapper package in version 3.0 includes the current stacking engine, the Satellite trail option, both DRUNet models, and the AI Star Deconvolution stellar model. Keep the complete <code>AS_Stacker_PI_Plugin</code> folder together. The CLI wrapper produces linear FIT output, so preview-only denoise and star deconvolution are not applied to the stacked FIT file.</p>
 <h2>10. Recommended Workflows</h2>
 <h3>Normal Deep-Sky Sequence</h3>
 <ul>
@@ -320,5 +353,24 @@ strong { color: #111827; }
 <p>This is common with rotation, dithering, or large drift. Use Turn Angle, Select crop, or crop the result later in another editor.</p>
 <h3>FIT Output Looks Dark</h3>
 <p>This is normal. FIT output is linear and needs stretching. Use Balance for preview, or process the output in PixInsight, Siril, or another astrophotography editor.</p>
+<h2>12. Installation</h2>
+<h3>Windows Source Installation</h3>
+<p>ASCOM Alpaca camera support uses standard network components and requires no additional Python package.</p>
+<ol>
+<li>Keep <code>install_astro_stacker_windows.bat</code>, <code>astro_stacker_app.py</code>, and the complete <code>models</code> folder together.</li>
+<li>Double-click <code>install_astro_stacker_windows.bat</code>.</li>
+<li>The installer creates an isolated Python environment and installs ONNX Runtime.</li>
+<li>Choose optional NVIDIA CUDA/CuPy support only on a Windows computer with a supported NVIDIA GPU and current driver.</li>
+<li>Start the program with <code>run_astro_stacker_windows.bat</code>.</li>
+</ol>
+<h3>macOS Source Installation</h3>
+<ol>
+<li>Keep <code>install_astro_stacker_macos</code>, <code>astro_stacker_app.py</code>, and the complete <code>models</code> folder together.</li>
+<li>In Terminal run <code>chmod +x install_astro_stacker_macos</code> and then <code>./install_astro_stacker_macos</code>.</li>
+<li>The installer creates an isolated Python environment and installs ONNX Runtime.</li>
+<li>Install optional PyTorch when Apple Metal/MPS stacking is required.</li>
+<li>Start the program with <code>run_astro_stacker_macos.command</code>.</li>
+</ol>
+<p>The standalone Windows installer and macOS DMG already contain both DRUNet models and the AI Star Deconvolution stellar model. They do not require a separate Python installation.</p>
 </body>
 </html>

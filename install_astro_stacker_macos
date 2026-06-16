@@ -51,7 +51,8 @@ echo "Installing Astro Stacker dependencies..."
   astropy \
   rawpy \
   xisf \
-  PySide6
+  PySide6 \
+  onnxruntime
 
 echo
 read -r -p "Install optional PyTorch for Apple Metal/MPS GPU stacking? [y/N] " INSTALL_TORCH
@@ -75,13 +76,31 @@ from astropy.io import fits
 import rawpy
 from xisf import XISF
 from PySide6.QtWidgets import QApplication
-print("Base dependencies OK")
+import onnxruntime
+print("Base dependencies and ONNX Runtime OK")
 try:
     import torch
     print("PyTorch OK:", torch.__version__)
 except Exception as exc:
     print("PyTorch not installed or not available:", exc)
 PYCODE
+
+if [ ! -f "models/drunet_color.onnx" ]; then
+  echo "ERROR: models/drunet_color.onnx was not found."
+  read -r -p "Press Enter to close..."
+  exit 1
+fi
+if [ ! -f "models/drunet_gray.onnx" ]; then
+  echo "ERROR: models/drunet_gray.onnx was not found."
+  read -r -p "Press Enter to close..."
+  exit 1
+fi
+if [ ! -f "models/cosmic_clarity_stellar.onnx" ]; then
+  echo "ERROR: models/cosmic_clarity_stellar.onnx was not found."
+  read -r -p "Press Enter to close..."
+  exit 1
+fi
+echo "DRUNet and AI Star Deconvolution models are ready."
 
 cat > run_astro_stacker_macos.command <<'EOF'
 #!/bin/bash

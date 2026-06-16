@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>Astro Stacker 2.8 - uživatelský manuál</title>
+<title>Astro Stacker 3.0 - uživatelský manuál</title>
 <style>
 @page { margin: 18mm 16mm; }
 body {
@@ -41,7 +41,7 @@ strong { color: #111827; }
 </style>
 </head>
 <body>
-<h1>Astro Stacker 2.8 - uživatelský manuál</h1>
+<h1>Astro Stacker 3.0 - uživatelský manuál</h1>
 <p>Astro Stacker slouží ke skládání astronomických snímků z DSLR, bezzrcadlovek, astronomických kamer a chytrých dalekohledů. Umí načíst sekvenci Light snímků, volitelně použít Flat/Bias/Dark kalibraci, zarovnat snímky podle hvězd nebo komety, složit výsledek a nabídnout základní úpravy náhledu pro kontrolu a export.</p>
 <p>Program pracuje tak, aby lineární XISF/FIT výstup zůstal vhodný pro další zpracování. Většina úprav v pravém panelu ovlivňuje hlavně náhled a export do obrazových formátů, ne původní lineární data.</p>
 <h2>1. Co program umí</h2>
@@ -57,6 +57,7 @@ strong { color: #111827; }
 <li>Uložení a načtení profilů nastavení.</li>
 <li>Náhled s histogramem, křivkami, barvami, vyvážením pozadí a funkcí Balance.</li>
 <li>Export lineárního XISF/FIT nebo vizuálně upraveného PNG/TIFF.</li>
+<li>Ovládání jedné nebo více ASCOM Alpaca kamer se společnou složkou pro Live Stack.</li>
 <li>Spuštění wrapperu pro PixInsight.</li>
 </ul>
 <h2>2. Rychlý postup pro běžné skládání</h2>
@@ -76,6 +77,21 @@ strong { color: #111827; }
 <li>Po dokončení zkontroluj náhled, diagnostickou tabulku a hlášení o počtu použitých/vyřazených snímků.</li>
 <li>Výsledek ulož přes <strong>File &gt; Save result as / Soubor &gt; Uložit výsledek jako</strong>.</li>
 </ol>
+<h2>2A. ASCOM Alpaca kamery a vícekamerový Live Stack</h2>
+<p>Otevři <strong>Camera &gt; ASCOM Alpaca cameras...</strong>. Stejné okno slouží pro jednu kameru i pro synchronizovanou skupinu kamer.</p>
+<ol>
+<li>Zadej adresu a port Alpaca serveru. Výchozí nastavení je <code>10.42.42.1:80</code>.</li>
+<li>Kliknutím na <strong>Refresh</strong> vyhledej dostupné kamery.</li>
+<li>Ve sloupci <strong>Use</strong> označ všechny kamery, které se mají účastnit sekvence.</li>
+<li>Klikni na <strong>Connect selected</strong>.</li>
+<li>Nastav expozici, počet snímků, interval, gain, binning, chlazení a cílovou teplotu.</li>
+<li>Vyber jednu společnou výstupní složku. Podle potřeby zapni automatické spuštění Live Stacku.</li>
+<li>Klikni na <strong>Start synchronized sequence</strong>.</li>
+</ol>
+<p>Sloupec <strong>Camera/ID file</strong> spojuje název kamery s jedinečným identifikátorem souborů. Identifikátor se ukládá do názvu vytvořeného souboru a do FIT položky <code>CAMID</code>, takže lze rozlišit snímky i z několika stejných kamer.</p>
+<p>Každá označená kamera pracuje samostatně, zobrazuje vlastní stav a ukládá dokončené expozice do stejné složky. Live Stack čeká na úplné dopsání souboru a umí bezpečně zpracovat snímky, které dorazí z více kamer téměř současně.</p>
+<p>Všechny kamery musí být z počítače dostupné současně, obvykle přes jednu LAN, Wi-Fi router nebo více správně nastavených síťových adaptérů. Přímé Wi-Fi spojení s kamerou může odpojit běžný internet. Vyhledávání používá Alpaca discovery i přímý dotaz na zadanou adresu.</p>
+<p>Astro Stacker podporuje obrazová data Alpaca JSON i binární odpověď <code>ImageBytes</code>. Bayer metadata dodaná kamerou se zachovají ve FIT souboru pro automatický debayering. Rozhraní bylo otestováno s kamerami Pegasus SmartEye a Seestar.</p>
 <h2>3. Levý panel - skládání</h2>
 <p>Levý i pravý boční panel lze schovat malou šipkou v levém horním rohu panelu.</p>
 <p>Po schování zůstane jen úzký proužek se šipkou pro opětovné zobrazení. Na</p>
@@ -229,7 +245,24 @@ strong { color: #111827; }
 </ul>
 <p>Black point a White point lze nastavovat jemně po <strong>0,05</strong>, například na hodnotu 2,25.</p>
 <h3>STF strength / Síla STF</h3>
-<p>Nastavuje intenzitu Screen Transfer Function pouze pro náhled a vizuální PNG/TIFF export. Hodnota <strong>0</strong> poskytne jemnější, tmavší STF s vyšším kontrastem, <strong>5</strong> odpovídá standardnímu náhledu a <strong>10</strong> silně vytáhne velmi slabé struktury. Černý a bílý bod zůstávají zachované; lineární XISF/FIT export se nemění.</p>
+<p>Nastavuje intenzitu Screen Transfer Function pouze pro náhled a vizuální PNG/TIFF export. Zobrazená stupnice roste běžně zleva doprava: vlevo je <strong>0</strong> a vpravo <strong>10</strong>. Účinek je záměrně obrácený: <strong>0</strong> znamená nejsilnější STF pro slabé struktury, <strong>5</strong> standardní náhled a <strong>10</strong> nejjemnější STF. Lineární XISF/FIT export se nemění.</p>
+<h3>Classic a AI DRUNet odšumění</h3>
+<p><strong>Classic</strong> používá vestavěný CPU algoritmus. <strong>AI DRUNet</strong> používá neuronový model ONNX a obvykle poskytuje výraznější potlačení jasového i barevného šumu.</p>
+<ul>
+<li><code>models/drunet_color.onnx</code> je výchozí model pro barevné RGB snímky.</li>
+<li><code>models/drunet_gray.onnx</code> je určený pro monochromatické snímky.</li>
+<li>Po prvním výpočtu Astro Stacker uloží adaptivní šumovou mapu. Gamma, STF, kontrast, barvy, Balance, odstranění gradientu a další ovladače ji znovu použijí bez opakovaného spuštění neuronové sítě.</li>
+<li>Nový výpočet se spustí při změně síly odšumění, modelu, zdrojového snímku nebo ořezu.</li>
+</ul>
+<p>ONNX Runtime na macOS přednostně používá CoreML, ve Windows CUDA nebo DirectML. Pokud GPU akcelerace není dostupná, automaticky se použije CPU. Výpočet je pomalejší, ale funkce zůstává dostupná.</p>
+<h3>AI dekonvoluce hvězd</h3>
+<p><strong>AI dekonvoluce hvězd</strong> doostří a jemně zmenší kompaktní hvězdy pomocí přiloženého stellar ONNX modelu Cosmic Clarity. Ovladač <strong>Velikost hvězd</strong> mění poloměr masky omezené pouze na hvězdy, aby se široké struktury galaxií a mlhovin nezpracovávaly jako hvězdy.</p>
+<ul>
+<li><code>models/cosmic_clarity_stellar.onnx</code> se vybere automaticky.</li>
+<li>První výpočet se uloží do cache. Síla, Velikost hvězd, STF, gamma, kontrast a barvy znovu použijí již vypočtený výsledek modelu.</li>
+<li>Na macOS se přednostně používá CoreML, ve Windows CUDA nebo DirectML, pokud jsou dostupné.</li>
+<li>Efekt se použije pouze pro náhled a vizuální PNG/TIFF export. Lineární XISF/FIT výstup zůstane beze změny.</li>
+</ul>
 <h3>Vignette removal / Odstranění vinětace</h3>
 <p>Jemně zesvětlí okraje a rohy. Není to náhrada skutečného Flat snímku, ale může pomoci pro rychlý vizuální náhled.</p>
 <h3>Synthetic flat / Umělý flat</h3>
@@ -237,7 +270,7 @@ strong { color: #111827; }
 <h3>Color background correction / Korekce barevného pozadí</h3>
 <p>Potlačuje hladký barevný závoj pozadí po RGB kanálech. Je užitečná hlavně u velmi barevně nevyvážených snímků, například růžové nebo fialové pozadí z chytrých dalekohledů.</p>
 <h3>SCNR Green</h3>
-<p>Potlačuje zelený nádech. Používej jen tehdy, pokud je zelená opravdu rušivá.</p>
+<p>Šetrně potlačuje pouze zelený přebytek metodou Maximum Neutral. Zelený kanál se přibližuje silnějšímu z červeného a modrého kanálu, takže se zachová více skutečného signálu zelenomodrých mlhovin než při stažení zelené k průměru R/B.</p>
 <h3>Contrast, Saturation, RGB</h3>
 <ul>
 <li><strong>Contrast / Kontrast</strong> mění kontrast náhledu.</li>
@@ -268,7 +301,7 @@ strong { color: #111827; }
 <h2>9. PixInsight wrapper</h2>
 <p>Tlačítko <strong>PixInsight</strong> otevře PixInsight a spustí AS_Stacker wrapper, pokud je správně dostupný. Wrapper umožňuje spustit CLI verzi stackeru přímo z PixInsightu a po dokončení otevřít výsledný FIT v PixInsightu.</p>
 <p>Pro wrapper je potřeba nastavit Python prostředí, ve kterém jsou nainstalované potřebné balíčky.</p>
-<p>Wrapper ve verzi 2.8 nabízí také volbu <strong>Satellite trail</strong> a pro nové nastavení používá jako výchozí Star alignment + RANSAC a Median.</p>
+<p>Balíček wrapperu ve verzi 3.0 obsahuje aktuální skládací jádro, volbu Satellite trail, oba DRUNet modely a stellar model pro AI dekonvoluci hvězd. Celou složku <code>AS_Stacker_PI_Plugin</code> ponech pohromadě. CLI wrapper vytváří lineární FIT výstup, proto se na složený FIT nepoužije odšumění ani dekonvoluce určená pouze pro náhled.</p>
 <h2>10. Doporučené postupy</h2>
 <h3>Běžná deep-sky sekvence</h3>
 <ul>
@@ -316,5 +349,24 @@ strong { color: #111827; }
 <p>Je to běžné u rotace, ditheringu nebo velkého driftu. Použij Turn angle, ruční výběr cropu nebo výsledek dále ořízni v externím editoru.</p>
 <h3>FIT výstup vypadá tmavě</h3>
 <p>To je normální. FIT je lineární a potřebuje stretch. Použij Balance pro náhled nebo výstup zpracuj v PixInsightu, Sirilu či jiném astrofoto editoru.</p>
+<h2>12. Instalace</h2>
+<h3>Instalace zdrojové verze ve Windows</h3>
+<p>Podpora ASCOM Alpaca kamer používá standardní síťové komponenty a nevyžaduje žádný další Python balíček.</p>
+<ol>
+<li>Ponech pohromadě <code>install_astro_stacker_windows.bat</code>, <code>astro_stacker_app.py</code> a celou složku <code>models</code>.</li>
+<li>Dvojklikem spusť <code>install_astro_stacker_windows.bat</code>.</li>
+<li>Instalátor vytvoří oddělené Python prostředí a nainstaluje ONNX Runtime.</li>
+<li>Volitelnou podporu NVIDIA CUDA/CuPy zapni jen na Windows počítači s podporovanou kartou NVIDIA a aktuálním ovladačem.</li>
+<li>Program potom spouštěj souborem <code>run_astro_stacker_windows.bat</code>.</li>
+</ol>
+<h3>Instalace zdrojové verze v macOS</h3>
+<ol>
+<li>Ponech pohromadě <code>install_astro_stacker_macos</code>, <code>astro_stacker_app.py</code> a celou složku <code>models</code>.</li>
+<li>V Terminálu spusť <code>chmod +x install_astro_stacker_macos</code> a potom <code>./install_astro_stacker_macos</code>.</li>
+<li>Instalátor vytvoří oddělené Python prostředí a nainstaluje ONNX Runtime.</li>
+<li>Volitelný PyTorch nainstaluj, pokud chceš Apple Metal/MPS akceleraci skládání.</li>
+<li>Program potom spouštěj souborem <code>run_astro_stacker_macos.command</code>.</li>
+</ol>
+<p>Samostatný Windows instalátor a macOS DMG už obsahují oba DRUNet modely i stellar model pro AI dekonvoluci hvězd. Nevyžadují samostatnou instalaci Pythonu.</p>
 </body>
 </html>
