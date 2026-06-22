@@ -13,12 +13,17 @@ set "REDIST_DIR=%PACKAGING%\redist"
 set "VCREDIST=%REDIST_DIR%\vc_redist.x64.exe"
 
 echo ============================================================
-echo Astro Stacker 3.0 - Windows installer build
+echo Astro Stacker 3.1 - Windows installer build
 echo ============================================================
 echo.
 
 if not exist "%ROOT%\astro_stacker_app.py" (
   echo ERROR: astro_stacker_app.py was not found.
+  pause
+  exit /b 1
+)
+if not exist "%ROOT%\AstroStacker_intro.png" (
+  echo ERROR: AstroStacker_intro.png was not found.
   pause
   exit /b 1
 )
@@ -42,6 +47,8 @@ if not exist "%ROOT%\MANUAL_CZ.html" goto :missing_payload
 if not exist "%ROOT%\AS_Stacker_PI_Plugin\AS_Stacker_PI.js" goto :missing_payload
 if not exist "%ROOT%\AS_Stacker_PI_Plugin\astro_stacker_cli.py" goto :missing_payload
 if not exist "%ROOT%\AS_Stacker_PI_Plugin\astro_stacker_app.py" goto :missing_payload
+if not exist "%ROOT%\AS_Stacker_PI_Plugin\MANUAL_EN.html" goto :missing_payload
+if not exist "%ROOT%\AS_Stacker_PI_Plugin\MANUAL_CZ.html" goto :missing_payload
 fc /b "%ROOT%\astro_stacker_app.py" "%ROOT%\AS_Stacker_PI_Plugin\astro_stacker_app.py" >nul
 if errorlevel 1 (
   echo ERROR: PixInsight wrapper contains an outdated astro_stacker_app.py.
@@ -219,7 +226,7 @@ if not "%INNO_RESULT%"=="0" goto :failed
 
 echo.
 echo Build complete:
-echo   %RELEASE%\AstroStacker30_Setup.exe
+echo   %RELEASE%\AstroStacker31_Setup.exe
 echo.
 pause
 exit /b 0
@@ -248,6 +255,11 @@ if errorlevel 1 (
   echo ERROR: %PAYLOAD_NAME% build does not contain cosmic_clarity_stellar.onnx.
   exit /b 1
 )
+where /r "%PAYLOAD_ROOT%" AstroStacker_intro.png >nul 2>nul
+if errorlevel 1 (
+  echo ERROR: %PAYLOAD_NAME% build does not contain AstroStacker_intro.png.
+  exit /b 1
+)
 where /r "%PAYLOAD_ROOT%" MANUAL_EN.html >nul 2>nul
 if errorlevel 1 (
   echo ERROR: %PAYLOAD_NAME% build does not contain MANUAL_EN.html.
@@ -261,6 +273,14 @@ if errorlevel 1 (
 where /r "%PAYLOAD_ROOT%" AS_Stacker_PI.js >nul 2>nul
 if errorlevel 1 (
   echo ERROR: %PAYLOAD_NAME% build does not contain the PixInsight wrapper.
+  exit /b 1
+)
+if not exist "%PAYLOAD_ROOT%\_internal\AS_Stacker_PI_Plugin\MANUAL_EN.html" (
+  echo ERROR: %PAYLOAD_NAME% wrapper does not contain MANUAL_EN.html.
+  exit /b 1
+)
+if not exist "%PAYLOAD_ROOT%\_internal\AS_Stacker_PI_Plugin\MANUAL_CZ.html" (
+  echo ERROR: %PAYLOAD_NAME% wrapper does not contain MANUAL_CZ.html.
   exit /b 1
 )
 echo %PAYLOAD_NAME% payload verification passed.

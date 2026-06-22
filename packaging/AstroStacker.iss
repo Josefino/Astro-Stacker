@@ -1,5 +1,5 @@
 #define MyAppName "Astro Stacker"
-#define MyAppVersion "3.0"
+#define MyAppVersion "3.1"
 #define MyAppPublisher "Josef Ladra"
 #define MyAppExeName "AstroStacker.exe"
 
@@ -16,7 +16,7 @@ DefaultDirName={autopf}\Astro Stacker
 DefaultGroupName=Astro Stacker
 AllowNoIcons=yes
 OutputDir=..\release
-OutputBaseFilename=AstroStacker30_Setup
+OutputBaseFilename=AstroStacker31_Setup
 SetupIconFile=icons\AstroStacker.ico
 Compression=lzma2/ultra64
 SolidCompression=yes

@@ -10,7 +10,7 @@ set "REDIST_DIR=%PACKAGING%\redist"
 set "VCREDIST=%REDIST_DIR%\vc_redist.x64.exe"
 
 echo ============================================================
-echo Astro Stacker 3.0 - create installer from existing builds
+echo Astro Stacker 3.1 - create installer from existing builds
 echo ============================================================
 echo.
 
@@ -26,6 +26,21 @@ if not exist "%DIST%\AstroStacker_CUDA\AstroStacker.exe" (
   echo ERROR: The CUDA build was not found:
   echo   %DIST%\AstroStacker_CUDA\AstroStacker.exe
   echo Run packaging\build_windows_installer.bat first.
+  pause
+  exit /b 1
+)
+
+where /r "%DIST%\AstroStacker_CPU" AstroStacker_intro.png >nul 2>nul
+if errorlevel 1 (
+  echo ERROR: The CPU build does not contain AstroStacker_intro.png.
+  echo Rebuild with packaging\build_windows_installer.bat.
+  pause
+  exit /b 1
+)
+where /r "%DIST%\AstroStacker_CUDA" AstroStacker_intro.png >nul 2>nul
+if errorlevel 1 (
+  echo ERROR: The CUDA build does not contain AstroStacker_intro.png.
+  echo Rebuild with packaging\build_windows_installer.bat.
   pause
   exit /b 1
 )
@@ -71,7 +86,7 @@ if "%ISCC%"=="" (
   exit /b 2
 )
 
-echo Creating AstroStacker30_Setup.exe...
+echo Creating AstroStacker31_Setup.exe...
 pushd "%PACKAGING%"
 "%ISCC%" "AstroStacker.iss"
 set "INNO_RESULT=%ERRORLEVEL%"
@@ -85,7 +100,7 @@ if not "%INNO_RESULT%"=="0" (
 
 echo.
 echo Installer created successfully:
-echo   %RELEASE%\AstroStacker30_Setup.exe
+echo   %RELEASE%\AstroStacker31_Setup.exe
 echo.
 pause
 exit /b 0

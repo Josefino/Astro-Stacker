@@ -15,7 +15,7 @@ English overview:
 - handles monochrome and Bayer XISF/FIT/FITS data; Auto mode debayers only
   when explicit Bayer/CFA metadata are present
 - provides preview adjustments, background tools, zoom, flips, rotations,
-  visual PNG/TIFF export, and linear unstretched FIT/FITS export
+  visual PNG/JPG/TIFF export, and linear unstretched FIT/FITS export
 - supports CPU multiprocessing and optional NVIDIA CUDA/CuPy or Apple
   Metal/MPS acceleration with an automatic CPU fallback
 
@@ -33,7 +33,7 @@ Cesky prehled:
 - rozlisuje monochromaticke a Bayer XISF/FIT/FITS snimky; rezim Auto
   debayeruje jen pri nalezeni explicitnich Bayer/CFA metadat
 - nabizi upravy nahledu, nastroje pro pozadi, zoom, flipy, rotace, vizualni
-  PNG/TIFF export a linearni nestretchovany FIT/FITS export
+  PNG/JPG/TIFF export a linearni nestretchovany FIT/FITS export
 - podporuje CPU multiprocessing a volitelnou NVIDIA CUDA/CuPy nebo Apple
   Metal/MPS akceleraci s automatickym fallbackem na CPU
 
@@ -80,7 +80,7 @@ from PIL import Image
 
 
 LOG_PATH: Optional[Path] = None
-APP_VERSION = "3.0"
+APP_VERSION = "3.1"
 LITE_BUILD = os.environ.get("ASTRO_STACKER_LITE", "").strip() == "1"
 APP_DISPLAY_VERSION = f"{APP_VERSION} Lite" if LITE_BUILD else APP_VERSION
 GITHUB_RELEASES_API_URL = "https://api.github.com/repos/Josefino/Astro-Stacker/releases/latest"
@@ -355,7 +355,7 @@ try:
     from xisf import XISF
 except ImportError:
     XISF = None
-from PySide6.QtCore import QEventLoop, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QEventLoop, QPoint, QPointF, QRectF, QSize, QSettings, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDesktopServices, QIcon, QImage, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
@@ -378,7 +378,9 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QSizePolicy,
+    QSplashScreen,
     QSpinBox,
+    QTabWidget,
     QAbstractItemView,
     QHeaderView,
     QTableWidget,
@@ -475,6 +477,19 @@ class ArrowDoubleSpinBox(QDoubleSpinBox):
         painter.setBrush(color)
         painter.setPen(Qt.NoPen)
         cx = self.width() - 12
+        if self.objectName() == "sliderValueBox":
+            cy = self.height() // 2
+            painter.drawPolygon(QPolygon([
+                QPoint(cx - 5, cy - 4),
+                QPoint(cx + 5, cy - 4),
+                QPoint(cx, cy - 11),
+            ]))
+            painter.drawPolygon(QPolygon([
+                QPoint(cx - 5, cy + 4),
+                QPoint(cx + 5, cy + 4),
+                QPoint(cx, cy + 11),
+            ]))
+            return
         up_y = max(7, self.height() // 4)
         down_y = min(self.height() - 7, (self.height() * 3) // 4)
         painter.drawPolygon(QPolygon([
@@ -570,6 +585,12 @@ class StackSettings:
     output_dir: Optional[str] = None  # volitelná výstupní složka pro CLI/wrapper režimy s více soubory
     use_gpu: bool = False                  # optional CUDA/CuPy or Apple Metal/MPS acceleration for stacking
     use_aligned_cache: bool = False         # cache zarovnaných snímků; default vypnuto kvůli I/O brzdě při alignmentu
+    live_stack_reject_outliers: bool = True   # online kappa-sigma rejection jednotlivých pixelů v Live stacku (letadla, satelity, kosmické záření)
+    live_stack_reject_sigma: float = 3.0      # práh odmítnutí pro Live stack (násobek průběžné směrodatné odchylky)
+    live_stack_reject_min_frames: int = 4     # počet úvodních snímků bez odmítání, než se ustálí průběžný odhad šumu
+    live_stack_reject_elongated_stars: bool = True  # vyřadí celý Live stack snímek s výrazně protaženými hvězdami
+    live_stack_min_roundness: float = 0.50  # minor/major; 0.50 odpovídá elongaci cca 2:1
+    live_stack_min_shape_stars: int = 8  # minimum spolehlivě změřených hvězd pro kontrolu elongace
     language: str = "en"
 
 
@@ -577,7 +598,7 @@ class StackSettings:
 class StretchSettings:
     black: int = 0
     white: int = 65535
-    gamma: float = 1.0
+    gamma: float = 1.5
     stf_strength: float = 5.0
     vignette_removal: float = 0.0
     synthetic_flat: float = 0.0
@@ -588,7 +609,7 @@ class StretchSettings:
     star_deconvolution_strength: float = 0.0
     star_deconvolution_size: float = 5.0
     star_deconvolution_model_path: Optional[str] = None
-    contrast: float = 1.0
+    contrast: float = 2.1
     saturation: float = 1.0
     red: float = 1.0
     green: float = 1.0
@@ -1012,12 +1033,12 @@ def bayer_pattern_for_fits_path(path: Path, override: Optional[str] = None) -> O
 
 
 def report_bayer_conversion_if_needed(path: Path, progress_callback, progress_value: int = 0) -> None:
-    """Zobrazí informaci, že tento konkrétní FIT se bude debayerovat."""
+    """Zobrazí informaci, že tento konkrétní FIT projde raw načtením, kalibrací a debayeringem."""
     if not progress_callback:
         return
     pattern = bayer_pattern_for_fits_path(path)
     if pattern:
-        progress_callback(progress_value, f"Konvertuji z Bayer masky {pattern}: {Path(path).name}")
+        progress_callback(progress_value, f"Načítám/kalibruji/debayeruji Bayer {pattern}")
 
 
 def format_elapsed(seconds: float) -> str:
@@ -1638,15 +1659,65 @@ def load_calibrated_image_as_float(
     dark: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Load and calibrate before debayering when raw sensor data are available."""
+    total_start = time.perf_counter()
+    sensor_start = time.perf_counter()
     sensor = load_sensor_mosaic_as_float(path)
+    sensor_elapsed = time.perf_counter() - sensor_start
     if sensor is not None:
         mosaic, pattern = sensor
+        calibration_start = time.perf_counter()
         calibrated_mosaic = calibrate_sensor_mosaic(mosaic, flat, bias, dark)
+        calibration_elapsed = time.perf_counter() - calibration_start
         if calibrated_mosaic is not None:
-            return debayer_sensor_mosaic_to_rgb_float(calibrated_mosaic, pattern)
+            debayer_start = time.perf_counter()
+            result = debayer_sensor_mosaic_to_rgb_float(calibrated_mosaic, pattern)
+            debayer_elapsed = time.perf_counter() - debayer_start
+            log_debug(
+                "Bayer load/calibrate/debayer "
+                f"{Path(path).name}: pattern={pattern} "
+                f"load={sensor_elapsed:.3f}s "
+                f"calibrate={calibration_elapsed:.3f}s "
+                f"debayer={debayer_elapsed:.3f}s "
+                f"total={time.perf_counter() - total_start:.3f}s "
+                f"shape={result.shape} "
+                f"dark={dark is not None} flat={flat is not None} bias={bias is not None}"
+            )
+            return result
 
+    load_start = time.perf_counter()
     img = load_image_as_float(path)
-    return calibrate_light_frame(img, flat, bias, dark)
+    load_elapsed = time.perf_counter() - load_start
+    calibration_start = time.perf_counter()
+    result = calibrate_light_frame(img, flat, bias, dark)
+    calibration_elapsed = time.perf_counter() - calibration_start
+    log_debug(
+        "Image load/calibrate "
+        f"{Path(path).name}: sensor_probe={sensor_elapsed:.3f}s "
+        f"load={load_elapsed:.3f}s "
+        f"calibrate={calibration_elapsed:.3f}s "
+        f"total={time.perf_counter() - total_start:.3f}s "
+        f"shape={result.shape} "
+        f"dark={dark is not None} flat={flat is not None} bias={bias is not None}"
+    )
+    return result
+
+
+def load_stack_frame_for_settings(
+    path: Path,
+    settings: StackSettings,
+    flat: Optional[np.ndarray] = None,
+    bias: Optional[np.ndarray] = None,
+    dark: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Load a frame for stacking while respecting calibration-master mode."""
+    if getattr(settings, "align_mode", "") == "calibration":
+        sensor = load_sensor_mosaic_as_float(path)
+        if sensor is not None:
+            return np.ascontiguousarray(sensor[0].astype(np.float32))
+        if Path(path).suffix.lower() in FITS_EXTENSIONS:
+            return load_calibration_master_fit(path, preserve_mosaic=True)
+        return load_image_as_float(path)
+    return load_calibrated_image_as_float(path, flat, bias, dark)
 
 
 
@@ -2126,18 +2197,23 @@ def match_stars_nearest(reference_pts: np.ndarray, moving_pts: np.ndarray, initi
         return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
 
     moving_pred = transform_points(moving_pts, initial_matrix)
+    max_d2 = max_distance * max_distance
+
+    ref_arr = np.asarray(reference_pts, dtype=np.float32)
+    pred_arr = np.asarray(moving_pred, dtype=np.float32)
+    diff = pred_arr[:, None, :] - ref_arr[None, :, :]
+    d2 = np.einsum("mri,mri->mr", diff, diff, optimize=True)
+    nearest_idx = np.argmin(d2, axis=1)
+    nearest_d2 = d2[np.arange(len(pred_arr)), nearest_idx]
 
     ref_used = set()
     src = []
     dst = []
-    max_d2 = max_distance * max_distance
 
     # Řadíme od jasnějších hvězd, protože detect_stars vrací body podle jasu.
-    for i, pred in enumerate(moving_pred):
-        diff = reference_pts - pred
-        d2 = np.sum(diff * diff, axis=1)
-        j = int(np.argmin(d2))
-        if float(d2[j]) <= max_d2 and j not in ref_used:
+    for i, j_raw in enumerate(nearest_idx):
+        j = int(j_raw)
+        if float(nearest_d2[i]) <= max_d2 and j not in ref_used:
             ref_used.add(j)
             src.append(moving_pts[i])
             dst.append(reference_pts[j])
@@ -2146,6 +2222,13 @@ def match_stars_nearest(reference_pts: np.ndarray, moving_pts: np.ndarray, initi
         return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
 
     return np.array(src, dtype=np.float32), np.array(dst, dtype=np.float32)
+
+
+def _star_affine_match_is_excellent(inliers: int, ratio: float, matches: int, ref_count: int, mov_count: int) -> bool:
+    """Return True when a candidate is strong enough to skip the remaining search."""
+    available = max(1, min(int(ref_count), int(mov_count)))
+    min_inliers = max(16, min(70, int(round(available * 0.35))))
+    return int(inliers) >= min_inliers and int(matches) >= min_inliers and float(ratio) >= 0.82
 
 
 def _fit_star_affine_candidate(ref_pts: np.ndarray, mov_pts: np.ndarray, initial_small: np.ndarray, max_distance: float) -> Tuple[Optional[np.ndarray], int, float, int]:
@@ -2562,11 +2645,14 @@ def estimate_star_affine_detailed(reference_gray: np.ndarray, moving_gray: np.nd
     best_inliers = 0
     best_ratio = 0.0
     best_matches = 0
+    candidate_tests = 0
+    stop_search = False
 
     for cand in candidates:
         # Nejdřív užší radius, potom širší. Širší zachrání velký drift, užší snižuje falešné páry.
         radii = (min(22.0, search_radius), min(55.0, search_radius), search_radius)
         for radius in dict.fromkeys(float(r) for r in radii):
+            candidate_tests += 1
             matrix_small, inliers, ratio, matches = _fit_star_affine_candidate(ref_pts, mov_pts, cand, max_distance=radius)
             score = inliers * max(0.2, ratio)
             if matrix_small is not None and score > best_score:
@@ -2575,6 +2661,49 @@ def estimate_star_affine_detailed(reference_gray: np.ndarray, moving_gray: np.nd
                 best_inliers = inliers
                 best_ratio = ratio
                 best_matches = matches
+                if _star_affine_match_is_excellent(inliers, ratio, matches, len(ref_pts), len(mov_pts)):
+                    stop_search = True
+                    break
+        if stop_search:
+            break
+
+    flip_180_used = False
+    if best_matrix_small is None or best_inliers < 7 or best_ratio < 0.28:
+        # Běžný rozsah úhlů výše pokrývá jen -90..+90°, takže meridian flip mountu
+        # (typicky přesně ~180° otočení pole) jím neprojde. Než to vzdáme, zkusíme
+        # cíleně jen kandidáty kolem 180° - znovu použijeme už nalezené hvězdné body,
+        # takže to nestojí žádnou další detekci hvězd, jen pár dalších RANSAC fitů.
+        flip_candidates: List[np.ndarray] = []
+        for delta_angle in (0.0, -6.0, -3.0, 3.0, 6.0):
+            rot_flip = centered_rotation_matrix(ref_small.shape, 180.0 + delta_angle)
+            flip_candidates.append(rot_flip)
+            if offset_initial is not None:
+                rot_flip_shift = rot_flip.copy()
+                rot_flip_shift[:, 2] += offset_initial[:, 2]
+                flip_candidates.append(rot_flip_shift.astype(np.float32))
+            for offset_candidate in (offset_candidates + coarse_offset_candidates)[:8]:
+                rot_flip_shift = rot_flip.copy()
+                rot_flip_shift[:, 2] += offset_candidate[:, 2]
+                flip_candidates.append(rot_flip_shift.astype(np.float32))
+
+        for cand in flip_candidates:
+            radii = (min(22.0, search_radius), min(55.0, search_radius), search_radius)
+            for radius in dict.fromkeys(float(r) for r in radii):
+                candidate_tests += 1
+                matrix_small, inliers, ratio, matches = _fit_star_affine_candidate(ref_pts, mov_pts, cand, max_distance=radius)
+                score = inliers * max(0.2, ratio)
+                if matrix_small is not None and score > best_score:
+                    best_matrix_small = matrix_small
+                    best_score = score
+                    best_inliers = inliers
+                    best_ratio = ratio
+                    best_matches = matches
+                    flip_180_used = True
+                    if _star_affine_match_is_excellent(inliers, ratio, matches, len(ref_pts), len(mov_pts)):
+                        stop_search = True
+                        break
+            if stop_search:
+                break
 
     if best_matrix_small is None or best_inliers < 7 or best_ratio < 0.28:
         # U star alignmentu je bezpečnější použít čistý hrubý posun než ECC, které se na slabých EAA datech
@@ -2585,6 +2714,7 @@ def estimate_star_affine_detailed(reference_gray: np.ndarray, moving_gray: np.nd
             "inliers": int(best_inliers),
             "inlier_ratio": float(best_ratio),
             "matches": int(best_matches),
+            "candidate_tests": int(candidate_tests),
         }
 
     matrix = best_matrix_small.astype(np.float32).copy()
@@ -2599,6 +2729,11 @@ def estimate_star_affine_detailed(reference_gray: np.ndarray, moving_gray: np.nd
     mapped_cy = c * cx + d * cy + float(matrix[1, 2])
     center_shift = math.hypot(mapped_cx - cx, mapped_cy - cy)
     max_allowed_center_shift = max(float(max_shift_px) * 1.6, max(w, h) * 0.35)
+    # Po 180° flipu je posun středu pole typicky výrazně větší než běžný "max_star_shift"
+    # (mount po meridian flipu zacílí na stejný objekt, ale rám i kabeláž se otočí),
+    # takže pro tento případ povolíme větší toleranci posunu.
+    if flip_180_used:
+        max_allowed_center_shift = max(max_allowed_center_shift, max(w, h) * 0.75)
 
     if approx_scale < 0.85 or approx_scale > 1.18 or center_shift > max_allowed_center_shift:
         return initial, "fallback_sanity_failed", {
@@ -2609,6 +2744,7 @@ def estimate_star_affine_detailed(reference_gray: np.ndarray, moving_gray: np.nd
             "matches": int(best_matches),
             "scale": float(approx_scale),
             "center_shift": float(center_shift),
+            "candidate_tests": int(candidate_tests),
         }
 
     return matrix.astype(np.float32), "ransac", {
@@ -2619,8 +2755,11 @@ def estimate_star_affine_detailed(reference_gray: np.ndarray, moving_gray: np.nd
         "matches": int(best_matches),
         "scale": float(approx_scale),
         "center_shift": float(center_shift),
+        "candidate_tests": int(candidate_tests),
         "matrix": matrix.astype(np.float32).tolist(),
+        "flip_180": flip_180_used,
     }
+
 
 
 def estimate_star_affine(reference_gray: np.ndarray, moving_gray: np.ndarray, scale: float, max_shift_px: int = 180, border_margin_px: int = 40, strict_star_filter: bool = True, allow_fallback: bool = True) -> Optional[np.ndarray]:
@@ -4749,7 +4888,15 @@ def prepare_stack_paths(folder: Path, settings: StackSettings, progress_callback
             raise ValueError("Ve složce nezbyly žádné light snímky. Zkontroluj, zda nejsou soubory označené jako Dark/Bias/Flat.")
     light_paths = list(paths)
 
-    need_scores = settings.auto_reference or settings.quality_filter or bool(getattr(settings, "satellite_trail_filter", False))
+    is_calibration_stack = settings.align_mode == "calibration"
+    need_scores = (
+        not is_calibration_stack
+        and (
+            settings.auto_reference
+            or settings.quality_filter
+            or bool(getattr(settings, "satellite_trail_filter", False))
+        )
+    )
     scores: Dict[Path, float] = {}
     metrics: Dict[Path, Dict[str, float]] = {}
 
@@ -4774,7 +4921,9 @@ def prepare_stack_paths(folder: Path, settings: StackSettings, progress_callback
 
     manual_ref = Path(settings.manual_comet_reference_path) if settings.manual_comet_reference_path else None
     manual_stack_ref = Path(settings.manual_reference_path) if getattr(settings, "manual_reference_path", None) else None
-    if settings.align_mode == "comet" and settings.manual_comet_xy is not None and manual_ref in paths:
+    if is_calibration_stack:
+        reference_path = paths[0]
+    elif settings.align_mode == "comet" and settings.manual_comet_xy is not None and manual_ref in paths:
         # U kometárního dvoubodového zarovnání musí být reference přesně ten snímek,
         # ve kterém uživatel označil první polohu komety.
         reference_path = manual_ref
@@ -4791,7 +4940,7 @@ def prepare_stack_paths(folder: Path, settings: StackSettings, progress_callback
         else:
             reference_path = paths[0]
 
-    if settings.quality_filter and len(paths) > 3:
+    if not is_calibration_stack and settings.quality_filter and len(paths) > 3:
         keep_percent = max(10, min(100, int(settings.keep_percent)))
         keep_count = max(3, int(round(len(paths) * keep_percent / 100.0)))
         ranked = sorted(paths, key=lambda p: scores.get(p, -1.0), reverse=True)
@@ -4845,7 +4994,7 @@ def prepare_stack_paths(folder: Path, settings: StackSettings, progress_callback
             }
             for p in all_paths
         },
-        "quality_filter": bool(settings.quality_filter and len(all_paths) > 3),
+        "quality_filter": bool(not is_calibration_stack and settings.quality_filter and len(all_paths) > 3),
         "keep_percent": int(getattr(settings, "keep_percent", 100)),
     }
     return paths, reference_path, scores
@@ -5036,7 +5185,6 @@ def stack_folder_star_with_comet_positions(folder: Path, settings: StackSettings
     paths, reference_path, scores, sequence_paths = prepare_paths_for_alignment_mode(folder, star_settings, progress_callback)
 
     report_bayer_conversion_if_needed(reference_path, progress_callback, 0)
-    report_bayer_conversion_if_needed(reference_path, progress_callback, 0)
     reference = load_calibrated_image_as_float(reference_path, flat_frame, bias_frame, dark_frame)
     h, w = reference.shape[:2]
     reference_gray = to_gray_float(reference)
@@ -5047,7 +5195,6 @@ def stack_folder_star_with_comet_positions(folder: Path, settings: StackSettings
     total = len(paths)
 
     for idx, path in enumerate(paths):
-        report_bayer_conversion_if_needed(path, progress_callback, 10 + int((idx + 1) / total * 60))
         report_bayer_conversion_if_needed(path, progress_callback, 10 + int((idx + 1) / total * 60))
         img = load_calibrated_image_as_float(path, flat_frame, bias_frame, dark_frame)
         if img.shape[:2] != (h, w):
@@ -5060,6 +5207,8 @@ def stack_folder_star_with_comet_positions(folder: Path, settings: StackSettings
             warped = img
         else:
             moving_gray = to_gray_float(img)
+            if progress_callback:
+                progress_callback(10 + int((idx + 1) / total * 60), f"Zarovnávám hvězdy ({idx + 1}/{total}): {path.name}")
             matrix = estimate_star_affine(
                 reference_gray,
                 moving_gray,
@@ -5083,7 +5232,7 @@ def stack_folder_star_with_comet_positions(folder: Path, settings: StackSettings
 
         aligned.append(warped)
         if progress_callback:
-            progress_callback(10 + int((idx + 1) / total * 60), f"Zarovnávám hvězdy ({idx + 1}/{total}): {path.name}")
+            progress_callback(10 + int((idx + 1) / total * 60), f"Zarovnáno hvězdně ({idx + 1}/{total}): {path.name}")
 
     if not aligned:
         raise ValueError("Žádný snímek neprošel zarovnáním. Zkontroluj, zda složka Light neobsahuje Dark/Bias snímky nebo zda jsou ve snímcích detekovatelné hvězdy.")
@@ -5254,24 +5403,29 @@ def prepare_output_fits_header(source_header=None, stack_info: Optional[Dict[str
             except Exception:
                 pass
 
-    # Po debayeringu/stacku už výstup není raw Bayer mozaika.
-    for key in (
-        "BAYERPAT", "BAYER_PATTERN", "BAYER", "PATTERN",
-        "CFA", "CFA_PAT", "CFA_PATTERN", "CFAPAT",
-        "FILTERPAT", "FILTER_PATTERN",
-    ):
-        if key in header:
-            try:
-                del header[key]
-            except Exception:
-                pass
+    preserve_bayer_header = bool(stack_info and stack_info.get("align_mode") == "calibration")
+    if not preserve_bayer_header:
+        # Po debayeringu/stacku už výstup není raw Bayer mozaika.
+        for key in (
+            "BAYERPAT", "BAYER_PATTERN", "BAYER", "PATTERN",
+            "CFA", "CFA_PAT", "CFA_PATTERN", "CFAPAT",
+            "FILTERPAT", "FILTER_PATTERN",
+        ):
+            if key in header:
+                try:
+                    del header[key]
+                except Exception:
+                    pass
 
     header["CREATOR"] = "Astro Stacker GUI"
     header["BUNIT"] = "normalized"
     header["STACKED"] = (True, "Created by Astro Stacker GUI")
     header["HISTORY"] = "Linear unstretched stack exported by Astro Stacker GUI"
     header["HISTORY"] = "Original FITS header was preserved where possible"
-    header["HISTORY"] = "RGB channel order is R,G,B when NAXIS3=3"
+    if preserve_bayer_header:
+        header["HISTORY"] = "Calibration stack exported without debayering"
+    else:
+        header["HISTORY"] = "RGB channel order is R,G,B when NAXIS3=3"
 
     if stack_info:
         mapping = {
@@ -5476,7 +5630,10 @@ def selected_satellite_trail_paths() -> set:
 def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) -> Optional[np.ndarray]:
     CALIBRATION_SIGNATURE_CACHE.clear()
     set_bayer_pattern_override(getattr(settings, "bayer_pattern", "auto"))
-    flat_frame, bias_frame, dark_frame = load_calibration_frames(settings, progress_callback)
+    if settings.align_mode == "calibration":
+        flat_frame, bias_frame, dark_frame = None, None, None
+    else:
+        flat_frame, bias_frame, dark_frame = load_calibration_frames(settings, progress_callback)
     if settings.align_mode == "comet_merge":
         stack_star_and_comet_two_outputs(
             folder,
@@ -5492,10 +5649,10 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
     if bool(getattr(settings, "satellite_trail_filter", False)):
         LAST_STACK_SELECTION["satellite_masked_paths"] = sorted(satellite_trail_paths)
 
-    reference = load_calibrated_image_as_float(reference_path, flat_frame, bias_frame, dark_frame)
+    reference = load_stack_frame_for_settings(reference_path, settings, flat_frame, bias_frame, dark_frame)
     h, w = reference.shape[:2]
     reference_gray = to_gray_float(reference)
-    reference_median = np.median(reference.reshape(-1, 3), axis=0)
+    reference_median = np.median(reference.reshape(-1, 3), axis=0) if reference.ndim == 3 else float(np.median(reference))
 
     aligned: List[np.ndarray] = []
     mosaic_records: List[Tuple[Path, np.ndarray, np.ndarray, Optional[np.ndarray]]] = []
@@ -5513,7 +5670,7 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
                     progress_callback(10 + int((idx + 1) / total * 60), f"Zarovnáno z cache ({idx + 1}/{total}): {path.name}")
                 continue
 
-        img = load_calibrated_image_as_float(path, flat_frame, bias_frame, dark_frame)
+        img = load_stack_frame_for_settings(path, settings, flat_frame, bias_frame, dark_frame)
         if img.shape[:2] != (h, w):
             img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
         trail_mask = None
@@ -5532,6 +5689,8 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
             matrix = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
         else:
             moving_gray = to_gray_float(img)
+            if progress_callback:
+                progress_callback(10 + int((idx + 1) / total * 60), f"Zarovnávám ({idx + 1}/{total}): {path.name}")
             if settings.align_mode == "comet":
                 if settings.manual_comet_xy is not None and predicted_xy is not None:
                     matrix = comet_alignment_matrix_with_optional_refine(reference_gray, moving_gray, settings, predicted_xy)
@@ -5558,20 +5717,20 @@ def stack_folder(folder: Path, settings: StackSettings, progress_callback=None) 
         if not getattr(settings, "mosaic_mode", False):
             warped = apply_warped_exclusion_mask(warped, trail_mask, matrix, (h, w))
 
-        if settings.normalize_background and not getattr(settings, "mosaic_mode", False):
+        if settings.normalize_background and settings.align_mode != "calibration" and not getattr(settings, "mosaic_mode", False):
             warped = normalize_background(warped, reference_median)
         if path != reference_path and settings.align_mode != "calibration":
             save_aligned_frame_cache(path, reference_path, settings, predicted_xy, warped)
 
         if getattr(settings, "mosaic_mode", False):
-            if settings.normalize_background:
+            if settings.normalize_background and settings.align_mode != "calibration":
                 img = normalize_background(img, reference_median)
             mosaic_records.append((path, img, matrix, trail_mask))
         else:
             aligned.append(warped)
         used_paths.append(path)
         if progress_callback:
-            progress_callback(10 + int((idx + 1) / total * 60), f"Zarovnávám ({idx + 1}/{total}): {path.name}")
+            progress_callback(10 + int((idx + 1) / total * 60), f"Zarovnáno ({idx + 1}/{total}): {path.name}")
 
     if getattr(settings, "mosaic_mode", False):
         aligned = warp_mosaic_records(mosaic_records, (h, w), progress_callback)
@@ -5629,7 +5788,7 @@ def apply_scnr_green(img: np.ndarray, strength: int = 0) -> np.ndarray:
 
 
 def apply_vignette_removal(img: np.ndarray, strength: float = 0.0) -> np.ndarray:
-    """Jednoduchá radiální korekce vinětace pro vizuální náhled a PNG/TIFF export."""
+    """Jednoduchá radiální korekce vinětace pro vizuální náhled a PNG/JPG/TIFF export."""
     amount = max(0.0, min(1.0, float(strength)))
     if amount <= 1e-6:
         return img
@@ -5659,7 +5818,7 @@ def apply_vignette_removal(img: np.ndarray, strength: float = 0.0) -> np.ndarray
 
 
 def apply_synthetic_flat(img: np.ndarray, strength: float = 0.0) -> np.ndarray:
-    """Synthetic flat z hladkého modelu pozadí pro náhled a PNG/TIFF export."""
+    """Synthetic flat z hladkého modelu pozadí pro náhled a PNG/JPG/TIFF export."""
     amount = max(0.0, min(1.0, float(strength)))
     if amount <= 1e-6:
         return img
@@ -6477,6 +6636,11 @@ def apply_drunet_onnx(
 
 def apply_stretch(img: np.ndarray, s: StretchSettings) -> np.ndarray:
     out = img.astype(np.float32).copy()
+    mono_visual = out.ndim == 2 or (out.ndim == 3 and out.shape[2] == 1)
+    if out.ndim == 2:
+        out = np.repeat(out[..., None], 3, axis=2)
+    elif out.ndim == 3 and out.shape[2] == 1:
+        out = np.repeat(out, 3, axis=2)
 
     out = apply_vignette_removal(out, getattr(s, "vignette_removal", 0.0))
     out = apply_synthetic_flat(out, getattr(s, "synthetic_flat", 0.0))
@@ -6501,10 +6665,11 @@ def apply_stretch(img: np.ndarray, s: StretchSettings) -> np.ndarray:
     out = (out - 0.5) * s.contrast + 0.5
     out = np.clip(out, 0, 1)
 
-    # RGB balance
-    out[..., 0] *= s.red
-    out[..., 1] *= s.green
-    out[..., 2] *= s.blue
+    if not mono_visual:
+        # RGB balance
+        out[..., 0] *= s.red
+        out[..., 1] *= s.green
+        out[..., 2] *= s.blue
 
     # Preserve highlight structure after RGB/Balance gains. A hard per-channel
     # clip turns bright galaxy nuclei into a flat white or colored patch as soon
@@ -6523,17 +6688,18 @@ def apply_stretch(img: np.ndarray, s: StretchSettings) -> np.ndarray:
         out *= scale[..., None]
     out = np.clip(out, 0, 1)
 
-    # SCNR Green — astro potlačení zeleného nádechu po RGB balance.
-    out = apply_scnr_green(out, getattr(s, "scnr_green_strength", 0))
+    if not mono_visual:
+        # SCNR Green — astro potlačení zeleného nádechu po RGB balance.
+        out = apply_scnr_green(out, getattr(s, "scnr_green_strength", 0))
 
-    # Saturation in floating-point HSV. Keep the processing pipeline at
-    # float32 precision; uint8 conversion belongs only to the final GUI/PNG
-    # output and would otherwise reduce even 16-bit TIFF exports to 256 levels.
-    hsv = cv2.cvtColor(np.ascontiguousarray(out.astype(np.float32)), cv2.COLOR_RGB2HSV)
-    hsv[..., 1] *= s.saturation
-    hsv[..., 1] = np.clip(hsv[..., 1], 0.0, 1.0)
-    out = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB).astype(np.float32)
-    out = np.clip(out, 0.0, 1.0)
+        # Saturation in floating-point HSV. Keep the processing pipeline at
+        # float32 precision; uint8 conversion belongs only to the final GUI/PNG
+        # output and would otherwise reduce even 16-bit TIFF exports to 256 levels.
+        hsv = cv2.cvtColor(np.ascontiguousarray(out.astype(np.float32)), cv2.COLOR_RGB2HSV)
+        hsv[..., 1] *= s.saturation
+        hsv[..., 1] = np.clip(hsv[..., 1], 0.0, 1.0)
+        out = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB).astype(np.float32)
+        out = np.clip(out, 0.0, 1.0)
     if getattr(s, "denoise_mode", "classic") != "drunet":
         out = apply_astro_denoise(out, getattr(s, "denoise_strength", 0.0))
     return out
@@ -6545,7 +6711,11 @@ def numpy_to_qpixmap(img: np.ndarray, max_size: Optional[Tuple[int, int]] = None
     - max_size: fit-to-window mode
     - zoom: fixed zoom mode, e.g. 1.0 = 100 % / 1:1
     """
-    img8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+    img8 = visual_float_to_uint8(img)
+    if img8.ndim == 2:
+        img8 = np.repeat(img8[..., None], 3, axis=2)
+    elif img8.ndim == 3 and img8.shape[2] == 1:
+        img8 = np.repeat(img8, 3, axis=2)
     h, w, ch = img8.shape
     qimg = QImage(img8.data, w, h, ch * w, QImage.Format_RGB888).copy()
     pixmap = QPixmap.fromImage(qimg)
@@ -6559,6 +6729,24 @@ def numpy_to_qpixmap(img: np.ndarray, max_size: Optional[Tuple[int, int]] = None
     new_w = max(1, int(w * zoom))
     new_h = max(1, int(h * zoom))
     return pixmap.scaled(new_w, new_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+
+def visual_float_to_uint8(img: np.ndarray) -> np.ndarray:
+    """Shared visual 8-bit conversion for preview, PNG and JPEG export."""
+    return np.clip(
+        np.rint(np.clip(np.asarray(img, dtype=np.float32), 0.0, 1.0) * 255.0),
+        0,
+        255,
+    ).astype(np.uint8)
+
+
+def visual_float_to_uint16(img: np.ndarray) -> np.ndarray:
+    """Shared visual 16-bit conversion for TIFF export."""
+    return np.clip(
+        np.rint(np.clip(np.asarray(img, dtype=np.float32), 0.0, 1.0) * 65535.0),
+        0,
+        65535,
+    ).astype(np.uint16)
 
 
 def make_histogram_pixmap(img: np.ndarray, width: int = 280, height: int = 120) -> QPixmap:
@@ -7020,8 +7208,9 @@ def process_single_image_mp(args: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
         if cached_warped is not None and cached_warped.shape[:2] == (h, w):
             return str(path), np.clip(cached_warped, 0, 1).astype(np.float32)
 
-    img = load_calibrated_image_as_float(
+    img = load_stack_frame_for_settings(
         path,
+        settings,
         args.get("flat_frame", context.get("flat_frame")),
         args.get("bias_frame", context.get("bias_frame")),
         args.get("dark_frame", context.get("dark_frame")),
@@ -7066,10 +7255,10 @@ def process_single_image_mp(args: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
     if not getattr(settings, "mosaic_mode", False):
         warped = apply_warped_exclusion_mask(warped, trail_mask, matrix, (h, w))
 
-    if settings.normalize_background and not getattr(settings, "mosaic_mode", False):
+    if settings.normalize_background and settings.align_mode != "calibration" and not getattr(settings, "mosaic_mode", False):
         warped = normalize_background(warped, reference_median)
     if getattr(settings, "mosaic_mode", False):
-        if settings.normalize_background:
+        if settings.normalize_background and settings.align_mode != "calibration":
             img = normalize_background(img, reference_median)
         return str(path), np.clip(img, 0, 1).astype(np.float32), np.asarray(matrix, dtype=np.float32), trail_mask
     if path != reference_path and settings.align_mode != "calibration":
@@ -7081,7 +7270,10 @@ def process_single_image_mp(args: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
 def stack_folder_multiprocessing(folder: Path, settings: StackSettings, processes: int, progress_callback=None) -> Optional[np.ndarray]:
     CALIBRATION_SIGNATURE_CACHE.clear()
     set_bayer_pattern_override(getattr(settings, "bayer_pattern", "auto"))
-    flat_frame, bias_frame, dark_frame = load_calibration_frames(settings, progress_callback)
+    if settings.align_mode == "calibration":
+        flat_frame, bias_frame, dark_frame = None, None, None
+    else:
+        flat_frame, bias_frame, dark_frame = load_calibration_frames(settings, progress_callback)
     if settings.align_mode == "comet_merge":
         stack_star_and_comet_two_outputs(
             folder,
@@ -7099,11 +7291,12 @@ def stack_folder_multiprocessing(folder: Path, settings: StackSettings, processe
 
     cv2.setNumThreads(1)
 
-    report_bayer_conversion_if_needed(reference_path, progress_callback, 0)
-    reference = load_calibrated_image_as_float(reference_path, flat_frame, bias_frame, dark_frame)
+    if settings.align_mode != "calibration":
+        report_bayer_conversion_if_needed(reference_path, progress_callback, 0)
+    reference = load_stack_frame_for_settings(reference_path, settings, flat_frame, bias_frame, dark_frame)
     h, w = reference.shape[:2]
     reference_gray = to_gray_float(reference)
-    reference_median = np.median(reference.reshape(-1, 3), axis=0)
+    reference_median = np.median(reference.reshape(-1, 3), axis=0) if reference.ndim == 3 else float(np.median(reference))
 
     total = len(paths)
     requested_processes = max(1, min(int(processes), total))
@@ -7115,12 +7308,16 @@ def stack_folder_multiprocessing(folder: Path, settings: StackSettings, processe
             progress_callback(5, f"CPU alignment procesy: {requested_processes} -> {processes}")
 
     if progress_callback:
-        bayer_files = [(path, bayer_pattern_for_fits_path(path)) for path in paths]
-        bayer_files = [(path, pattern) for path, pattern in bayer_files if pattern]
-        if bayer_files:
-            preview_names = ", ".join(f"{path.name} ({pattern})" for path, pattern in bayer_files[:3])
-            suffix = "…" if len(bayer_files) > 3 else ""
-            progress_callback(5, f"Konvertuji z Bayer masky: {preview_names}{suffix}")
+        bayer_patterns = sorted(
+            {
+                pattern
+                for path in paths
+                for pattern in [bayer_pattern_for_fits_path(path)]
+                if pattern
+            }
+        )
+        bayer_suffix = f", Bayer {'/'.join(bayer_patterns)}" if bayer_patterns else ""
+        progress_callback(5, f"Načítám a zarovnávám snímky paralelně{bayer_suffix}...")
 
     worker_context = {
         "reference_path": str(reference_path),
@@ -7161,7 +7358,7 @@ def stack_folder_multiprocessing(folder: Path, settings: StackSettings, processe
                 aligned.append(warped)
             used_paths.append(Path(used_path))
             if progress_callback:
-                progress_callback(10 + int((idx + 1) / total * 60), f"Zarovnávám paralelně ({idx + 1}/{total}): {name}")
+                progress_callback(10 + int((idx + 1) / total * 60), f"Zarovnáno paralelně ({idx + 1}/{total}): {name}")
         if progress_callback:
             progress_callback(72, "Dokoncuji paralelni alignment...")
 
@@ -7826,6 +8023,9 @@ class StackWorker(QThread):
             ("Hodnotim kvalitu", "Scoring quality"),
             ("Zarovnáno z cache", "Aligned from cache"),
             ("Zarovnano z cache", "Aligned from cache"),
+            ("Zarovnáno paralelně", "Aligned in parallel"),
+            ("Zarovnáno hvězdně", "Star aligned"),
+            ("Zarovnáno", "Aligned"),
             ("Zarovnávám paralelně", "Aligning in parallel"),
             ("Zarovnavam paralelne", "Aligning in parallel"),
             ("Dokoncuji paralelni alignment", "Finishing parallel alignment"),
@@ -7864,6 +8064,10 @@ class StackWorker(QThread):
             ("radku", "rows"),
             ("vlaken", "threads"),
             ("Časy", "Times"),
+            ("Načítám a zarovnávám snímky paralelně", "Loading and aligning frames in parallel"),
+            ("Načítám a zarovnávám snímky", "Loading and aligning frames"),
+            ("Načítám/kalibruji/debayeruji Bayer snímky", "Loading/calibrating/debayering Bayer frames"),
+            ("Načítám/kalibruji/debayeruji Bayer", "Loading/calibrating/debayering Bayer"),
             ("debayering/načtení", "debayering/loading"),
             ("debayering+alignment", "debayering+alignment"),
             ("alignment", "alignment"),
@@ -7935,7 +8139,6 @@ class StackWorker(QThread):
             if getattr(self.settings, "language", "cz") == "en":
                 message = self._translate_progress_message(message)
             self.failed.emit(message)
-
 
 class FrameAnalysisWorker(QThread):
     progress = Signal(int, str)
@@ -8457,13 +8660,87 @@ class AlpacaCaptureWorker(QThread):
 
 
 class AlpacaCameraDialog(QDialog):
+    CAMERA_TRANSLATIONS = {
+        "cz": {
+            "window_title": "Camera - ASCOM Alpaca Multi Camera",
+            "alpaca_server": "Alpaca server",
+            "discover": "Najít",
+            "cameras": "Kamery",
+            "refresh": "Obnovit",
+            "select_all": "Vybrat vše",
+            "select_none": "Zrušit výběr",
+            "table_use": "Použít",
+            "table_camera_id": "Camera/ID file",
+            "table_server": "Alpaca server",
+            "table_status": "Stav",
+            "connect_selected": "Připojit vybrané",
+            "disconnect_selected": "Odpojit vybrané",
+            "connect_remaining": "Připojit zbývající",
+            "disconnect_all": "Odpojit vše",
+            "all_selected_connected": "Vše vybrané připojeno",
+            "selected_disconnected": "Vybrané odpojeno",
+            "connecting_selected": "Připojuji vybrané...",
+            "exposure": "Expozice",
+            "gain": "Gain",
+            "unchanged": "Beze změny",
+            "cooler": "Chlazení",
+            "apply": "Použít",
+            "sensor_temperature": "Teplota senzoru",
+            "current_temperature": "Aktuální: -- °C",
+            "current_temperature_value": "Aktuální: {value:.1f} °C",
+            "current_temperature_unavailable": "Aktuální: nedostupná",
+            "binning": "Binning",
+            "frames": "Snímky",
+            "interval": "Interval",
+            "live_stack_folder": "Složka Live stack",
+            "select": "Vybrat",
+            "auto_live": "Automaticky spustit Live stack",
+            "start_sequence": "Spustit synchronizovanou sérii",
+            "stop_all": "Zastavit vše",
+            "initial_status": "Zadej Alpaca server a stiskni Obnovit.",
+            "disconnected": "Odpojeno",
+            "connected": "Připojeno",
+            "connecting": "Připojuji...",
+            "disconnecting": "Odpojuji...",
+            "error": "Chyba",
+            "settings_applied": "Nastavení použito",
+            "settings_error": "Chyba nastavení",
+            "starting": "Startuji...",
+            "stopping": "Zastavuji...",
+            "completed": "Dokončeno",
+            "stopped": "Zastaveno",
+            "no_server_discovered": "Nebyl nalezen žádný Alpaca server. Zkontroluj, že je počítač připojený k Wi-Fi kamery.",
+            "discovered_cameras": "Nalezeno {cameras} Alpaca kamer na {servers} serverech.",
+            "found_servers_no_cameras": "Nalezeno {servers} Alpaca serverů, ale žádný nehlásí kameru.",
+            "discovery_failed": "Vyhledání Alpaca selhalo: {error}",
+            "select_camera_first": "Nejprve vyber alespoň jednu Alpaca kameru.",
+            "found_cameras": "Nalezeno {count} Alpaca kamer.",
+            "no_cameras_reported": "Tento server nehlásí žádné Alpaca kamery.",
+            "cameras_connected": "{count} kamer připojeno.",
+            "cameras_disconnected": "{count} kamer odpojeno.",
+            "settings_applied_to": "Nastavení použito pro {count} kamer.",
+            "select_folder_title": "Vybrat složku Live stack",
+            "select_output_folder": "Vyber výstupní složku.",
+            "started_sequence": "Spuštěna synchronizovaná série na {count} kamerách.",
+            "stopping_all": "Zastavuji všechny kamery po dokončení aktuální operace...",
+            "starting_exposure": "Spouštím expozici",
+            "exposing": "Exponuji",
+            "downloading_exposure": "Stahuji expozici",
+            "saved": "Uloženo",
+            "saved_status": "{name}: uloženo {file}; Live stack ho zařadí do fronty.",
+            "all_completed": "Všechny kamerové série dokončeny.",
+            "sequence_stopped": "Multi-camera série zastavena.",
+        },
+        "en": {},
+    }
+
     def __init__(self, main_window: "AstroStackerWindow"):
         super().__init__(main_window)
         self.main_window = main_window
         self.capture_workers: Dict[str, AlpacaCaptureWorker] = {}
         self.camera_states: Dict[str, bool] = {}
         self.camera_progress: Dict[str, int] = {}
-        self.setWindowTitle("Camera - ASCOM Alpaca Multi Camera")
+        self.setWindowTitle(self.tr_cam("window_title", "Camera - ASCOM Alpaca Multi Camera"))
         self.setMinimumWidth(720)
         self.setModal(False)
 
@@ -8478,19 +8755,19 @@ class AlpacaCameraDialog(QDialog):
         server_row.setContentsMargins(0, 0, 0, 0)
         server_row.addWidget(self.host_edit, 1)
         server_row.addWidget(self.port_spin)
-        self.discover_btn = QPushButton("Discover")
+        self.discover_btn = QPushButton(self.tr_cam("discover", "Discover"))
         self.discover_btn.clicked.connect(self.discover_cameras)
         server_row.addWidget(self.discover_btn)
         server_widget = QWidget()
         server_widget.setLayout(server_row)
-        connection_form.addRow("Alpaca server", server_widget)
+        connection_form.addRow(self.tr_cam("alpaca_server", "Alpaca server"), server_widget)
 
         camera_buttons = QHBoxLayout()
         camera_buttons.setContentsMargins(0, 0, 0, 0)
-        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn = QPushButton(self.tr_cam("refresh", "Refresh"))
         self.refresh_btn.clicked.connect(self.refresh_cameras)
-        self.select_all_btn = QPushButton("Select all")
-        self.select_none_btn = QPushButton("Select none")
+        self.select_all_btn = QPushButton(self.tr_cam("select_all", "Select all"))
+        self.select_none_btn = QPushButton(self.tr_cam("select_none", "Select none"))
         self.select_all_btn.clicked.connect(lambda: self.set_all_cameras_checked(True))
         self.select_none_btn.clicked.connect(lambda: self.set_all_cameras_checked(False))
         camera_buttons.addWidget(self.refresh_btn)
@@ -8499,12 +8776,17 @@ class AlpacaCameraDialog(QDialog):
         camera_buttons.addStretch(1)
         camera_buttons_widget = QWidget()
         camera_buttons_widget.setLayout(camera_buttons)
-        connection_form.addRow("Cameras", camera_buttons_widget)
+        connection_form.addRow(self.tr_cam("cameras", "Cameras"), camera_buttons_widget)
         layout.addLayout(connection_form)
 
         self.camera_table = QTableWidget(0, 4)
         self.camera_table.setHorizontalHeaderLabels(
-            ["Use", "Camera/ID file", "Alpaca server", "Status"]
+            [
+                self.tr_cam("table_use", "Use"),
+                self.tr_cam("table_camera_id", "Camera/ID file"),
+                self.tr_cam("table_server", "Alpaca server"),
+                self.tr_cam("table_status", "Status"),
+            ]
         )
         self.camera_table.verticalHeader().setVisible(False)
         self.camera_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -8519,8 +8801,8 @@ class AlpacaCameraDialog(QDialog):
         layout.addWidget(self.camera_table)
 
         connect_row = QHBoxLayout()
-        self.connect_btn = QPushButton("Connect selected")
-        self.disconnect_btn = QPushButton("Disconnect selected")
+        self.connect_btn = QPushButton(self.tr_cam("connect_selected", "Connect selected"))
+        self.disconnect_btn = QPushButton(self.tr_cam("disconnect_selected", "Disconnect selected"))
         self.connect_btn.clicked.connect(lambda: self.set_connected(True))
         self.disconnect_btn.clicked.connect(lambda: self.set_connected(False))
         connect_row.addWidget(self.connect_btn)
@@ -8533,69 +8815,69 @@ class AlpacaCameraDialog(QDialog):
         self.exposure_spin.setDecimals(3)
         self.exposure_spin.setValue(10.0)
         self.exposure_spin.setSuffix(" s")
-        capture_form.addRow("Exposure", self.exposure_spin)
+        capture_form.addRow(self.tr_cam("exposure", "Exposure"), self.exposure_spin)
 
         self.gain_spin = ArrowSpinBox()
         self.gain_spin.setRange(-1, 100000)
         self.gain_spin.setValue(-1)
-        self.gain_spin.setSpecialValueText("Unchanged")
-        capture_form.addRow("Gain", self.gain_spin)
+        self.gain_spin.setSpecialValueText(self.tr_cam("unchanged", "Unchanged"))
+        capture_form.addRow(self.tr_cam("gain", "Gain"), self.gain_spin)
 
         temperature_row = QHBoxLayout()
-        self.cooler_check = QCheckBox("Cooler")
+        self.cooler_check = QCheckBox(self.tr_cam("cooler", "Cooler"))
         self.target_temperature_spin = ArrowDoubleSpinBox()
         self.target_temperature_spin.setRange(-80.0, 40.0)
         self.target_temperature_spin.setDecimals(1)
         self.target_temperature_spin.setValue(-10.0)
         self.target_temperature_spin.setSuffix(" °C")
-        self.apply_camera_settings_btn = QPushButton("Apply")
+        self.apply_camera_settings_btn = QPushButton(self.tr_cam("apply", "Apply"))
         self.apply_camera_settings_btn.clicked.connect(self.apply_camera_settings)
         temperature_row.addWidget(self.cooler_check)
         temperature_row.addWidget(self.target_temperature_spin)
         temperature_row.addWidget(self.apply_camera_settings_btn)
         temperature_widget = QWidget()
         temperature_widget.setLayout(temperature_row)
-        capture_form.addRow("Sensor temperature", temperature_widget)
+        capture_form.addRow(self.tr_cam("sensor_temperature", "Sensor temperature"), temperature_widget)
 
-        self.current_temperature_label = QLabel("Current: -- °C")
+        self.current_temperature_label = QLabel(self.tr_cam("current_temperature", "Current: -- °C"))
         capture_form.addRow("", self.current_temperature_label)
 
         self.bin_spin = ArrowSpinBox()
         self.bin_spin.setRange(1, 16)
         self.bin_spin.setValue(1)
-        capture_form.addRow("Binning", self.bin_spin)
+        capture_form.addRow(self.tr_cam("binning", "Binning"), self.bin_spin)
 
         self.count_spin = ArrowSpinBox()
         self.count_spin.setRange(1, 100000)
         self.count_spin.setValue(10)
-        capture_form.addRow("Frames", self.count_spin)
+        capture_form.addRow(self.tr_cam("frames", "Frames"), self.count_spin)
 
         self.interval_spin = ArrowDoubleSpinBox()
         self.interval_spin.setRange(0.0, 3600.0)
-        self.interval_spin.setValue(0.5)
+        self.interval_spin.setValue(5.0)
         self.interval_spin.setSuffix(" s")
-        capture_form.addRow("Interval", self.interval_spin)
+        capture_form.addRow(self.tr_cam("interval", "Interval"), self.interval_spin)
 
         folder_row = QHBoxLayout()
         self.folder_edit = QLineEdit(
             str(main_window.folder) if main_window.folder is not None else ""
         )
-        self.folder_btn = QPushButton("Select")
+        self.folder_btn = QPushButton(self.tr_cam("select", "Select"))
         self.folder_btn.clicked.connect(self.choose_output_folder)
         folder_row.addWidget(self.folder_edit, 1)
         folder_row.addWidget(self.folder_btn)
         folder_widget = QWidget()
         folder_widget.setLayout(folder_row)
-        capture_form.addRow("Live stack folder", folder_widget)
+        capture_form.addRow(self.tr_cam("live_stack_folder", "Live stack folder"), folder_widget)
         layout.addLayout(capture_form)
 
-        self.auto_live_check = QCheckBox("Start Live stacking automatically")
+        self.auto_live_check = QCheckBox(self.tr_cam("auto_live", "Start Live stacking automatically"))
         self.auto_live_check.setChecked(True)
         layout.addWidget(self.auto_live_check)
 
         action_row = QHBoxLayout()
-        self.start_btn = QPushButton("Start synchronized sequence")
-        self.stop_btn = QPushButton("Stop all")
+        self.start_btn = QPushButton(self.tr_cam("start_sequence", "Start synchronized sequence"))
+        self.stop_btn = QPushButton(self.tr_cam("stop_all", "Stop all"))
         self.stop_btn.setEnabled(False)
         self.start_btn.clicked.connect(self.start_sequence)
         self.stop_btn.clicked.connect(self.stop_sequence)
@@ -8605,10 +8887,36 @@ class AlpacaCameraDialog(QDialog):
 
         self.progress = QProgressBar()
         layout.addWidget(self.progress)
-        self.status_label = QLabel("Enter the Alpaca server and press Refresh.")
+        self.status_label = QLabel(self.tr_cam("initial_status", "Enter the Alpaca server and press Refresh."))
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         self.update_connection_indicator(False)
+
+    def tr_cam(self, key: str, fallback: str, **kwargs) -> str:
+        lang = getattr(self.main_window, "language", "en")
+        text = self.CAMERA_TRANSLATIONS.get(lang, {}).get(key, fallback)
+        if kwargs:
+            try:
+                return text.format(**kwargs)
+            except Exception:
+                return text
+        return text
+
+    def camera_status_text(self, text: str) -> str:
+        mapping = {
+            "Disconnected": self.tr_cam("disconnected", "Disconnected"),
+            "Connected": self.tr_cam("connected", "Connected"),
+            "Connecting...": self.tr_cam("connecting", "Connecting..."),
+            "Disconnecting...": self.tr_cam("disconnecting", "Disconnecting..."),
+            "Error": self.tr_cam("error", "Error"),
+            "Settings applied": self.tr_cam("settings_applied", "Settings applied"),
+            "Settings error": self.tr_cam("settings_error", "Settings error"),
+            "Starting...": self.tr_cam("starting", "Starting..."),
+            "Stopping...": self.tr_cam("stopping", "Stopping..."),
+            "Completed": self.tr_cam("completed", "Completed"),
+            "Stopped": self.tr_cam("stopped", "Stopped"),
+        }
+        return mapping.get(str(text), str(text))
 
     @staticmethod
     def camera_key(host: str, port: int, device_number: int) -> str:
@@ -8653,7 +8961,7 @@ class AlpacaCameraDialog(QDialog):
         self.camera_table.setItem(row, 0, use_item)
         self.camera_table.setItem(row, 1, QTableWidgetItem(str(name)))
         self.camera_table.setItem(row, 2, QTableWidgetItem(f"{host}:{int(port)}"))
-        status_item = QTableWidgetItem("Disconnected")
+        status_item = QTableWidgetItem(self.tr_cam("disconnected", "Disconnected"))
         status_item.setForeground(QBrush(QColor("#ef4444")))
         self.camera_table.setItem(row, 3, status_item)
         self.camera_states[key] = False
@@ -8704,7 +9012,7 @@ class AlpacaCameraDialog(QDialog):
                 continue
             item = self.camera_table.item(entry["row"], 3)
             if item is not None:
-                item.setText(text)
+                item.setText(self.camera_status_text(text))
                 item.setForeground(QBrush(QColor(color)))
             break
         if connected is not None:
@@ -8722,10 +9030,10 @@ class AlpacaCameraDialog(QDialog):
         if all(states):
             self.update_connection_indicator(True)
         elif any(states):
-            self.connect_btn.setText("Connect remaining")
+            self.connect_btn.setText(self.tr_cam("connect_remaining", "Connect remaining"))
             self.connect_btn.setEnabled(True)
             self.connect_btn.setStyleSheet("font-weight: 600; padding: 6px 12px;")
-            self.disconnect_btn.setText("Disconnect all")
+            self.disconnect_btn.setText(self.tr_cam("disconnect_all", "Disconnect all"))
             self.disconnect_btn.setEnabled(True)
             self.disconnect_btn.setStyleSheet(
                 """
@@ -8747,7 +9055,7 @@ class AlpacaCameraDialog(QDialog):
     ):
         base_style = "font-weight: 600; padding: 6px 12px;"
         if connected is True:
-            self.connect_btn.setText("All selected connected")
+            self.connect_btn.setText(self.tr_cam("all_selected_connected", "All selected connected"))
             self.connect_btn.setEnabled(False)
             self.connect_btn.setStyleSheet(
                 base_style
@@ -8759,14 +9067,14 @@ class AlpacaCameraDialog(QDialog):
                 }
                 """
             )
-            self.disconnect_btn.setText("Disconnect selected")
+            self.disconnect_btn.setText(self.tr_cam("disconnect_selected", "Disconnect selected"))
             self.disconnect_btn.setEnabled(True)
             self.disconnect_btn.setStyleSheet(base_style)
         elif connected is False:
-            self.connect_btn.setText("Connect selected")
+            self.connect_btn.setText(self.tr_cam("connect_selected", "Connect selected"))
             self.connect_btn.setEnabled(True)
             self.connect_btn.setStyleSheet(base_style)
-            self.disconnect_btn.setText("Selected disconnected")
+            self.disconnect_btn.setText(self.tr_cam("selected_disconnected", "Selected disconnected"))
             self.disconnect_btn.setEnabled(False)
             self.disconnect_btn.setStyleSheet(
                 base_style
@@ -8779,7 +9087,7 @@ class AlpacaCameraDialog(QDialog):
                 """
             )
         else:
-            self.connect_btn.setText("Connecting selected...")
+            self.connect_btn.setText(self.tr_cam("connecting_selected", "Connecting selected..."))
             self.connect_btn.setEnabled(False)
             self.connect_btn.setStyleSheet(
                 base_style
@@ -8791,7 +9099,7 @@ class AlpacaCameraDialog(QDialog):
                 }
                 """
             )
-            self.disconnect_btn.setText("Disconnect selected")
+            self.disconnect_btn.setText(self.tr_cam("disconnect_selected", "Disconnect selected"))
             self.disconnect_btn.setEnabled(False)
             self.disconnect_btn.setStyleSheet(base_style)
 
@@ -8805,8 +9113,10 @@ class AlpacaCameraDialog(QDialog):
             )
             if not servers:
                 self.status_label.setText(
-                    "No Alpaca server was discovered. Check that the computer is "
-                    "connected to the camera Wi-Fi."
+                    self.tr_cam(
+                        "no_server_discovered",
+                        "No Alpaca server was discovered. Check that the computer is connected to the camera Wi-Fi.",
+                    )
                 )
                 return
 
@@ -8834,17 +9144,27 @@ class AlpacaCameraDialog(QDialog):
             if total_cameras:
                 self.refresh_connection_indicator()
                 self.status_label.setText(
-                    f"Discovered {total_cameras} Alpaca camera(s) on "
-                    f"{len(servers)} server(s)."
+                    self.tr_cam(
+                        "discovered_cameras",
+                        "Discovered {cameras} Alpaca camera(s) on {servers} server(s).",
+                        cameras=total_cameras,
+                        servers=len(servers),
+                    )
                 )
             elif errors:
                 self.status_label.setText(errors[0])
             else:
                 self.status_label.setText(
-                    f"Found {len(servers)} Alpaca server(s), but none reported a camera."
+                    self.tr_cam(
+                        "found_servers_no_cameras",
+                        "Found {servers} Alpaca server(s), but none reported a camera.",
+                        servers=len(servers),
+                    )
                 )
         except Exception as exc:
-            self.status_label.setText(f"Alpaca discovery failed: {exc}")
+            self.status_label.setText(
+                self.tr_cam("discovery_failed", "Alpaca discovery failed: {error}", error=exc)
+            )
         finally:
             QApplication.restoreOverrideCursor()
             self.discover_btn.setEnabled(True)
@@ -8853,7 +9173,7 @@ class AlpacaCameraDialog(QDialog):
     def current_client_and_device(self) -> Tuple[AlpacaClient, int]:
         entries = self.camera_entries()
         if not entries:
-            raise RuntimeError("Select at least one Alpaca camera first.")
+            raise RuntimeError(self.tr_cam("select_camera_first", "Select at least one Alpaca camera first."))
         entry = entries[0]
         return (
             AlpacaClient(entry["host"], entry["port"]),
@@ -8878,9 +9198,13 @@ class AlpacaCameraDialog(QDialog):
                 )
             if cameras:
                 self.refresh_connection_indicator()
-                self.status_label.setText(f"Found {len(cameras)} Alpaca camera(s).")
+                self.status_label.setText(
+                    self.tr_cam("found_cameras", "Found {count} Alpaca camera(s).", count=len(cameras))
+                )
             else:
-                self.status_label.setText("No Alpaca cameras were reported by this server.")
+                self.status_label.setText(
+                    self.tr_cam("no_cameras_reported", "No Alpaca cameras were reported by this server.")
+                )
         except Exception as exc:
             self.status_label.setText(str(exc))
         finally:
@@ -8911,7 +9235,7 @@ class AlpacaCameraDialog(QDialog):
         try:
             entries = self.camera_entries()
             if not entries:
-                raise RuntimeError("Select at least one Alpaca camera first.")
+                raise RuntimeError(self.tr_cam("select_camera_first", "Select at least one Alpaca camera first."))
             failures = []
             for index, entry in enumerate(entries):
                 client = AlpacaClient(entry["host"], entry["port"])
@@ -8952,8 +9276,11 @@ class AlpacaCameraDialog(QDialog):
                 self.status_label.setText("; ".join(failures))
             else:
                 self.status_label.setText(
-                    f"{len(entries)} camera(s) "
-                    f"{'connected' if connected else 'disconnected'}."
+                    self.tr_cam(
+                        "cameras_connected" if connected else "cameras_disconnected",
+                        "{count} camera(s) connected." if connected else "{count} camera(s) disconnected.",
+                        count=len(entries),
+                    )
                 )
         except Exception as exc:
             self.status_label.setText(str(exc))
@@ -8983,10 +9310,14 @@ class AlpacaCameraDialog(QDialog):
             pass
         try:
             temperature = float(client.camera_get(device_number, "ccdtemperature"))
-            self.current_temperature_label.setText(f"Current: {temperature:.1f} °C")
+            self.current_temperature_label.setText(
+                self.tr_cam("current_temperature_value", "Current: {value:.1f} °C", value=temperature)
+            )
             details.append(f"sensor {temperature:.1f} °C")
         except Exception:
-            self.current_temperature_label.setText("Current: unavailable")
+            self.current_temperature_label.setText(
+                self.tr_cam("current_temperature_unavailable", "Current: unavailable")
+            )
         try:
             cooler_on = bool(client.camera_get(device_number, "cooleron"))
             self.cooler_check.setChecked(cooler_on)
@@ -9004,7 +9335,7 @@ class AlpacaCameraDialog(QDialog):
         try:
             entries = self.camera_entries()
             if not entries:
-                raise RuntimeError("Select at least one Alpaca camera first.")
+                raise RuntimeError(self.tr_cam("select_camera_first", "Select at least one Alpaca camera first."))
             failures = []
             for index, entry in enumerate(entries):
                 client = AlpacaClient(entry["host"], entry["port"])
@@ -9047,7 +9378,11 @@ class AlpacaCameraDialog(QDialog):
                 self.status_label.setText("; ".join(failures))
             else:
                 self.status_label.setText(
-                    f"Settings applied to {len(entries)} camera(s)."
+                    self.tr_cam(
+                        "settings_applied_to",
+                        "Settings applied to {count} camera(s).",
+                        count=len(entries),
+                    )
                 )
         except Exception as exc:
             self.status_label.setText(str(exc))
@@ -9057,7 +9392,7 @@ class AlpacaCameraDialog(QDialog):
     def choose_output_folder(self):
         selected = QFileDialog.getExistingDirectory(
             self,
-            "Select Live stack folder",
+            self.tr_cam("select_folder_title", "Select Live stack folder"),
             self.folder_edit.text(),
         )
         if selected:
@@ -9069,10 +9404,10 @@ class AlpacaCameraDialog(QDialog):
         try:
             entries = self.camera_entries()
             if not entries:
-                raise RuntimeError("Select at least one Alpaca camera first.")
+                raise RuntimeError(self.tr_cam("select_camera_first", "Select at least one Alpaca camera first."))
             output_folder_text = self.folder_edit.text().strip()
             if not output_folder_text:
-                raise RuntimeError("Select an output folder.")
+                raise RuntimeError(self.tr_cam("select_output_folder", "Select an output folder."))
             output_folder = Path(output_folder_text).expanduser()
             output_folder.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
@@ -9145,7 +9480,11 @@ class AlpacaCameraDialog(QDialog):
         for worker in list(self.capture_workers.values()):
             worker.start()
         self.status_label.setText(
-            f"Started synchronized sequence on {len(entries)} camera(s)."
+            self.tr_cam(
+                "started_sequence",
+                "Started synchronized sequence on {count} camera(s).",
+                count=len(entries),
+            )
         )
 
     def stop_sequence(self):
@@ -9155,8 +9494,20 @@ class AlpacaCameraDialog(QDialog):
                 self.set_camera_status(key, "Stopping...", "#f59e0b")
             self.stop_btn.setEnabled(False)
             self.status_label.setText(
-                "Stopping all cameras after their current operation..."
+                self.tr_cam("stopping_all", "Stopping all cameras after their current operation...")
             )
+
+    def translate_capture_message(self, message: str) -> str:
+        text = str(message or "")
+        replacements = [
+            ("Starting exposure", self.tr_cam("starting_exposure", "Starting exposure")),
+            ("Downloading exposure", self.tr_cam("downloading_exposure", "Downloading exposure")),
+            ("Saved", self.tr_cam("saved", "Saved")),
+        ]
+        for source, target in replacements:
+            if text.startswith(source):
+                return target + text[len(source):]
+        return text
 
     def on_capture_progress(
         self,
@@ -9172,14 +9523,24 @@ class AlpacaCameraDialog(QDialog):
         ]
         if active_values:
             self.progress.setValue(round(sum(active_values) / len(active_values)))
-        short_message = message.replace("Starting exposure", "Exposing")
+        display_message = self.translate_capture_message(message)
+        short_message = display_message.replace(
+            self.tr_cam("starting_exposure", "Starting exposure"),
+            self.tr_cam("exposing", "Exposing"),
+        )
         self.set_camera_status(key, short_message, "#60a5fa", progress=value)
-        self.status_label.setText(f"{name}: {message}")
+        self.status_label.setText(f"{name}: {display_message}")
 
     def on_frame_saved(self, key: str, name: str, path: str):
-        self.set_camera_status(key, f"Saved {Path(path).name}", "#22c55e")
+        file_name = Path(path).name
+        self.set_camera_status(key, f"{self.tr_cam('saved', 'Saved')} {file_name}", "#22c55e")
         self.status_label.setText(
-            f"{name}: saved {Path(path).name}; Live stack will queue it."
+            self.tr_cam(
+                "saved_status",
+                "{name}: saved {file}; Live stack will queue it.",
+                name=name,
+                file=file_name,
+            )
         )
 
     def on_capture_failed(self, key: str, name: str, message: str):
@@ -9207,9 +9568,9 @@ class AlpacaCameraDialog(QDialog):
                 value >= 100 for value in self.camera_progress.values()
             ):
                 self.progress.setValue(100)
-                self.status_label.setText("All camera sequences completed.")
+                self.status_label.setText(self.tr_cam("all_completed", "All camera sequences completed."))
             else:
-                self.status_label.setText("Multi-camera sequence stopped.")
+                self.status_label.setText(self.tr_cam("sequence_stopped", "Multi-camera sequence stopped."))
 
     def closeEvent(self, event):
         if self.capture_workers:
@@ -9224,7 +9585,7 @@ class AstroStackerWindow(QMainWindow):
         "cz": {
             "window_title": f"Astro Stacker {APP_DISPLAY_VERSION} - skládání astronomických snímků",
             "settings": "Setup", "folder_none": "Složka: nevybrána", "choose_folder": "Vybrat složku",
-            "open_image": "Otevřít obrázek/FIT", "language": "Jazyk", "align": "Zarovnání",
+            "open_image": "Otevřít obrázek", "language": "Jazyk", "align": "Zarovnání",
             "pixinsight": "PixInsight",
             "pixinsight_tooltip": "Otevře PixInsight a zaregistruje AS_Stacker wrapper do menu Script > Utilities.",
             "stacking": "Skládání", "max_images": "Max. snímků", "sigma": "Sigma",
@@ -9297,6 +9658,12 @@ class AstroStackerWindow(QMainWindow):
             "show_left_panel": "Zobrazit levý panel",
             "hide_right_panel": "Skrýt pravý panel",
             "show_right_panel": "Zobrazit pravý panel",
+            "tab_setting": "Setting",
+            "tab_stars_alignment": "Stars Alignment",
+            "tab_comet_alignment": "Comet Alignment",
+            "tab_color": "Barva",
+            "tab_correction": "Korekce",
+            "tab_ai_tools": "AI tools",
             "curves": "Křivky / barvy / kontrast", "stf_strength": "Síla STF",
             "stf_strength_tooltip": "0 = silné STF pro velmi slabé snímky; 5 = standardní náhled; 10 = jemné STF.",
             "auto_stretch": "Balance",
@@ -9317,10 +9684,10 @@ class AstroStackerWindow(QMainWindow):
             "onnxruntime_missing_title": "Chybí ONNX Runtime",
             "onnxruntime_missing_message": "Pro AI DRUNet nainstaluj balíček onnxruntime.",
             "drunet_model_selected": "DRUNet model nastaven: {name}",
-            "drunet_tooltip": "AI odšumění přes DRUNet ONNX. Na macOS preferuje CoreML, ve Windows CUDA nebo DirectML. Model pracuje jen s vizuálním náhledem a PNG/TIFF exportem.",
+            "drunet_tooltip": "AI odšumění přes DRUNet ONNX. Na macOS preferuje CoreML, ve Windows CUDA nebo DirectML. Model pracuje jen s vizuálním náhledem a PNG/JPG/TIFF exportem.",
             "star_deconvolution": "AI dekonvoluce hvězd",
             "star_deconvolution_size": "Velikost hvězd",
-            "star_deconvolution_tooltip": "Doostří a zmenší hvězdy pomocí stellar modelu Cosmic Clarity. Ovlivňuje pouze náhled a PNG/TIFF export; lineární FIT zůstává beze změny.",
+            "star_deconvolution_tooltip": "Doostří a zmenší hvězdy pomocí stellar modelu Cosmic Clarity. Ovlivňuje pouze náhled a PNG/JPG/TIFF export; lineární FIT zůstává beze změny.",
             "select_stellar_model": "Vybrat",
             "select_stellar_title": "Vybrat Cosmic Clarity stellar ONNX model",
             "stellar_model_missing_title": "Chybí stellar ONNX model",
@@ -9373,7 +9740,7 @@ class AstroStackerWindow(QMainWindow):
             "continue_stack": "Pokračovat ve skládání",
             "reference_cannot_exclude": "Referenční snímek nelze vyřadit. Nejprve vyber jinou referenci.",
             "choose_images_folder": "Vybrat složku se snímky",
-            "open_image_title": "Otevřít obrázek/FIT",
+            "open_image_title": "Otevřít obrázek",
             "all_files": "Všechny soubory",
             "metadata": "Metadata",
             "theme": "Motiv",
@@ -9399,7 +9766,7 @@ class AstroStackerWindow(QMainWindow):
             "neutralization_cleared": "Neutralizace pozadí zrušena.",
             "remove_gradient": "Odstranit gradient",
             "clear_gradient": "Zrušit gradient",
-            "gradient_removed": "Gradient pozadí byl odstraněn pouze pro náhled a PNG/TIFF export.",
+            "gradient_removed": "Gradient pozadí byl odstraněn pouze pro náhled a PNG/JPG/TIFF export.",
             "gradient_cleared": "Odstranění gradientu bylo zrušeno.",
             "gradient_tooltip": "Odhadne hladký gradient pozadí robustním 2D polynomem. Lineární FIT výstup zůstává beze změny.",
             "crop_edges": "Turn angle",
@@ -9421,7 +9788,7 @@ class AstroStackerWindow(QMainWindow):
         "en": {
             "window_title": f"Astro Stacker {APP_DISPLAY_VERSION} - astronomical image stacking",
             "settings": "Setup", "folder_none": "Folder: not selected", "choose_folder": "Choose folder",
-            "open_image": "Open image/FIT", "language": "Language", "align": "Alignment",
+            "open_image": "Open image", "language": "Language", "align": "Alignment",
             "pixinsight": "PixInsight",
             "pixinsight_tooltip": "Opens PixInsight and registers the AS_Stacker wrapper under Script > Utilities.",
             "stacking": "Stacking", "max_images": "Max. frames", "sigma": "Sigma",
@@ -9494,6 +9861,12 @@ class AstroStackerWindow(QMainWindow):
             "show_left_panel": "Show left panel",
             "hide_right_panel": "Hide right panel",
             "show_right_panel": "Show right panel",
+            "tab_setting": "Setting",
+            "tab_stars_alignment": "Stars Alignment",
+            "tab_comet_alignment": "Comet Alignment",
+            "tab_color": "Color",
+            "tab_correction": "Correction",
+            "tab_ai_tools": "AI tools",
             "curves": "Curves / color / contrast", "stf_strength": "STF strength",
             "stf_strength_tooltip": "0 = strong STF for very faint images; 5 = standard preview; 10 = gentle STF.",
             "auto_stretch": "Balance",
@@ -9514,10 +9887,10 @@ class AstroStackerWindow(QMainWindow):
             "onnxruntime_missing_title": "ONNX Runtime missing",
             "onnxruntime_missing_message": "Install the onnxruntime package to use AI DRUNet.",
             "drunet_model_selected": "DRUNet model selected: {name}",
-            "drunet_tooltip": "AI denoising through DRUNet ONNX. Prefers CoreML on macOS and CUDA or DirectML on Windows. It affects only the visual preview and PNG/TIFF export.",
+            "drunet_tooltip": "AI denoising through DRUNet ONNX. Prefers CoreML on macOS and CUDA or DirectML on Windows. It affects only the visual preview and PNG/JPG/TIFF export.",
             "star_deconvolution": "AI Star Deconvolution",
             "star_deconvolution_size": "Star size",
-            "star_deconvolution_tooltip": "Sharpens and reduces stars with the Cosmic Clarity stellar model. It affects only the preview and PNG/TIFF export; linear FIT data is unchanged.",
+            "star_deconvolution_tooltip": "Sharpens and reduces stars with the Cosmic Clarity stellar model. It affects only the preview and PNG/JPG/TIFF export; linear FIT data is unchanged.",
             "select_stellar_model": "Select",
             "select_stellar_title": "Select Cosmic Clarity stellar ONNX model",
             "stellar_model_missing_title": "Stellar ONNX model missing",
@@ -9570,7 +9943,7 @@ class AstroStackerWindow(QMainWindow):
             "continue_stack": "Continue stacking",
             "reference_cannot_exclude": "The reference frame cannot be excluded. Select another reference first.",
             "choose_images_folder": "Choose image folder",
-            "open_image_title": "Open image/FIT",
+            "open_image_title": "Open image",
             "all_files": "All files",
             "metadata": "Metadata",
             "theme": "Theme",
@@ -9596,7 +9969,7 @@ class AstroStackerWindow(QMainWindow):
             "neutralization_cleared": "Background neutralization cleared.",
             "remove_gradient": "Remove gradient",
             "clear_gradient": "Clear gradient",
-            "gradient_removed": "Background gradient removed for preview and PNG/TIFF export only.",
+            "gradient_removed": "Background gradient removed for preview and PNG/JPG/TIFF export only.",
             "gradient_cleared": "Gradient removal cleared.",
             "gradient_tooltip": "Estimates a smooth background gradient with a robust 2D polynomial. Linear FIT output remains unchanged.",
             "crop_edges": "Turn angle",
@@ -9672,6 +10045,7 @@ class AstroStackerWindow(QMainWindow):
         self.preview_ai_denoise_cache_key: Optional[Tuple[Any, ...]] = None
         self.ai_denoise_layer_cache: Dict[Tuple[Any, ...], Dict[str, np.ndarray]] = {}
         self.ai_denoise_in_progress: bool = False
+        self.pending_ai_denoise_completion_sound: bool = False
         detected_stellar_model = find_stellar_deconvolution_model()
         self.star_deconvolution_model_path: Optional[str] = (
             str(detected_stellar_model)
@@ -9707,7 +10081,9 @@ class AstroStackerWindow(QMainWindow):
         self.preview_override_path: Optional[str] = None
         self.preview_sequence_paths: List[Path] = []
         self.preview_sequence_loading: bool = False
-        self.slider_value_labels: Dict[QSlider, QLabel] = {}
+        self.settings_store = QSettings("AstroStacker", "AstroStacker")
+        self.recent_image_actions: List[QAction] = []
+        self.slider_value_labels: Dict[QSlider, ArrowDoubleSpinBox] = {}
         self.simple_mode_hidden_widgets: List[QWidget] = []
         self.stack_selection_info: Dict[str, Any] = {}
         self.stack_used_paths: set[str] = set()
@@ -9739,6 +10115,17 @@ class AstroStackerWindow(QMainWindow):
         self.auto_stack_reference_shape: Optional[Tuple[int, ...]] = None
         self.auto_stack_sum: Optional[np.ndarray] = None
         self.auto_stack_weight: Optional[np.ndarray] = None
+        self.auto_stack_sumsq: Optional[np.ndarray] = None  # suma čtverců pro průběžný (online) odhad rozptylu
+        self.auto_stack_reject_outliers: bool = True   # zapnutí kappa-sigma rejection pixelů v Live stacku
+        self.auto_stack_reject_sigma: float = 3.0       # práh odmítnutí, násobek průběžné std. odchylky
+        self.auto_stack_reject_min_frames: int = 4      # warm-up: počet snímků na daný pixel, než se začne odmítat
+        self.auto_stack_reject_elongated_stars: bool = True
+        self.auto_stack_min_roundness: float = 0.50
+        self.auto_stack_min_shape_stars: int = 8
+        self.auto_stack_last_quality_metrics: Optional[Dict[str, float]] = None
+        self.auto_stack_balance_applied: bool = False
+        self.auto_stack_rejected_pixels_last: int = 0   # kolik pixelů bylo odmítnuto v posledním zpracovaném snímku
+        self.auto_stack_flip_180_count: int = 0   # kolik snímků bylo zarovnáno přes fallback s 180° otočením (meridian flip)
         self.auto_stack_flat: Optional[np.ndarray] = None
         self.auto_stack_bias: Optional[np.ndarray] = None
         self.auto_stack_dark: Optional[np.ndarray] = None
@@ -9802,9 +10189,14 @@ class AstroStackerWindow(QMainWindow):
         self.open_action.triggered.connect(self.choose_folder)
         file_menu.addAction(self.open_action)
 
-        self.open_image_action = QAction("Otevřít obrázek/FIT…", self)
+        self.open_image_action = QAction("Otevřít obrázek…", self)
         self.open_image_action.triggered.connect(self.open_image_file)
         file_menu.addAction(self.open_image_action)
+
+        self.recent_images_menu = file_menu.addMenu("Nedávné obrázky")
+        self.clear_recent_images_action = QAction("Smazat historii", self)
+        self.clear_recent_images_action.triggered.connect(self.clear_recent_images)
+        self.update_recent_images_menu()
 
         self.save_action = QAction("Uložit výsledek jako…", self)
         self.save_action.triggered.connect(self.save_preview)
@@ -9862,6 +10254,19 @@ class AstroStackerWindow(QMainWindow):
         self.auto_stack_stop_action.triggered.connect(self.stop_auto_stacking)
         self.auto_stack_stop_action.setEnabled(False)
         self.auto_stack_menu.addAction(self.auto_stack_stop_action)
+
+        self.auto_stack_menu.addSeparator()
+        self.auto_stack_reject_action = QAction("Reject outliers (sigma)", self)
+        self.auto_stack_reject_action.setCheckable(True)
+        self.auto_stack_reject_action.setChecked(True)
+        self.auto_stack_reject_action.toggled.connect(self.on_auto_stack_reject_toggled)
+        self.auto_stack_menu.addAction(self.auto_stack_reject_action)
+
+        self.auto_stack_reject_elongated_action = QAction("Reject elongated stars", self)
+        self.auto_stack_reject_elongated_action.setCheckable(True)
+        self.auto_stack_reject_elongated_action.setChecked(True)
+        self.auto_stack_reject_elongated_action.toggled.connect(self.on_auto_stack_reject_elongated_toggled)
+        self.auto_stack_menu.addAction(self.auto_stack_reject_elongated_action)
 
         self.camera_menu = self.menuBar().addMenu("Camera")
         self.camera_control_action = QAction("ASCOM Alpaca cameras…", self)
@@ -9957,19 +10362,24 @@ class AstroStackerWindow(QMainWindow):
         self.folder_label.setWordWrap(True)
         left_layout.addWidget(self.folder_label)
 
+        file_buttons_row = QHBoxLayout()
+        file_buttons_row.setContentsMargins(0, 0, 0, 0)
+        file_buttons_row.setSpacing(6)
+
         self.choose_btn = QPushButton("Vybrat složku")
         self.choose_btn.clicked.connect(self.choose_folder)
-        left_layout.addWidget(self.choose_btn)
+        file_buttons_row.addWidget(self.choose_btn)
 
 
-        self.open_image_btn = QPushButton("Otevřít obrázek/FIT")
+        self.open_image_btn = QPushButton("Otevřít obrázek")
         self.open_image_btn.clicked.connect(self.open_image_file)
-        left_layout.addWidget(self.open_image_btn)
+        file_buttons_row.addWidget(self.open_image_btn)
+        left_layout.addLayout(file_buttons_row)
 
         self.pixinsight_btn = QPushButton("PixInsight")
         self.pixinsight_btn.setToolTip(self.tr_ui("pixinsight_tooltip"))
         self.pixinsight_btn.clicked.connect(self.launch_pixinsight_wrapper)
-        left_layout.addWidget(self.pixinsight_btn)
+        self.pixinsight_btn.hide()
 
         self.preview_file_combo = ArrowComboBox()
         self.preview_file_combo.setMinimumWidth(1)
@@ -10003,12 +10413,6 @@ class AstroStackerWindow(QMainWindow):
         self.theme_combo.addItem(self.tr_ui("theme_dark"), "dark")
         self.theme_combo.addItem(self.tr_ui("theme_light"), "light")
         self.theme_combo.currentIndexChanged.connect(self.change_theme)
-
-        self.ui_mode_combo = ArrowComboBox()
-        self.ui_mode_combo.setFixedWidth(118)
-        self.ui_mode_combo.addItem(self.tr_ui("ui_advanced"), "advanced")
-        self.ui_mode_combo.addItem(self.tr_ui("ui_simple"), "simple")
-        self.ui_mode_combo.currentIndexChanged.connect(self.change_ui_mode)
 
         self.completion_sound_check = QCheckBox("Zvuk hotovo")
         self.completion_sound_check.setChecked(True)
@@ -10140,61 +10544,157 @@ class AstroStackerWindow(QMainWindow):
         self.bayer_combo.addItem("GBRG", "GBRG")
         self.bayer_combo.setToolTip("Ruční override Bayer masky pro XISF/FIT/FITS. Auto použije metadata; Mono vynutí monochrom.")
 
-        form = QFormLayout()
+        self.left_settings_tabs = QTabWidget()
+        self.left_settings_tabs.setDocumentMode(True)
+        self.left_settings_tabs.setUsesScrollButtons(False)
+        self.left_settings_tabs.tabBar().setExpanding(True)
+        self.left_settings_tabs.setStyleSheet(
+            """
+            QTabWidget::pane {
+                border: 1px solid #303744;
+                border-radius: 4px;
+                background: #050505;
+                top: -1px;
+            }
+            QTabWidget::tab-bar {
+                background: #050505;
+            }
+            QTabBar {
+                background: #050505;
+                qproperty-drawBase: 0;
+            }
+            QTabBar::base {
+                background: #050505;
+                border: none;
+            }
+            QTabBar::tab {
+                background: #050505;
+                color: #f5f7fb;
+                border: 1px solid #303744;
+                border-bottom: none;
+                padding: 7px 7px;
+                margin-right: 2px;
+                font-weight: 600;
+                min-width: 52px;
+            }
+            QTabBar::tab:selected {
+                background: #1f2937;
+                color: #ffffff;
+                border-color: #6aa7ff;
+                border-top: 3px solid #6aa7ff;
+                padding-top: 5px;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #111827;
+                border-color: #4b5563;
+            }
+            """
+        )
+        left_layout.addWidget(self.left_settings_tabs)
+
+        def make_left_tab(title_key: str) -> Tuple[QWidget, QVBoxLayout, QFormLayout]:
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(4, 8, 4, 4)
+            page_layout.setSpacing(8)
+            page_form = QFormLayout()
+            page_form.setContentsMargins(0, 0, 0, 0)
+            page_form.setSpacing(6)
+            page_layout.addLayout(page_form)
+            page_layout.addStretch(1)
+            self.left_settings_tabs.addTab(page, self.tr_ui(title_key))
+            return page, page_layout, page_form
+
+        self.setting_tab, setting_tab_layout, setting_form = make_left_tab("tab_setting")
+        self.stars_alignment_tab, stars_alignment_tab_layout, stars_alignment_form = make_left_tab("tab_stars_alignment")
+        self.comet_alignment_tab, comet_alignment_tab_layout, comet_alignment_form = make_left_tab("tab_comet_alignment")
+
+        self.metadata_title = QLabel("Metadata")
+        self.metadata_title.setStyleSheet("font-size: 14px; font-weight: bold; margin-top: 8px;")
+        left_layout.addWidget(self.metadata_title)
+        self.metadata_label = QLabel("-")
+        self.metadata_label.setWordWrap(False)
+        self.metadata_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.metadata_label.setStyleSheet("font-family: Consolas, monospace; font-size: 11px; color: #ddd; background: #151515; border: 1px solid #444; border-radius: 4px; padding: 6px;")
+        self.metadata_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+
+        self.metadata_scroll = QScrollArea()
+        self.metadata_scroll.setWidgetResizable(True)
+        self.metadata_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.metadata_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.metadata_scroll.setFrameShape(QFrame.NoFrame)
+        self.metadata_scroll.setWidget(self.metadata_label)
+        metadata_lines = 10
+        metadata_height = self.metadata_label.fontMetrics().lineSpacing() * metadata_lines + 18
+        self.metadata_scroll.setMinimumHeight(metadata_height)
+        self.metadata_scroll.setMaximumHeight(metadata_height)
+        left_layout.addWidget(self.metadata_scroll)
 
         def _mark_simple_hidden(*widgets):
             for widget in widgets:
                 if widget is not None and widget not in self.simple_mode_hidden_widgets:
                     self.simple_mode_hidden_widgets.append(widget)
 
-        def add_form_row(label_text, field_widget, advanced: bool = False):
+        def add_tab_form_row(form: QFormLayout, label_text, field_widget, advanced: bool = False):
             form.addRow(label_text, field_widget)
             if advanced:
                 _mark_simple_hidden(form.labelForField(field_widget), field_widget)
 
-        def add_form_layout_row(label_text, row_layout, advanced: bool = False):
+        def add_tab_form_layout_row(form: QFormLayout, label_text, row_layout, advanced: bool = False):
             row_layout.setContentsMargins(0, 0, 0, 0)
             row_widget = QWidget()
             row_widget.setLayout(row_layout)
-            add_form_row(label_text, row_widget, advanced=advanced)
+            add_tab_form_row(form, label_text, row_widget, advanced=advanced)
             return row_widget
 
-        add_form_row("Jazyk", self.language_combo)
+        def add_setting_row(label_text, field_widget, advanced: bool = False):
+            add_tab_form_row(setting_form, label_text, field_widget, advanced)
+
+        def add_setting_layout_row(label_text, row_layout, advanced: bool = False):
+            return add_tab_form_layout_row(setting_form, label_text, row_layout, advanced)
+
+        def add_stars_row(label_text, field_widget, advanced: bool = False):
+            add_tab_form_row(stars_alignment_form, label_text, field_widget, advanced)
+
+        def add_comet_row(label_text, field_widget, advanced: bool = False):
+            add_tab_form_row(comet_alignment_form, label_text, field_widget, advanced)
+
+        add_setting_row("Jazyk", self.language_combo)
         theme_row = QHBoxLayout()
         theme_row.addWidget(self.theme_combo)
         theme_row.addWidget(self.completion_sound_check)
         theme_row.addStretch(1)
-        add_form_layout_row("Motiv", theme_row)
-        add_form_row("Režim", self.ui_mode_combo)
-        add_form_row("Zarovnání", self.align_combo)
-        add_form_row("Skládání", self.stack_combo)
-        add_form_row("Max. snímků", self.max_images_spin)
-        add_form_row("", self.fit_only_check)
-        add_form_row("Sigma", self.sigma_spin)
-        add_form_row("", self.normalize_check, advanced=True)
-        add_form_row("", self.mp_check, advanced=True)
+        add_setting_layout_row("Motiv", theme_row)
+        add_setting_row("Zarovnání", self.align_combo)
+        add_setting_row("Skládání", self.stack_combo)
+        add_setting_row("Max. snímků", self.max_images_spin)
+        add_setting_row("", self.fit_only_check)
+        add_setting_row("Sigma", self.sigma_spin)
+        add_setting_row("", self.normalize_check, advanced=True)
+        add_setting_row("", self.mp_check, advanced=True)
         if not LITE_BUILD:
-            add_form_row("", self.gpu_check, advanced=True)
+            add_setting_row("", self.gpu_check, advanced=True)
         process_row = QHBoxLayout()
         process_row.addWidget(self.process_mode_combo)
         process_row.addWidget(self.processes_spin)
-        add_form_layout_row("CPU procesy", process_row, advanced=True)
-        add_form_row("", self.auto_reference_check)
-        add_form_row("", self.review_frames_check, advanced=True)
-        add_form_row("", self.manual_reference_btn, advanced=True)
-        add_form_row("", self.mosaic_mode_check, advanced=True)
-        add_form_row("", self.quality_filter_check, advanced=True)
-        add_form_row("Ponechat", self.keep_percent_spin, advanced=True)
-        add_form_row("Max. drift hvězd", self.max_star_shift_spin)
-        add_form_row("Max. pohyb komety", self.max_comet_shift_spin, advanced=True)
-        add_form_row("", self.comet_refine_check, advanced=True)
-        add_form_row("Šablona komety", self.comet_refine_patch_spin, advanced=True)
-        add_form_row("Hledání komety", self.comet_refine_search_spin, advanced=True)
-        add_form_row("Ignorovat okraj", self.star_border_margin_spin, advanced=True)
-        add_form_row("", self.strict_star_filter_check)
-        add_form_row("", self.satellite_trail_check, advanced=True)
-        add_form_row("Bayer FIT", self.bayer_combo, advanced=True)
-        left_layout.addLayout(form)
+        add_setting_layout_row("CPU procesy", process_row, advanced=True)
+        add_setting_row("Bayer FIT", self.bayer_combo, advanced=True)
+
+        add_stars_row("", self.auto_reference_check)
+        add_stars_row("", self.review_frames_check, advanced=True)
+        add_stars_row("", self.manual_reference_btn, advanced=True)
+        add_stars_row("", self.mosaic_mode_check, advanced=True)
+        add_stars_row("", self.quality_filter_check, advanced=True)
+        add_stars_row("Ponechat", self.keep_percent_spin, advanced=True)
+        add_stars_row("Max. drift hvězd", self.max_star_shift_spin)
+        add_stars_row("Ignorovat okraj", self.star_border_margin_spin, advanced=True)
+        add_stars_row("", self.strict_star_filter_check)
+        add_stars_row("", self.satellite_trail_check, advanced=True)
+
+        add_comet_row("Max. pohyb komety", self.max_comet_shift_spin, advanced=True)
+        add_comet_row("", self.comet_refine_check, advanced=True)
+        add_comet_row("Šablona komety", self.comet_refine_patch_spin, advanced=True)
+        add_comet_row("Hledání komety", self.comet_refine_search_spin, advanced=True)
 
         comet_row = QHBoxLayout()
         comet_row.setSpacing(4)
@@ -10218,7 +10718,7 @@ class AstroStackerWindow(QMainWindow):
         comet_row.addWidget(self.clear_comet_marks_btn)
         comet_row_widget = QWidget()
         comet_row_widget.setLayout(comet_row)
-        left_layout.addWidget(comet_row_widget)
+        comet_alignment_tab_layout.insertWidget(0, comet_row_widget)
         _mark_simple_hidden(comet_row_widget)
 
         self.stack_btn = QPushButton("Spustit skládání")
@@ -10312,6 +10812,77 @@ class AstroStackerWindow(QMainWindow):
         self.show_stacked_btn.clicked.connect(self.show_original_stacked_image)
         right_panel_layout.addWidget(self.show_stacked_btn)
 
+        self.adjustment_tabs = QTabWidget()
+        self.adjustment_tabs.setDocumentMode(True)
+        self.adjustment_tabs.setUsesScrollButtons(False)
+        self.adjustment_tabs.tabBar().setExpanding(True)
+        self.adjustment_tabs.setStyleSheet(
+            """
+            QTabWidget::pane {
+                border: 1px solid #303744;
+                border-radius: 4px;
+                background: #050505;
+                top: -1px;
+            }
+            QTabWidget::tab-bar {
+                background: #050505;
+            }
+            QTabBar {
+                background: #050505;
+                qproperty-drawBase: 0;
+            }
+            QTabBar::base {
+                background: #050505;
+                border: none;
+            }
+            QTabBar::tab {
+                background: #050505;
+                color: #f5f7fb;
+                border: 1px solid #303744;
+                border-bottom: none;
+                padding: 7px 8px;
+                margin-right: 2px;
+                font-weight: 600;
+                min-width: 58px;
+            }
+            QTabBar::tab:selected {
+                background: #1f2937;
+                color: #ffffff;
+                border-color: #6aa7ff;
+                border-top: 3px solid #6aa7ff;
+                padding-top: 5px;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #111827;
+                border-color: #4b5563;
+            }
+            QTabBar::tab:first {
+                border-top-left-radius: 4px;
+            }
+            QTabBar::tab:last {
+                border-top-right-radius: 4px;
+            }
+            """
+        )
+        right_panel_layout.addWidget(self.adjustment_tabs)
+
+        def make_adjustment_tab(title_key: str) -> Tuple[QWidget, QVBoxLayout, QFormLayout]:
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(4, 8, 4, 4)
+            page_layout.setSpacing(8)
+            form = QFormLayout()
+            form.setContentsMargins(0, 0, 0, 0)
+            form.setSpacing(6)
+            page_layout.addLayout(form)
+            page_layout.addStretch(1)
+            self.adjustment_tabs.addTab(page, self.tr_ui(title_key))
+            return page, page_layout, form
+
+        self.color_tab, color_tab_layout, color_form = make_adjustment_tab("tab_color")
+        self.correction_tab, correction_tab_layout, correction_form = make_adjustment_tab("tab_correction")
+        self.ai_tools_tab, ai_tab_layout, ai_form = make_adjustment_tab("tab_ai_tools")
+
         stretch_header = QHBoxLayout()
         stretch_title = QLabel("Křivky / barvy / kontrast")
         stretch_title.setStyleSheet("font-size: 16px; font-weight: bold;")
@@ -10323,23 +10894,30 @@ class AstroStackerWindow(QMainWindow):
         for curve_slider in (self.black_slider, self.white_slider):
             curve_slider.setSingleStep(curve_step)
             curve_slider.setPageStep(curve_step)
-        self.gamma_slider = self._slider(10, 400, 100)
-        self.contrast_slider = self._slider(10, 300, 100)
+        self.gamma_slider = self._slider(10, 400, 68)
+        self.contrast_slider = self._slider(10, 300, 71)
         self.saturation_slider = self._slider(0, 300, 100)
         self.red_slider = self._slider(0, 300, 100)
         self.green_slider = self._slider(0, 300, 100)
         self.blue_slider = self._slider(0, 300, 100)
 
-        stretch_form = QFormLayout()
-
-        def add_stretch_row(label_text, field_widget, advanced: bool = False):
-            stretch_form.addRow(label_text, field_widget)
+        def add_tab_row(form: QFormLayout, label_text, field_widget, advanced: bool = False):
+            form.addRow(label_text, field_widget)
             if advanced:
-                _mark_simple_hidden(stretch_form.labelForField(field_widget), field_widget)
+                _mark_simple_hidden(form.labelForField(field_widget), field_widget)
 
-        add_stretch_row("Black point", self.slider_with_value(self.black_slider))
-        add_stretch_row("White point", self.slider_with_value(self.white_slider))
-        add_stretch_row("Gamma", self.slider_with_value(self.gamma_slider))
+        def add_color_row(label_text, field_widget, advanced: bool = False):
+            add_tab_row(color_form, label_text, field_widget, advanced)
+
+        def add_correction_row(label_text, field_widget, advanced: bool = False):
+            add_tab_row(correction_form, label_text, field_widget, advanced)
+
+        def add_ai_row(label_text, field_widget, advanced: bool = False):
+            add_tab_row(ai_form, label_text, field_widget, advanced)
+
+        add_color_row("Black point", self.slider_with_value(self.black_slider))
+        add_color_row("White point", self.slider_with_value(self.white_slider))
+        add_color_row("Gamma", self.slider_with_value(self.gamma_slider))
 
         self.auto_stretch_btn = QPushButton("")
         self.auto_stretch_btn.setToolTip(self.tr_ui("auto_stretch_tooltip"))
@@ -10352,7 +10930,7 @@ class AstroStackerWindow(QMainWindow):
         self.auto_stretch_btn.clicked.connect(self.auto_stretch_preview)
         stretch_header.addWidget(self.auto_stretch_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
         stretch_header.addSpacing(24)
-        right_panel_layout.addLayout(stretch_header)
+        color_tab_layout.insertLayout(0, stretch_header)
 
         self.stf_strength_slider = QSlider(Qt.Horizontal)
 
@@ -10363,28 +10941,28 @@ class AstroStackerWindow(QMainWindow):
         self._connect_preview_slider(self.stf_strength_slider)
         self.stf_strength_slider.setToolTip(self.tr_ui("stf_strength_tooltip"))
 
-        add_stretch_row("Síla STF", self.slider_with_value(self.stf_strength_slider), advanced=True)
+        add_correction_row("Síla STF", self.slider_with_value(self.stf_strength_slider), advanced=True)
 
         self.vignette_removal_slider = QSlider(Qt.Horizontal)
         self.vignette_removal_slider.setRange(0, 100)
         self.vignette_removal_slider.setValue(0)
         self._connect_preview_slider(self.vignette_removal_slider)
         self.vignette_removal_slider.setToolTip("Zesvětlí okraje a rohy pro jemné potlačení vinětace. Maximum odpovídá asi 30 % původní síly.")
-        add_stretch_row("Odstranění vinětace", self.slider_with_value(self.vignette_removal_slider), advanced=True)
+        add_correction_row("Odstranění vinětace", self.slider_with_value(self.vignette_removal_slider), advanced=True)
 
         self.synthetic_flat_slider = QSlider(Qt.Horizontal)
         self.synthetic_flat_slider.setRange(0, 100)
         self.synthetic_flat_slider.setValue(0)
         self._connect_preview_slider(self.synthetic_flat_slider)
-        self.synthetic_flat_slider.setToolTip("Odhadne hladké pozadí ze složeného obrazu a použije ho jako jemný umělý flat pro náhled a PNG/TIFF export.")
-        add_stretch_row("Umělý flat", self.slider_with_value(self.synthetic_flat_slider), advanced=True)
+        self.synthetic_flat_slider.setToolTip("Odhadne hladké pozadí ze složeného obrazu a použije ho jako jemný umělý flat pro náhled a PNG/JPG/TIFF export.")
+        add_correction_row("Umělý flat", self.slider_with_value(self.synthetic_flat_slider), advanced=True)
 
         self.color_background_slider = QSlider(Qt.Horizontal)
         self.color_background_slider.setRange(0, 100)
         self.color_background_slider.setValue(0)
         self._connect_preview_slider(self.color_background_slider)
         self.color_background_slider.setToolTip("Potlačí hladký barevný závoj pozadí po jednotlivých RGB kanálech. Vhodné pro růžové/fialové pozadí z chytrých dalekohledů.")
-        add_stretch_row("Korekce barevného pozadí", self.slider_with_value(self.color_background_slider), advanced=True)
+        add_correction_row("Korekce barevného pozadí", self.slider_with_value(self.color_background_slider), advanced=True)
 
         self.denoise_slider = QSlider(Qt.Horizontal)
         self.denoise_slider.setRange(0, 100)
@@ -10408,8 +10986,8 @@ class AstroStackerWindow(QMainWindow):
         self.select_drunet_model_btn.clicked.connect(self.choose_selected_denoise_model)
         if not LITE_BUILD:
             denoise_mode_layout.addWidget(self.select_drunet_model_btn)
-        add_stretch_row(self.tr_ui("denoise_mode"), denoise_mode_widget, advanced=True)
-        add_stretch_row("Astro odšumění", self.slider_with_value(self.denoise_slider), advanced=True)
+        add_ai_row(self.tr_ui("denoise_mode"), denoise_mode_widget, advanced=True)
+        add_ai_row("Astro odšumění", self.slider_with_value(self.denoise_slider), advanced=True)
 
         self.star_deconvolution_slider = QSlider(Qt.Horizontal)
         self.star_deconvolution_slider.setRange(0, 100)
@@ -10436,7 +11014,7 @@ class AstroStackerWindow(QMainWindow):
             self.choose_stellar_deconvolution_model
         )
         stellar_control_layout.addWidget(self.select_stellar_model_btn)
-        add_stretch_row(
+        add_ai_row(
             self.tr_ui("star_deconvolution"),
             stellar_control,
             advanced=True,
@@ -10449,7 +11027,7 @@ class AstroStackerWindow(QMainWindow):
         self.star_deconvolution_size_slider.setToolTip(
             self.tr_ui("star_deconvolution_tooltip")
         )
-        add_stretch_row(
+        add_ai_row(
             self.tr_ui("star_deconvolution_size"),
             self.slider_with_value(self.star_deconvolution_size_slider),
             advanced=True,
@@ -10466,14 +11044,12 @@ class AstroStackerWindow(QMainWindow):
 
         self._connect_preview_slider(self.scnr_green_slider)
 
-
-        add_stretch_row("SCNR Green", self.slider_with_value(self.scnr_green_slider), advanced=True)
-        add_stretch_row("Kontrast", self.slider_with_value(self.contrast_slider), advanced=True)
-        add_stretch_row("Saturace", self.slider_with_value(self.saturation_slider), advanced=True)
-        add_stretch_row("Červená", self.slider_with_value(self.red_slider), advanced=True)
-        add_stretch_row("Zelená", self.slider_with_value(self.green_slider), advanced=True)
-        add_stretch_row("Modrá", self.slider_with_value(self.blue_slider), advanced=True)
-        right_panel_layout.addLayout(stretch_form)
+        add_correction_row("SCNR Green", self.slider_with_value(self.scnr_green_slider), advanced=True)
+        add_color_row("Kontrast", self.slider_with_value(self.contrast_slider), advanced=True)
+        add_color_row("Saturace", self.slider_with_value(self.saturation_slider), advanced=True)
+        add_color_row("Červená", self.slider_with_value(self.red_slider), advanced=True)
+        add_color_row("Zelená", self.slider_with_value(self.green_slider), advanced=True)
+        add_color_row("Modrá", self.slider_with_value(self.blue_slider), advanced=True)
 
         self.hist_title = QLabel("Histogram L/R/G/B")
         self.hist_title.setStyleSheet("font-size: 14px; font-weight: bold; margin-top: 8px;")
@@ -10484,43 +11060,17 @@ class AstroStackerWindow(QMainWindow):
         self.histogram_label.setStyleSheet("background: #121212; border: 1px solid #444; border-radius: 4px;")
         right_panel_layout.addWidget(self.histogram_label)
 
-        self.metadata_title = QLabel("Metadata")
-        self.metadata_title.setStyleSheet("font-size: 14px; font-weight: bold; margin-top: 8px;")
-        right_panel_layout.addWidget(self.metadata_title)
-        self.metadata_label = QLabel("-")
-        self.metadata_label.setWordWrap(False)
-        self.metadata_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.metadata_label.setStyleSheet("font-family: Consolas, monospace; font-size: 11px; color: #ddd; background: #151515; border: 1px solid #444; border-radius: 4px; padding: 6px;")
-        self.metadata_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-
-        self.metadata_scroll = QScrollArea()
-        self.metadata_scroll.setWidgetResizable(True)
-        self.metadata_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.metadata_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.metadata_scroll.setFrameShape(QFrame.NoFrame)
-        self.metadata_scroll.setWidget(self.metadata_label)
-        metadata_lines = 10
-        metadata_height = self.metadata_label.fontMetrics().lineSpacing() * metadata_lines + 18
-        self.metadata_scroll.setMinimumHeight(metadata_height)
-        self.metadata_scroll.setMaximumHeight(metadata_height)
-        right_panel_layout.addWidget(self.metadata_scroll)
-
         compact_button_block = QVBoxLayout()
         compact_button_block.setContentsMargins(0, 0, 0, 0)
         compact_button_block.setSpacing(5)
 
-        awb_crop_row = QHBoxLayout()
-        awb_crop_row.setContentsMargins(0, 0, 0, 0)
-        awb_crop_row.setSpacing(3)
-        self.awb_btn = QPushButton("Auto WB")
-        self.awb_btn.setMinimumWidth(72)
-        self.awb_btn.clicked.connect(self.auto_white_balance)
-        awb_crop_row.addWidget(self.awb_btn)
-
+        crop_transform_row = QHBoxLayout()
+        crop_transform_row.setContentsMargins(0, 0, 0, 0)
+        crop_transform_row.setSpacing(3)
         self.crop_edges_btn = QPushButton("Turn angle")
         self.crop_edges_btn.setToolTip(self.tr_ui("crop_tooltip"))
         self.crop_edges_btn.clicked.connect(self.rotate_current_image_by_crop_angle)
-        awb_crop_row.addWidget(self.crop_edges_btn)
+        crop_transform_row.addWidget(self.crop_edges_btn)
 
         self.crop_angle_spin = ArrowSpinBox()
         self.crop_angle_spin.setRange(-15, 15)
@@ -10528,17 +11078,17 @@ class AstroStackerWindow(QMainWindow):
         self.crop_angle_spin.setSuffix("°")
         self.crop_angle_spin.setToolTip(self.tr_ui("crop_tooltip"))
         self.crop_angle_spin.setMinimumWidth(64)
-        awb_crop_row.addWidget(self.crop_angle_spin)
+        crop_transform_row.addWidget(self.crop_angle_spin)
 
         self.crop_select_btn = QPushButton("Výběr")
         self.crop_select_btn.setMinimumWidth(58)
         self.crop_select_btn.setToolTip(self.tr_ui("crop_select_tooltip"))
         self.crop_select_btn.clicked.connect(self.start_manual_crop_selection)
-        awb_crop_row.addWidget(self.crop_select_btn)
-        awb_crop_row_widget = QWidget()
-        awb_crop_row_widget.setLayout(awb_crop_row)
-        compact_button_block.addWidget(awb_crop_row_widget)
-        _mark_simple_hidden(awb_crop_row_widget)
+        crop_transform_row.addWidget(self.crop_select_btn)
+        crop_transform_row_widget = QWidget()
+        crop_transform_row_widget.setLayout(crop_transform_row)
+        compact_button_block.addWidget(crop_transform_row_widget)
+        _mark_simple_hidden(crop_transform_row_widget)
 
         neutralize_row = QHBoxLayout()
         neutralize_row.setContentsMargins(0, 0, 0, 0)
@@ -10552,7 +11102,7 @@ class AstroStackerWindow(QMainWindow):
         neutralize_row.addWidget(self.clear_neutral_bg_btn)
         neutralize_row_widget = QWidget()
         neutralize_row_widget.setLayout(neutralize_row)
-        compact_button_block.addWidget(neutralize_row_widget)
+        correction_tab_layout.insertWidget(0, neutralize_row_widget)
         _mark_simple_hidden(neutralize_row_widget)
 
         gradient_row = QHBoxLayout()
@@ -10568,7 +11118,7 @@ class AstroStackerWindow(QMainWindow):
         gradient_row.addWidget(self.clear_gradient_btn)
         gradient_row_widget = QWidget()
         gradient_row_widget.setLayout(gradient_row)
-        compact_button_block.addWidget(gradient_row_widget)
+        correction_tab_layout.insertWidget(1, gradient_row_widget)
         _mark_simple_hidden(gradient_row_widget)
 
         transform_row = QHBoxLayout()
@@ -10880,23 +11430,56 @@ class AstroStackerWindow(QMainWindow):
         return int(round(float(normalized) * 65535.0))
 
     def update_slider_value_label(self, slider: QSlider):
-        label = getattr(self, "slider_value_labels", {}).get(slider)
-        if label is not None:
-            label.setText(self.slider_position_text(slider))
+        value_box = getattr(self, "slider_value_labels", {}).get(slider)
+        if value_box is not None:
+            value_box.blockSignals(True)
+            value_box.setValue(float(self.slider_position_text(slider)))
+            value_box.blockSignals(False)
+
+    def slider_display_value_to_position(self, slider: QSlider, display_value: float) -> int:
+        display_value = float(np.clip(display_value, 0.0, 10.0))
+        span = max(1, slider.maximum() - slider.minimum())
+        position = slider.minimum() + int(round(display_value / 10.0 * span))
+        return max(slider.minimum(), min(slider.maximum(), position))
+
+    def set_slider_from_value_box(self, slider: QSlider, display_value: float):
+        slider.setValue(self.slider_display_value_to_position(slider, display_value))
 
     def slider_with_value(self, slider: QSlider) -> QWidget:
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
-        value_label = QLabel(self.slider_position_text(slider))
-        value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        value_label.setFixedWidth(34)
-        value_label.setStyleSheet("font-family: Menlo, Consolas, monospace; font-size: 11px; color: #b9c0cc;")
-        self.slider_value_labels[slider] = value_label
+        value_box = ArrowDoubleSpinBox()
+        value_box.setObjectName("sliderValueBox")
+        value_box.setRange(0.0, 10.0)
+        value_box.setDecimals(2 if slider in (getattr(self, "black_slider", None), getattr(self, "white_slider", None)) else 1)
+        value_box.setSingleStep(0.05 if value_box.decimals() == 2 else 0.1)
+        value_box.setKeyboardTracking(False)
+        value_box.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        value_box.setFixedWidth(75 if value_box.decimals() == 2 else 68)
+        value_box.setStyleSheet("""
+            QDoubleSpinBox#sliderValueBox {
+                font-family: Menlo, Consolas, monospace;
+                font-size: 11px;
+                padding: 2px 18px 0px 0px;
+            }
+            QDoubleSpinBox#sliderValueBox::up-button,
+            QDoubleSpinBox#sliderValueBox::down-button {
+                width: 18px;
+            }
+        """)
+        try:
+            value_box.lineEdit().setTextMargins(0, 0, 0, 0)
+            value_box.lineEdit().setStyleSheet("padding: 0px; margin: 0px; background: transparent;")
+        except Exception:
+            pass
+        value_box.setValue(float(self.slider_position_text(slider)))
+        self.slider_value_labels[slider] = value_box
         slider.valueChanged.connect(lambda _value, s=slider: self.update_slider_value_label(s))
+        value_box.valueChanged.connect(lambda value, s=slider: self.set_slider_from_value_box(s, value))
         layout.addWidget(slider, 1)
-        layout.addWidget(value_label)
+        layout.addWidget(value_box)
         return row
 
     def _undo_array(self, arr: Optional[np.ndarray], copy_pixels: bool = False) -> Optional[np.ndarray]:
@@ -11047,6 +11630,103 @@ class AstroStackerWindow(QMainWindow):
         slider.sliderReleased.connect(self._preview_slider_released)
         slider.valueChanged.connect(self.schedule_preview_update)
 
+    def recent_image_paths(self) -> List[Path]:
+        value = self.settings_store.value("recent_images", [])
+        if isinstance(value, str):
+            raw_paths = [value]
+        elif isinstance(value, (list, tuple)):
+            raw_paths = [str(item) for item in value if item]
+        else:
+            raw_paths = []
+        paths: List[Path] = []
+        seen: set[str] = set()
+        for raw in raw_paths:
+            try:
+                path = Path(raw).expanduser()
+                key = str(path)
+            except Exception:
+                continue
+            if key not in seen:
+                paths.append(path)
+                seen.add(key)
+        return paths[:10]
+
+    def save_recent_image_paths(self, paths: List[Path]):
+        self.settings_store.setValue("recent_images", [str(path) for path in paths[:10]])
+        self.update_recent_images_menu()
+
+    def add_recent_image_path(self, path: Path):
+        path = Path(path).expanduser()
+        paths = [p for p in self.recent_image_paths() if str(p) != str(path)]
+        paths.insert(0, path)
+        self.save_recent_image_paths(paths)
+
+    def clear_recent_images(self):
+        self.save_recent_image_paths([])
+
+    def update_recent_images_menu(self):
+        if not hasattr(self, "recent_images_menu"):
+            return
+        self.recent_images_menu.clear()
+        self.recent_image_actions = []
+        paths = self.recent_image_paths()
+        if paths:
+            for index, path in enumerate(paths, start=1):
+                text = f"{index}. {path.name}"
+                action = QAction(text, self)
+                action.setToolTip(str(path))
+                action.triggered.connect(lambda _checked=False, p=path: self.open_recent_image(p))
+                self.recent_images_menu.addAction(action)
+                self.recent_image_actions.append(action)
+            self.recent_images_menu.addSeparator()
+            self.clear_recent_images_action.setEnabled(True)
+        else:
+            empty_action = QAction(
+                "Žádná historie" if self.language == "cz" else "No recent images",
+                self,
+            )
+            empty_action.setEnabled(False)
+            self.recent_images_menu.addAction(empty_action)
+            self.clear_recent_images_action.setEnabled(False)
+        self.recent_images_menu.addAction(self.clear_recent_images_action)
+
+    def open_recent_image(self, path: Path):
+        path = Path(path).expanduser()
+        if not path.exists():
+            QMessageBox.warning(
+                self,
+                self.tr_ui("missing_image_title"),
+                (
+                    f"Soubor už neexistuje:\n{path}"
+                    if self.language == "cz"
+                    else f"The file no longer exists:\n{path}"
+                ),
+            )
+            self.save_recent_image_paths([p for p in self.recent_image_paths() if str(p) != str(path)])
+            return
+        self.open_image_path(path, add_to_recent=True)
+
+    def open_image_path(self, path: Path, add_to_recent: bool = False):
+        path = Path(path).expanduser()
+        sibling_paths = sorted(
+            [
+                p
+                for p in path.parent.iterdir()
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+            ],
+            key=lambda p: p.name.lower(),
+        )
+        self.set_preview_sequence(sibling_paths, path)
+        if self.load_preview_image(path) and add_to_recent:
+            self.add_recent_image_path(path)
+
+    def _is_ai_preview_slider(self, slider) -> bool:
+        return slider in (
+            getattr(self, "denoise_slider", None),
+            getattr(self, "star_deconvolution_slider", None),
+            getattr(self, "star_deconvolution_size_slider", None),
+        )
+
     def choose_drunet_model(self) -> bool:
         current_path = find_drunet_model(getattr(self, "ai_denoise_model_path", None))
         start_dir = str(current_path.parent if current_path is not None else Path.home())
@@ -11059,6 +11739,7 @@ class AstroStackerWindow(QMainWindow):
         if not filename:
             return False
         candidate = Path(filename).expanduser()
+        saved_preview_state = self.capture_preview_zoom_state()
         DRUNET_SESSION_CACHE.clear()
         if ort is not None:
             try:
@@ -11081,6 +11762,8 @@ class AstroStackerWindow(QMainWindow):
                     str(exc),
                 )
                 return False
+        self.preview_slider_zoom_state = saved_preview_state
+        self.preview_render_pending_final = True
         self.ai_denoise_model_path = str(candidate)
         self.preview_ai_denoise_cache = None
         self.preview_ai_denoise_cache_key = None
@@ -11110,6 +11793,7 @@ class AstroStackerWindow(QMainWindow):
         if not filename:
             return False
         candidate = Path(filename).expanduser()
+        saved_preview_state = self.capture_preview_zoom_state()
         STELLAR_SESSION_CACHE.clear()
         if ort is not None:
             try:
@@ -11131,6 +11815,8 @@ class AstroStackerWindow(QMainWindow):
                     str(exc),
                 )
                 return False
+        self.preview_slider_zoom_state = saved_preview_state
+        self.preview_render_pending_final = True
         self.star_deconvolution_model_path = str(candidate)
         self.star_deconvolution_layer_cache.clear()
         self.status_label.setText(
@@ -11675,13 +12361,13 @@ class AstroStackerWindow(QMainWindow):
         self.stop_preview_pan_inertia()
         self.preview_pan_scroll = (0.0, 0.0)
 
-    def load_preview_image(self, path: Path):
+    def load_preview_image(self, path: Path) -> bool:
         try:
             set_bayer_pattern_override(self.bayer_combo.currentData() if hasattr(self, "bayer_combo") else "auto")
             img = load_image_as_float(path)
         except Exception as exc:
             QMessageBox.critical(self, "Chyba" if self.language == "cz" else "Error", f"Snímek se nepodařilo načíst:\n{exc}" if self.language == "cz" else f"Could not load image:\n{exc}")
-            return
+            return False
 
         self.reset_preview_render_state_for_new_source()
         self.preview_override = img
@@ -11705,6 +12391,7 @@ class AstroStackerWindow(QMainWindow):
         self.status_label.setText(self.tr_ui("open_preview_status").format(name=path.name))
         self.update_preview()
         self.update_preview_nav_state()
+        return True
 
     def format_metadata_for_path(self, path: Path, img: Optional[np.ndarray] = None) -> str:
         lines = []
@@ -12163,11 +12850,20 @@ class AstroStackerWindow(QMainWindow):
         self.preview_rotation_degrees = 0
 
     def auto_stack_status_text(self, last_name: Optional[str] = None) -> str:
+        pixel_pct = 0.0
+        if self.auto_stack_weight is not None and self.auto_stack_rejected_pixels_last > 0:
+            total_px = max(1, int(self.auto_stack_weight.size))
+            pixel_pct = 100.0 * self.auto_stack_rejected_pixels_last / total_px
+        flip_count = getattr(self, "auto_stack_flip_180_count", 0)
         if self.language == "cz":
             text = (
                 f"Live stacking: složeno {self.auto_stack_accepted}, "
                 f"vyřazeno {self.auto_stack_rejected}"
             )
+            if pixel_pct > 0:
+                text += f", odlehlé pixely v posl. snímku: {pixel_pct:.2f}%"
+            if flip_count > 0:
+                text += f", meridian flip korekce: {flip_count}"
             if last_name:
                 text += f"; poslední: {last_name}"
             return text
@@ -12175,9 +12871,19 @@ class AstroStackerWindow(QMainWindow):
             f"Live stacking: stacked {self.auto_stack_accepted}, "
             f"rejected {self.auto_stack_rejected}"
         )
+        if pixel_pct > 0:
+            text += f", outlier pixels in last frame: {pixel_pct:.2f}%"
+        if flip_count > 0:
+            text += f", meridian flip corrections: {flip_count}"
         if last_name:
             text += f"; last: {last_name}"
         return text
+
+    def on_auto_stack_reject_toggled(self, checked: bool):
+        self.auto_stack_reject_outliers = bool(checked)
+
+    def on_auto_stack_reject_elongated_toggled(self, checked: bool):
+        self.auto_stack_reject_elongated_stars = bool(checked)
 
     def start_auto_stacking(self):
         if self.auto_stack_calibration_worker is not None:
@@ -12199,11 +12905,16 @@ class AstroStackerWindow(QMainWindow):
         self.auto_stack_reference_shape = None
         self.auto_stack_sum = None
         self.auto_stack_weight = None
+        self.auto_stack_sumsq = None
+        self.auto_stack_rejected_pixels_last = 0
+        self.auto_stack_flip_180_count = 0
         self.auto_stack_flat = None
         self.auto_stack_bias = None
         self.auto_stack_dark = None
         self.auto_stack_accepted = 0
         self.auto_stack_rejected = 0
+        self.auto_stack_last_quality_metrics = None
+        self.auto_stack_balance_applied = False
 
         self.linear_result = None
         self.original_linear_result = None
@@ -12228,7 +12939,16 @@ class AstroStackerWindow(QMainWindow):
         self.open_action.setEnabled(False)
         self.open_image_action.setEnabled(False)
         settings = self.current_stack_settings()
-        settings = replace(settings, align_mode="star_affine", stack_mode="mean")
+        settings = replace(settings, align_mode="star_affine", stack_mode="median")
+        self.auto_stack_reject_outliers = bool(self.auto_stack_reject_action.isChecked())
+        self.auto_stack_reject_sigma = float(getattr(settings, "live_stack_reject_sigma", 3.0))
+        self.auto_stack_reject_min_frames = int(getattr(settings, "live_stack_reject_min_frames", 4))
+        self.auto_stack_reject_elongated_stars = bool(
+            getattr(self, "auto_stack_reject_elongated_action", None) is None
+            or self.auto_stack_reject_elongated_action.isChecked()
+        )
+        self.auto_stack_min_roundness = float(getattr(settings, "live_stack_min_roundness", 0.50))
+        self.auto_stack_min_shape_stars = int(getattr(settings, "live_stack_min_shape_stars", 8))
         self.auto_stack_calibration_worker = AutoStackCalibrationWorker(settings)
         self.auto_stack_calibration_worker.progress.connect(self.on_auto_stack_calibration_progress)
         self.auto_stack_calibration_worker.masters_ready.connect(self.on_auto_stack_calibration_ready)
@@ -12419,22 +13139,57 @@ class AstroStackerWindow(QMainWindow):
     ):
         if not self.auto_stack_active:
             return
+        if detail.get("flip_180"):
+            self.auto_stack_flip_180_count = getattr(self, "auto_stack_flip_180_count", 0) + 1
         image = np.asarray(aligned, dtype=np.float32)
         mask = np.asarray(coverage, dtype=np.float32)
+        if self.should_reject_live_stack_elongated_stars(image):
+            return self.reject_auto_stack_frame_for_quality(path_text, image)
         if self.auto_stack_reference_gray is None:
             self.auto_stack_reference_gray = np.ascontiguousarray(to_gray_float(image))
             self.auto_stack_reference_shape = tuple(image.shape)
             self.auto_stack_sum = np.zeros_like(image, dtype=np.float32)
+            self.auto_stack_sumsq = np.zeros_like(image, dtype=np.float32)
             self.auto_stack_weight = np.zeros(image.shape[:2], dtype=np.float32)
             self.update_metadata_panel(Path(path_text), image)
 
         if self.auto_stack_sum is None or self.auto_stack_weight is None:
             return
+        if self.auto_stack_sumsq is None:
+            self.auto_stack_sumsq = np.zeros_like(image, dtype=np.float32)
+
+        # Online (running) kappa-sigma rejection: porovná nový pixel proti dosavadnímu
+        # průběžnému průměru/std. odchylce na dané pozici a vynechá ho ze skládání,
+        # pokud je výrazně přejasněný (letadlo, satelit, kosmické záření, hot pixel).
+        # Nepotřebuje držet historii snímků v paměti - jen sum/sumsq/weight z minulých snímků.
+        weight_before = self.auto_stack_weight
+        accept_mask = mask
+        rejected_now = 0
+        if self.auto_stack_reject_outliers:
+            enough_history = weight_before >= max(1, self.auto_stack_reject_min_frames)
+            if np.any(enough_history):
+                safe_weight_before = np.maximum(weight_before, 1.0)
+                weight_b = safe_weight_before[..., None] if image.ndim == 3 else safe_weight_before
+                running_mean = self.auto_stack_sum / weight_b
+                running_var = self.auto_stack_sumsq / weight_b - running_mean ** 2
+                running_std = np.sqrt(np.maximum(running_var, 0.0)) + 1e-3
+                # Odmítáme jen kladné odlehlé hodnoty (přejasněné stopy), ne podexponované
+                # pixely u okraje pokrytí - ty řeší už samotná coverage maska.
+                is_outlier_channel = (image - running_mean) > (self.auto_stack_reject_sigma * running_std)
+                outlier_pixel = np.any(is_outlier_channel, axis=2) if image.ndim == 3 else is_outlier_channel
+                outlier_pixel = outlier_pixel & enough_history
+                if np.any(outlier_pixel):
+                    accept_mask = mask * (1.0 - outlier_pixel.astype(np.float32))
+                    rejected_now = int(np.sum(outlier_pixel & (mask > 0)))
+        self.auto_stack_rejected_pixels_last = rejected_now
+
         if image.ndim == 3:
-            self.auto_stack_sum += image * mask[..., None]
+            self.auto_stack_sum += image * accept_mask[..., None]
+            self.auto_stack_sumsq += (image ** 2) * accept_mask[..., None]
         else:
-            self.auto_stack_sum += image * mask
-        self.auto_stack_weight += mask
+            self.auto_stack_sum += image * accept_mask
+            self.auto_stack_sumsq += (image ** 2) * accept_mask
+        self.auto_stack_weight += accept_mask
         safe_weight = np.maximum(self.auto_stack_weight, 1.0)
         if image.ndim == 3:
             result = self.auto_stack_sum / safe_weight[..., None]
@@ -12451,14 +13206,54 @@ class AstroStackerWindow(QMainWindow):
         self.preview_source_shape = self.linear_result.shape[:2]
         self.preview_auto_display_stretch = True
         self.reset_preview_display_limits()
-        self.apply_balance_to_current_preview(
+        first_live_balance = not getattr(self, "auto_stack_balance_applied", False)
+        balance_applied = self.apply_balance_to_current_preview(
             record_undo=False,
             refresh_preview=False,
             set_status=False,
+            update_sliders=first_live_balance,
         )
+        if first_live_balance and balance_applied:
+            self.auto_stack_balance_applied = True
         self.update_preview()
         self.progress.setValue(min(99, self.auto_stack_accepted))
         self.status_label.setText(self.auto_stack_status_text(Path(path_text).name))
+
+    def should_reject_live_stack_elongated_stars(self, image: np.ndarray) -> bool:
+        if not getattr(self, "auto_stack_reject_elongated_stars", True):
+            self.auto_stack_last_quality_metrics = None
+            return False
+        try:
+            metrics = frame_quality_metrics_from_gray(to_gray_float(image))
+        except Exception as exc:
+            log_debug(f"Live stack elongated-star check failed: {exc}")
+            self.auto_stack_last_quality_metrics = None
+            return False
+        self.auto_stack_last_quality_metrics = metrics
+        measured = float(metrics.get("shape_star_count", 0.0))
+        if measured < max(1, int(getattr(self, "auto_stack_min_shape_stars", 8))):
+            return False
+        roundness = float(metrics.get("roundness", 1.0))
+        return roundness < float(getattr(self, "auto_stack_min_roundness", 0.50))
+
+    def reject_auto_stack_frame_for_quality(self, path_text: str, image: np.ndarray):
+        metrics = dict(getattr(self, "auto_stack_last_quality_metrics", None) or {})
+        roundness = float(metrics.get("roundness", 0.0))
+        measured = int(round(float(metrics.get("shape_star_count", 0.0))))
+        self.auto_stack_rejected += 1
+        reason = (
+            f"protažené hvězdy (kulatost {roundness:.2f}, hvězd {measured})"
+            if self.language == "cz"
+            else f"elongated stars (roundness {roundness:.2f}, stars {measured})"
+        )
+        log_debug(f"Automatic stacking rejected {path_text}: {reason}")
+        self.status_label.setText(
+            (
+                f"{self.auto_stack_status_text(Path(path_text).name)}; důvod: {reason}"
+                if self.language == "cz"
+                else f"{self.auto_stack_status_text(Path(path_text).name)}; reason: {reason}"
+            )
+        )
 
     def on_auto_stack_frame_failed(self, path_text: str, message: str):
         if not self.auto_stack_active:
@@ -12495,7 +13290,11 @@ class AstroStackerWindow(QMainWindow):
         k rychlému prohlédnutí zdrojového nebo již složeného snímku se stejným
         stretch/zoom ovládáním jako běžný výsledek.
         """
-        start_dir = str(self.folder) if self.folder else ""
+        recent_paths = self.recent_image_paths()
+        if recent_paths:
+            start_dir = str(recent_paths[0].parent)
+        else:
+            start_dir = str(self.folder) if self.folder else ""
         filename, _ = QFileDialog.getOpenFileName(
             self,
             self.tr_ui("open_image_title"),
@@ -12505,13 +13304,7 @@ class AstroStackerWindow(QMainWindow):
         if not filename:
             return
 
-        path = Path(filename)
-        sibling_paths = sorted(
-            [p for p in path.parent.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS],
-            key=lambda p: p.name.lower(),
-        )
-        self.set_preview_sequence(sibling_paths, path)
-        self.load_preview_image(path)
+        self.open_image_path(Path(filename), add_to_recent=True)
 
     def _sequence_paths_for_ui(self) -> List[Path]:
         if not self.folder:
@@ -12534,16 +13327,25 @@ class AstroStackerWindow(QMainWindow):
             )
             return
 
+        self.reset_preview_render_state_for_new_source()
         self.preview_override = img
         self.preview_override_path = str(path)
         self.preview_source_shape = img.shape[:2]
+        self.reset_denoise_for_new_preview_source()
         self.invalidate_preview_cache()
+        self.preview_auto_display_stretch = True
         self.update_metadata_panel(path, img)
         self.awaiting_comet_click = True
         self.comet_click_mode = mode
         if hasattr(self, "image_label"):
             self.image_label.set_marking_mode(True)
         self.zoom_mode = "fit"
+        self.zoom_factor = 1.0
+        self.apply_balance_to_current_preview(
+            record_undo=False,
+            refresh_preview=False,
+            set_status=False,
+        )
         label = self.tr_ui("comet_mark_first_label") if mode == "start" else self.tr_ui("comet_mark_last_label")
         self.status_label.setText(self.tr_ui("comet_click_status").format(label=label, name=path.name))
         self.update_preview()
@@ -12745,7 +13547,6 @@ class AstroStackerWindow(QMainWindow):
             "auto_stretch_btn": "auto_stretch",
             "crop_edges_btn": "crop_edges",
             "crop_select_btn": "crop_select",
-            "awb_btn": "auto_wb",
             "neutral_bg_btn": "neutralize",
             "clear_neutral_bg_btn": "clear_neutralize",
             "remove_gradient_btn": "remove_gradient",
@@ -12778,6 +13579,14 @@ class AstroStackerWindow(QMainWindow):
             self.right_collapse_btn.setToolTip(self.tr_ui("hide_right_panel"))
         if hasattr(self, "right_expand_btn"):
             self.right_expand_btn.setToolTip(self.tr_ui("show_right_panel"))
+        if hasattr(self, "left_settings_tabs"):
+            for index, key in enumerate(("tab_setting", "tab_stars_alignment", "tab_comet_alignment")):
+                if index < self.left_settings_tabs.count():
+                    self.left_settings_tabs.setTabText(index, self.tr_ui(key))
+        if hasattr(self, "adjustment_tabs"):
+            for index, key in enumerate(("tab_color", "tab_correction", "tab_ai_tools")):
+                if index < self.adjustment_tabs.count():
+                    self.adjustment_tabs.setTabText(index, self.tr_ui(key))
         if hasattr(self, "stack_btn") and getattr(self, "review_ready", False):
             self.stack_btn.setText(self.tr_ui("continue_stack"))
         if hasattr(self, "mosaic_mode_check"):
@@ -12843,7 +13652,9 @@ class AstroStackerWindow(QMainWindow):
         menu_texts = {
             "cz": {
                 "file_menu": "Soubor", "view_menu": "Zobrazení", "auto_stack_menu": "Live stack", "camera_menu": "Camera", "help_menu": "Nápověda",
-                "open_action": "Vybrat složku…", "open_image_action": "Otevřít obrázek/FIT…",
+                "open_action": "Vybrat složku…", "open_image_action": "Otevřít obrázek…",
+                "recent_images_menu": "Nedávné obrázky",
+                "clear_recent_images_action": "Smazat historii",
                 "save_action": "Uložit výsledek jako…", "save_profile_action": "Uložit profil nastavení…",
                 "load_profile_action": "Načíst profil nastavení…", "comet_action": "Označit kometu v prvním snímku…",
                 "comet_end_action": "Označit kometu v posledním snímku…", "fit_action": "Přizpůsobit",
@@ -12855,11 +13666,15 @@ class AstroStackerWindow(QMainWindow):
                 "open_log_action": "Zobrazit / smazat logy…", "quit_action": "Konec",
                 "auto_stack_start_action": "Live stacking",
                 "auto_stack_stop_action": "Stop Live stacking",
+                "auto_stack_reject_action": "Odmítat odlehlé pixely (sigma)",
+                "auto_stack_reject_elongated_action": "Odmítat protažené hvězdy",
                 "camera_control_action": "ASCOM Alpaca kamery…",
             },
             "en": {
                 "file_menu": "File", "view_menu": "View", "auto_stack_menu": "Live stack", "camera_menu": "Camera", "help_menu": "Help",
-                "open_action": "Choose folder…", "open_image_action": "Open image/FIT…",
+                "open_action": "Choose folder…", "open_image_action": "Open image…",
+                "recent_images_menu": "Recent images",
+                "clear_recent_images_action": "Clear history",
                 "save_action": "Save result as…", "save_profile_action": "Save settings profile…",
                 "load_profile_action": "Load settings profile…", "comet_action": "Mark comet in first frame…",
                 "comet_end_action": "Mark comet in last frame…", "fit_action": "Fit",
@@ -12871,6 +13686,8 @@ class AstroStackerWindow(QMainWindow):
                 "open_log_action": "View / delete logs…", "quit_action": "Quit",
                 "auto_stack_start_action": "Live stacking",
                 "auto_stack_stop_action": "Stop Live stacking",
+                "auto_stack_reject_action": "Reject outliers (sigma)",
+                "auto_stack_reject_elongated_action": "Reject elongated stars",
                 "camera_control_action": "ASCOM Alpaca cameras…",
             },
         }
@@ -12878,6 +13695,7 @@ class AstroStackerWindow(QMainWindow):
             obj = getattr(self, attr, None)
             if obj is not None:
                 obj.setTitle(text) if hasattr(obj, "setTitle") else obj.setText(text)
+        self.update_recent_images_menu()
 
         label_map = {}
         for lang_values in self.TRANSLATIONS.values():
@@ -12959,12 +13777,12 @@ class AstroStackerWindow(QMainWindow):
                 "<li>Click <b>Start stacking</b>. Progress and any warnings are shown in the status line and diagnostic logs.</li>"
                 "<li>The completed stack is shown linearly and may initially look black. Use <b>Balance</b> to stretch the preview only.</li>"
                 "<li>Then adjust black/white point, gamma, color, background neutralization, vignette removal, or synthetic flat.</li>"
-                "<li>Export FITS/XISF for linear data, or PNG/TIFF for the current visual result.</li>"
+                "<li>Export FITS/XISF for linear data, or PNG/JPG/TIFF for the current visual result.</li>"
                 "</ol>"
                 "<h3>Input and browsing</h3>"
                 "<ul>"
                 "<li><b>Choose folder</b> loads a sequence of light frames and also lets the app find Flat/Bias/Dark subfolders.</li>"
-                "<li><b>Open image/FIT</b> opens one standalone image for inspection without changing the stack folder.</li>"
+                "<li><b>Open image</b> opens one standalone image for inspection without changing the stack folder.</li>"
                 "<li>The preview list shows Light/Flat/Bias/Dark frames. After stacking, <b>*</b> marks the reference frame and <b>x</b> marks frames rejected by the quality filter.</li>"
                 "<li>The metadata panel shows camera/FITS/RAW details such as exposure, gain, temperature, filter, binning, Bayer pattern, dimensions, and file information when available.</li>"
                 "<li>The left and right panels can be collapsed with the small arrow in the top-left corner. The remaining arrow rail shows the panel again and gives more room to the preview and Frame quality table.</li>"
@@ -12999,7 +13817,7 @@ class AstroStackerWindow(QMainWindow):
                 "<ul>"
                 "<li>Mouse wheel zooms around the cursor. Dragging pans the image, including a subtle inertial glide.</li>"
                 "<li>Double-click opens a full-screen preview with the same zoom and pan behavior. Esc closes it.</li>"
-                "<li>Curves, Turn angle, manual Select crop, black/white point, gamma, highlight compression, vignette removal, synthetic flat, contrast, saturation, RGB balance, SCNR Green, AWB, background neutralization, polynomial gradient removal, and flips affect the visual preview and PNG/TIFF export.</li>"
+                "<li>Curves, Turn angle, manual Select crop, black/white point, gamma, highlight compression, vignette removal, synthetic flat, contrast, saturation, RGB balance, SCNR Green, AWB, background neutralization, polynomial gradient removal, and flips affect the visual preview and PNG/JPG/TIFF export.</li>"
                 "<li><b>Select crop</b> lets you drag a rectangle directly in the preview. The selected area is kept and everything outside it is removed.</li>"
                 "<li><b>Remove gradient</b> is intended mainly for smooth light-pollution gradients around galaxies. Use it carefully with large nebulae, where faint real structures can be mistaken for background.</li>"
                 "<li>The L/R/G/B histogram includes a subtle 0-100 brightness ruler.</li>"
@@ -13007,7 +13825,7 @@ class AstroStackerWindow(QMainWindow):
                 "<h3>Export</h3>"
                 "<ul>"
                 "<li><b>FITS/XISF</b> export stays linear and does not bake in the visual stretch.</li>"
-                "<li><b>PNG/TIFF</b> export uses the same visual stretch and color adjustments as the preview. External 16-bit TIFF files are loaded without reducing their tonal depth.</li>"
+                "<li><b>PNG/JPG/TIFF</b> export uses the same visual stretch and color adjustments as the preview. External 16-bit TIFF files are loaded without reducing their tonal depth.</li>"
                 "<li>Settings profiles save and restore stack and stretch controls.</li>"
                 "</ul>"
             )
@@ -13024,12 +13842,12 @@ class AstroStackerWindow(QMainWindow):
                 "<li>Klikni na <b>Spustit skládání</b>. Průběh a případná varování jsou ve stavovém řádku a v diagnostických lozích.</li>"
                 "<li>Hotový stack se zobrazí lineárně a může zpočátku vypadat černě. Tlačítkem <b>Balance</b> roztáhni pouze náhled.</li>"
                 "<li>Potom dolaď black/white point, gamma, barvy, neutralizaci pozadí, vinětaci nebo umělý flat.</li>"
-                "<li>Exportuj FITS/XISF pro lineární data, nebo PNG/TIFF pro aktuální vizuální výsledek.</li>"
+                "<li>Exportuj FITS/XISF pro lineární data, nebo PNG/JPG/TIFF pro aktuální vizuální výsledek.</li>"
                 "</ol>"
                 "<h3>Vstup a prohlížení</h3>"
                 "<ul>"
                 "<li><b>Vybrat složku</b> načte sekvenci light snímků a umožní automaticky najít podsložky Flat/Bias/Dark.</li>"
-                "<li><b>Otevřít obrázek/FIT</b> otevře jeden samostatný snímek pro kontrolu bez změny složky stacku.</li>"
+                "<li><b>Otevřít obrázek</b> otevře jeden samostatný snímek pro kontrolu bez změny složky stacku.</li>"
                 "<li>Seznam náhledů ukazuje Light/Flat/Bias/Dark. Po složení značí <b>*</b> referenční snímek a <b>x</b> snímek vyřazený filtrem kvality.</li>"
                 "<li>Panel metadata zobrazuje dostupné informace z FITS/RAW/kamery: expozici, gain, teplotu, filtr, binning, Bayer masku, rozměry a informace o souboru.</li>"
                 "<li>Levý i pravý panel lze schovat malou šipkou v levém horním rohu. Zůstane jen úzký proužek se šipkou pro návrat a náhled i tabulka Frame quality získají více místa.</li>"
@@ -13064,7 +13882,7 @@ class AstroStackerWindow(QMainWindow):
                 "<ul>"
                 "<li>Kolečko myši zoomuje od kurzoru. Tažením se posouvá obraz včetně jemné setrvačnosti.</li>"
                 "<li>Dvojklik otevře celoobrazovkový náhled se stejným zoomem a posunem. Esc ho zavře.</li>"
-                "<li>Křivky, Turn angle, ruční crop výběrem, black/white point, gamma, komprese jasů, odstranění vinětace, umělý flat, kontrast, saturace, RGB balance, SCNR Green, AWB, neutralizace pozadí, polynomické odstranění gradientu a otočení ovlivňují vizuální náhled a PNG/TIFF export.</li>"
+                "<li>Křivky, Turn angle, ruční crop výběrem, black/white point, gamma, komprese jasů, odstranění vinětace, umělý flat, kontrast, saturace, RGB balance, SCNR Green, AWB, neutralizace pozadí, polynomické odstranění gradientu a otočení ovlivňují vizuální náhled a PNG/JPG/TIFF export.</li>"
                 "<li><b>Výběr / Select crop</b> umožní natáhnout obdélník přímo v náhledu. Vybraná oblast zůstane a vše mimo ni se odstraní.</li>"
                 "<li><b>Odstranit gradient</b> je určené hlavně pro hladké světelné gradienty okolo galaxií. Používej opatrně u rozsáhlých mlhovin, kde může za pozadí považovat reálné slabé struktury.</li>"
                 "<li>Histogram L/R/G/B obsahuje jemné pravítko jasu 0-100.</li>"
@@ -13072,7 +13890,7 @@ class AstroStackerWindow(QMainWindow):
                 "<h3>Export</h3>"
                 "<ul>"
                 "<li><b>FITS/XISF</b> export zůstává lineární a neobsahuje vizuální stretch.</li>"
-                "<li><b>PNG/TIFF</b> export používá stejný vizuální stretch a barevné úpravy jako náhled. Externí 16bit TIFF soubory se načítají bez snížení tonální hloubky.</li>"
+                "<li><b>PNG/JPG/TIFF</b> export používá stejný vizuální stretch a barevné úpravy jako náhled. Externí 16bit TIFF soubory se načítají bez snížení tonální hloubky.</li>"
                 "<li>Profily nastavení ukládají a obnovují nastavení stacku a vizuálních úprav.</li>"
                 "</ul>"
             )
@@ -13680,6 +14498,28 @@ class AstroStackerWindow(QMainWindow):
             scnr_green_strength=self.scnr_green_slider.value() if hasattr(self, "scnr_green_slider") else 0,
         )
 
+    def release_zoomed_preview_before_processing(self):
+        """Drop large zoomed preview pixmaps before CPU-heavy processing starts."""
+        self.stop_preview_pan_inertia()
+        self.preview_slider_zoom_state = None
+        self.preview_fast_zoom_scale = 1.0
+        self.preview_render_array = None
+        self.preview_source_shape = None
+        self.zoom_mode = "fit"
+        self.zoom_factor = 1.0
+        self.update_zoom_status_label()
+        if hasattr(self, "image_label"):
+            self.image_label.set_overlay_markers([], (1, 1))
+            self.image_label.set_marking_mode(False)
+            self.image_label.setPixmap(QPixmap())
+            self.image_label.setText(self.tr_ui("starting"))
+            self.image_label.setMinimumSize(1, 1)
+        if hasattr(self, "scroll"):
+            self.scroll.setWidgetResizable(True)
+            self.scroll.horizontalScrollBar().setValue(0)
+            self.scroll.verticalScrollBar().setValue(0)
+        QApplication.processEvents()
+
     def start_stack(self):
         global LAST_STACK_SELECTION
         if not self.folder:
@@ -13715,6 +14555,7 @@ class AstroStackerWindow(QMainWindow):
         self.gradient_preview_layer = None
         self.gradient_preview_base_source_id = None
         self.reset_preview_display_limits()
+        self.release_zoomed_preview_before_processing()
         if not continuing_from_review:
             LAST_STACK_SELECTION = {}
             self.clear_stack_selection_info()
@@ -13781,13 +14622,67 @@ class AstroStackerWindow(QMainWindow):
     def on_progress(self, value: int, message: str):
         self.progress.setValue(value)
         self.status_label.setText(message)
-        self.update_activity(value, message)
+        self.update_activity(value, self.compact_activity_message(message))
+
+    def compact_activity_message(self, message: str) -> str:
+        """Keep the centered activity overlay short and readable."""
+        text = str(message or "")
+        for prefix in (
+            "Loading/calibrating/debayering Bayer frames",
+            "Načítám/kalibruji/debayeruji Bayer snímky",
+        ):
+            if text.startswith(prefix):
+                return prefix
+        for prefix in (
+            "Loading/calibrating/debayering Bayer",
+            "Načítám/kalibruji/debayeruji Bayer",
+        ):
+            if text.startswith(prefix):
+                return text.split(":", 1)[0]
+        for prefix in (
+            "Aligning in parallel",
+            "Aligned in parallel",
+            "Zarovnávám paralelně",
+            "Zarovnáno paralelně",
+            "Aligning stars",
+            "Star aligned",
+            "Zarovnávám hvězdy",
+            "Zarovnáno hvězdně",
+            "Aligning",
+            "Aligned",
+            "Zarovnávám",
+            "Zarovnáno",
+        ):
+            if text.startswith(prefix):
+                return text.split(":", 1)[0]
+        if len(text) > 90:
+            return text[:87].rstrip() + "..."
+        return text
 
     def play_completion_sound(self):
         try:
             if hasattr(self, "completion_sound_check") and not self.completion_sound_check.isChecked():
                 return
-            QApplication.beep()
+            played = False
+            if sys.platform == "darwin":
+                sound_path = Path("/System/Library/Sounds/Glass.aiff")
+                if sound_path.exists():
+                    subprocess.Popen(
+                        ["afplay", str(sound_path)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    played = True
+            elif sys.platform.startswith("win"):
+                try:
+                    import winsound
+
+                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                    played = True
+                except Exception:
+                    pass
+            if not played:
+                QApplication.beep()
         except Exception as exc:
             log_debug(f"Completion sound failed: {exc}")
 
@@ -13877,7 +14772,7 @@ class AstroStackerWindow(QMainWindow):
         self.saturation_slider.blockSignals(True)
         self.black_slider.setValue(0)
         self.white_slider.setValue(65535)
-        self.gamma_slider.setValue(100)
+        self.gamma_slider.setValue(68)
         if hasattr(self, "stf_strength_slider"):
             self.stf_strength_slider.setValue(50)
         if hasattr(self, "vignette_removal_slider"):
@@ -13896,7 +14791,7 @@ class AstroStackerWindow(QMainWindow):
             self.star_deconvolution_slider.setValue(0)
         if hasattr(self, "star_deconvolution_size_slider"):
             self.star_deconvolution_size_slider.setValue(5)
-        self.contrast_slider.setValue(100)
+        self.contrast_slider.setValue(71)
         self.saturation_slider.setValue(100)
         self.black_slider.blockSignals(False)
         self.white_slider.blockSignals(False)
@@ -14197,6 +15092,8 @@ class AstroStackerWindow(QMainWindow):
                     value=100,
                     delay_ms=1000,
                 )
+                if "preview" in layer_key:
+                    self.pending_ai_denoise_completion_sound = True
                 self.ai_denoise_in_progress = False
         full_result = np.ascontiguousarray(result.astype(np.float32))
         self.preview_ai_denoise_cache = full_result
@@ -14356,6 +15253,14 @@ class AstroStackerWindow(QMainWindow):
         self.preview_render_timer.start(1)
 
     def schedule_preview_update(self, *_args):
+        sender = self.sender()
+        if (
+            self._is_ai_preview_slider(sender)
+            and self.preview_slider_zoom_state is None
+            and not self.preview_interactive
+        ):
+            self.preview_slider_zoom_state = self.capture_preview_zoom_state()
+            self.preview_render_pending_final = True
         if self.preview_interactive:
             self.preview_render_pending_final = True
             self.preview_render_timer.start(40)
@@ -14509,6 +15414,20 @@ class AstroStackerWindow(QMainWindow):
         visible_edge = max(int(viewport.width()), int(viewport.height()))
         return max(480, min(800, int(round(visible_edge * 0.80))))
 
+    def final_preview_max_edge(
+        self,
+        source: np.ndarray,
+        settings: StretchSettings,
+    ) -> int:
+        """Use a sharper work preview only when AI denoise needs visual accuracy."""
+        if (
+            getattr(settings, "denoise_mode", "classic") == "drunet"
+            and float(getattr(settings, "denoise_strength", 0.0)) > 1e-6
+        ):
+            source_edge = max(int(source.shape[0]), int(source.shape[1]))
+            return min(source_edge, 2500)
+        return 2200
+
     def update_preview(self, fast: bool = False):
         source = self.preview_override if self.preview_override is not None else self.linear_result
         if source is None:
@@ -14528,8 +15447,12 @@ class AstroStackerWindow(QMainWindow):
                 interactive_target_shape = tuple(saved_shape)
         self.preview_fast_zoom_scale = 1.0
 
-        max_preview_edge = self.interactive_preview_max_edge() if fast else 2200
         stretch_settings = self.current_stretch_settings()
+        max_preview_edge = (
+            self.interactive_preview_max_edge()
+            if fast
+            else self.final_preview_max_edge(source, stretch_settings)
+        )
         display_source, stretch_settings = self.processed_display_base(
             source,
             stretch_settings,
@@ -14543,23 +15466,13 @@ class AstroStackerWindow(QMainWindow):
         preview = self.apply_cached_preview_denoise(
             preview,
             stretch_settings,
-            (
-                id(source),
-                "preview",
-                bool(self.preview_auto_display_stretch),
-                tuple(self.preview_display_limits or ()),
-            ),
+            (id(source), "preview"),
             fast=fast,
         )
         preview = self.apply_cached_star_deconvolution(
             preview,
             stretch_settings,
-            (
-                id(source),
-                "preview",
-                bool(self.preview_auto_display_stretch),
-                tuple(self.preview_display_limits or ()),
-            ),
+            (id(source), "preview"),
             fast=fast,
         )
         if not fast and hasattr(self, "histogram_label"):
@@ -14624,6 +15537,9 @@ class AstroStackerWindow(QMainWindow):
         self.preview_render_array = np.ascontiguousarray(preview)
         self.image_label.set_overlay_markers(overlay_markers, (preview.shape[1], preview.shape[0]))
         self.render_preview_pixmap()
+        if getattr(self, "pending_ai_denoise_completion_sound", False):
+            self.pending_ai_denoise_completion_sound = False
+            QTimer.singleShot(0, self.play_completion_sound)
 
     def render_preview_pixmap(self):
         preview = getattr(self, "preview_render_array", None)
@@ -15156,7 +16072,7 @@ class AstroStackerWindow(QMainWindow):
 
         Na rozdíl od původní verze už jen nenastavuje RGB slidery.
         Vytvoří dočasnou neutralizovanou vrstvu obrazu, která se použije pro
-        náhled a PNG/TIFF export. Původní lineární FIT data v self.linear_result
+        náhled a PNG/JPG/TIFF export. Původní lineární FIT data v self.linear_result
         zůstávají beze změny.
         """
         source = self.preview_override if self.preview_override is not None else self.linear_result
@@ -15188,7 +16104,7 @@ class AstroStackerWindow(QMainWindow):
             return None
 
         # Pozadí stačí analyzovat na menší kopii. Výsledné multiplikátory se
-        # níže stále aplikují na plné rozlišení pro náhled i PNG/TIFF export.
+        # níže stále aplikují na plné rozlišení pro náhled i PNG/JPG/TIFF export.
         # Tím zůstane barevný výsledek stejný, ale Balance výrazně zrychlí.
         analysis_img = img
         source_h, source_w = img.shape[:2]
@@ -15426,7 +16342,7 @@ class AstroStackerWindow(QMainWindow):
         self.reset_preview_display_limits()
         self.black_slider.setValue(0)
         self.white_slider.setValue(65535)
-        self.gamma_slider.setValue(100)
+        self.gamma_slider.setValue(68)
         if hasattr(self, "stf_strength_slider"):
             self.stf_strength_slider.setValue(50)
         if hasattr(self, "vignette_removal_slider"):
@@ -15437,7 +16353,7 @@ class AstroStackerWindow(QMainWindow):
             self.color_background_slider.setValue(0)
         if hasattr(self, "denoise_slider"):
             self.denoise_slider.setValue(0)
-        self.contrast_slider.setValue(100)
+        self.contrast_slider.setValue(71)
         self.saturation_slider.setValue(100)
         self.red_slider.setValue(100)
         self.green_slider.setValue(100)
@@ -15461,8 +16377,8 @@ class AstroStackerWindow(QMainWindow):
             slider.blockSignals(True)
         self.black_slider.setValue(0)
         self.white_slider.setValue(65535)
-        self.gamma_slider.setValue(100)
-        self.contrast_slider.setValue(100)
+        self.gamma_slider.setValue(68)
+        self.contrast_slider.setValue(71)
         self.saturation_slider.setValue(100)
         for slider in (
             self.black_slider,
@@ -15479,6 +16395,7 @@ class AstroStackerWindow(QMainWindow):
         record_undo: bool = True,
         refresh_preview: bool = True,
         set_status: bool = True,
+        update_sliders: bool = True,
     ) -> bool:
         source = self.preview_override if self.preview_override is not None else self.linear_result
         if source is None:
@@ -15502,7 +16419,7 @@ class AstroStackerWindow(QMainWindow):
         else:
             display = make_display_preview_base(source)
 
-        if not self._set_auto_stretch_sliders(display):
+        if update_sliders and not self._set_auto_stretch_sliders(display):
             return False
 
         if set_status:
@@ -15575,7 +16492,7 @@ class AstroStackerWindow(QMainWindow):
             self,
             self.tr_ui("save_image_title"),
             str(default_path),
-            "TIFF 16-bit (*.tif *.tiff);;PNG 8-bit (*.png);;FITS 32-bit linear (*.fits *.fit);;XISF 32-bit linear (*.xisf)",
+            "TIFF 16-bit (*.tif *.tiff);;PNG 8-bit (*.png);;JPEG 8-bit (*.jpg *.jpeg);;FITS 32-bit linear (*.fits *.fit);;XISF 32-bit linear (*.xisf)",
         )
         if not filename:
             return
@@ -15583,9 +16500,11 @@ class AstroStackerWindow(QMainWindow):
         path = Path(filename)
         suffix = path.suffix.lower()
 
-        if suffix not in {".png", ".tif", ".tiff", ".fits", ".fit", ".xisf"}:
+        if suffix not in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".fits", ".fit", ".xisf"}:
             if "PNG" in selected_filter:
                 path = path.with_suffix(".png")
+            elif "JPEG" in selected_filter or "JPG" in selected_filter:
+                path = path.with_suffix(".jpg")
             elif "XISF" in selected_filter:
                 path = path.with_suffix(".xisf")
             elif "FITS" in selected_filter:
@@ -15653,12 +16572,12 @@ class AstroStackerWindow(QMainWindow):
                         tuple(self.preview_display_limits or ()),
                     ),
                 )
-                img16_rgb = (np.clip(preview, 0, 1) * 65535).astype(np.uint16)
+                img16_rgb = visual_float_to_uint16(preview)
                 img16_bgr = cv2.cvtColor(img16_rgb, cv2.COLOR_RGB2BGR)
                 ok = cv2.imwrite(filename, img16_bgr)
                 if not ok:
                     raise RuntimeError(self.tr_ui("save_tiff_error"))
-            else:
+            elif suffix == ".png":
                 # PNG ukládáme jako vizuální 8bit náhled:
                 # používá stejný display stretch jako zobrazení v programu.
                 stretch_settings = self.current_stretch_settings()
@@ -15690,7 +16609,41 @@ class AstroStackerWindow(QMainWindow):
                         tuple(self.preview_display_limits or ()),
                     ),
                 )
-                Image.fromarray((np.clip(preview, 0, 1) * 255).astype(np.uint8)).save(filename)
+                Image.fromarray(visual_float_to_uint8(preview)).save(filename)
+            else:
+                # JPEG ukládáme jako vizuální 8bit náhled se stejnými úpravami jako PNG.
+                stretch_settings = self.current_stretch_settings()
+                display_base, stretch_settings = self.processed_display_base(
+                    source,
+                    stretch_settings,
+                )
+                preview = apply_stretch(
+                    display_base,
+                    replace(stretch_settings, denoise_strength=0.0),
+                )
+                preview = self.apply_cached_preview_denoise(
+                    preview,
+                    stretch_settings,
+                    (
+                        id(source),
+                        "export",
+                        bool(self.preview_auto_display_stretch),
+                        tuple(self.preview_display_limits or ()),
+                    ),
+                )
+                preview = self.apply_cached_star_deconvolution(
+                    preview,
+                    stretch_settings,
+                    (
+                        id(source),
+                        "export",
+                        bool(self.preview_auto_display_stretch),
+                        tuple(self.preview_display_limits or ()),
+                    ),
+                )
+                Image.fromarray(
+                    visual_float_to_uint8(preview)
+                ).save(filename, quality=95, subsampling=0, optimize=True)
 
             self.status_label.setText(
                 self.tr_ui("save_image_done").format(path=filename)
@@ -15730,6 +16683,65 @@ class AstroStackerWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def create_startup_splash(app: QApplication) -> Optional[QSplashScreen]:
+    intro_path = bundled_file_path("AstroStacker_intro.png")
+    content = QPixmap(str(intro_path)) if intro_path is not None else QPixmap()
+    if content.isNull():
+        content = QPixmap(520, 320)
+        content.fill(QColor("#10151d"))
+    else:
+        content = content.scaled(560, 360, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    border = 10
+    pixmap = QPixmap(content.width() + border * 2, content.height() + border * 2)
+    pixmap.fill(QColor("#05070b"))
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.fillRect(0, 0, pixmap.width(), pixmap.height(), QColor("#05070b"))
+    painter.setPen(QPen(QColor("#8fb8ff"), 2))
+    painter.drawRoundedRect(1, 1, pixmap.width() - 2, pixmap.height() - 2, 8, 8)
+    painter.setPen(QPen(QColor("#1f2937"), 1))
+    painter.drawRoundedRect(border - 1, border - 1, content.width() + 1, content.height() + 1, 4, 4)
+    painter.drawPixmap(border, border, content)
+    overlay_h = 68
+    overlay_y = border
+    painter.fillRect(border, overlay_y, content.width(), overlay_h, QColor(0, 0, 0, 170))
+
+    title_font = painter.font()
+    title_font.setPointSize(21)
+    title_font.setBold(True)
+    painter.setFont(title_font)
+    painter.setPen(QColor("#ffffff"))
+    painter.drawText(
+        QRectF(border + 18, overlay_y + 8, content.width() - 36, 28),
+        Qt.AlignLeft | Qt.AlignVCenter,
+        "Astro Stacker",
+    )
+
+    detail_font = painter.font()
+    detail_font.setPointSize(12)
+    detail_font.setBold(False)
+    painter.setFont(detail_font)
+    painter.setPen(QColor("#d8e6ff"))
+    painter.drawText(
+        QRectF(border + 20, overlay_y + 38, content.width() - 40, 22),
+        Qt.AlignLeft | Qt.AlignVCenter,
+        f"Version {APP_DISPLAY_VERSION}  -  Loading...",
+    )
+    painter.end()
+
+    splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint)
+    splash.setWindowFlag(Qt.FramelessWindowHint, True)
+    splash.show()
+    screen = app.primaryScreen()
+    if screen is not None:
+        screen_geo = screen.availableGeometry()
+        splash.move(screen_geo.center() - splash.rect().center())
+    app.processEvents()
+    return splash
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Astro Stacker")
@@ -15737,8 +16749,14 @@ def main():
         app.setApplicationDisplayName("Astro Stacker")
     app.setOrganizationName("Josef Ladra")
     apply_dark_theme(app)
+    splash = create_startup_splash(app)
     win = AstroStackerWindow()
-    win.show()
+    if splash is not None:
+        splash.showMessage("Opening main window...", Qt.AlignBottom | Qt.AlignHCenter, QColor("#ffffff"))
+        app.processEvents()
+    win.showMaximized()
+    if splash is not None:
+        QTimer.singleShot(3000, lambda: splash.finish(win))
     sys.exit(app.exec())
 
 

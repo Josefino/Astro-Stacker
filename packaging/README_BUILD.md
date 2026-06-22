@@ -34,13 +34,14 @@ The script:
 3. Installs CuPy with CUDA 12 for stacking and DirectML for DRUNet AI denoise.
 4. Builds `AstroStacker_CUDA`.
 5. Downloads and embeds the current Microsoft Visual C++ v14 x64 Runtime.
-6. Verifies both DRUNet models, manuals, wrapper, and CUDA DLL payloads.
+6. Verifies the splash image, DRUNet models, manuals, wrapper, stellar AI
+   model, and CUDA DLL payloads.
 7. Creates one installer with an **Install NVIDIA CUDA GPU support** checkbox.
 
 Result:
 
 ```text
-release\AstroStacker30_Setup.exe
+release\AstroStacker31_Setup.exe
 ```
 
 If the CPU and CUDA folders were already built but Inno Setup was missing, do
@@ -75,7 +76,7 @@ packaging\build_windows_lite_installer.bat
 Result:
 
 ```text
-release\AstroStacker30_Lite_Setup.exe
+release\AstroStacker31_Lite_Setup.exe
 ```
 
 The Lite interface hides the GPU option and AI DRUNet method. Classic denoise
@@ -101,14 +102,15 @@ chmod +x packaging/build_macos_dmg.command
 Result:
 
 ```text
-release/AstroStacker30_macOS.dmg
+release/AstroStacker31_macOS.dmg
 ```
 
 The script installs PyTorch so that Apple Metal/MPS GPU stacking is available.
 The common requirements install ONNX Runtime for DRUNet AI denoising. Both
 `models/drunet_color.onnx` and `models/drunet_gray.onnx` are embedded in the
-standalone application, together with the English/Czech HTML manuals and the
-PixInsight wrapper package.
+standalone application, together with the stellar AI deconvolution model, the
+startup splash image, the English/Czech HTML manuals, and the PixInsight
+wrapper package.
 The resulting build matches the architecture of the Python interpreter used to
 run the build.
 The build also verifies the Python/host architecture and checks the complete
@@ -153,5 +155,11 @@ local testing. Users may then need to remove quarantine manually.
 - `AstroStacker-macOS.spec`: macOS PyInstaller app bundle.
 - `macos-entitlements.plist`: hardened-runtime permissions needed by PyTorch.
 - `make_icons.py`: creates Windows ICO and macOS ICNS files.
+- `../AstroStacker_intro.png`: startup splash image.
+- `../MANUAL_EN.html`: English user guide.
+- `../MANUAL_CZ.html`: Czech user guide.
+- `../AS_Stacker_PI_Plugin/`: PixInsight wrapper package.
 - `../models/drunet_color.onnx`: bundled RGB DRUNet model.
 - `../models/drunet_gray.onnx`: bundled monochrome DRUNet model.
+- `../models/cosmic_clarity_stellar.onnx`: bundled stellar AI deconvolution model.
+- `../models/COSMIC_CLARITY_STELLAR_LICENSE.txt`: license notice for the stellar model.

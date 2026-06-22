@@ -1,4 +1,4 @@
-"""Command-line bridge for the Astro Stacker 3.0 processing engine."""
+"""Command-line bridge for the Astro Stacker 3.1 processing engine."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import traceback
 import unicodedata
 from pathlib import Path
 
-CLI_VERSION = "3.0"
+CLI_VERSION = "3.1"
 
 
 def ascii_text(text: str) -> str:

@@ -4,7 +4,7 @@ Astro Stacker is a desktop application for astronomical image stacking, calibrat
 
 The application focuses on a practical workflow: load a folder of light frames, optionally apply calibration frames, align the sequence, stack it, inspect rejected frames, and export either a linear FIT/FITS result or a stretched visual image.
 
-Current application version: **3.0**
+Current application version: **3.1**
 
 ## Main Features
 
@@ -186,9 +186,9 @@ python astro_stacker_app.py
 Ready-to-run installer build scripts are available in the `packaging` folder.
 They create:
 
-- `AstroStacker30_Setup.exe` for Windows, with optional NVIDIA CUDA support.
-- `AstroStacker30_Lite_Setup.exe` for the compact Windows CPU-only edition.
-- `AstroStacker30_macOS.dmg` for macOS, with Apple Metal/MPS support.
+- `AstroStacker31_Setup.exe` for Windows, with optional NVIDIA CUDA support.
+- `AstroStacker31_Lite_Setup.exe` for the compact Windows CPU-only edition.
+- `AstroStacker31_macOS.dmg` for macOS, with Apple Metal/MPS support.
 
 See [`packaging/README_BUILD.md`](packaging/README_BUILD.md) for the exact
 requirements, commands, CUDA packaging, macOS signing, and notarization.

@@ -20,6 +20,8 @@ datas = [
     (str(ROOT / "AS_Stacker_PI_Plugin" / "astro_stacker_app.py"), "AS_Stacker_PI_Plugin"),
     (str(ROOT / "AS_Stacker_PI_Plugin" / "README_INSTALL.txt"), "AS_Stacker_PI_Plugin"),
     (str(ROOT / "AS_Stacker_PI_Plugin" / "requirements.txt"), "AS_Stacker_PI_Plugin"),
+    (str(ROOT / "AS_Stacker_PI_Plugin" / "MANUAL_EN.html"), "AS_Stacker_PI_Plugin"),
+    (str(ROOT / "AS_Stacker_PI_Plugin" / "MANUAL_CZ.html"), "AS_Stacker_PI_Plugin"),
 ]
 binaries = []
 hiddenimports = [
@@ -77,8 +79,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "Astro Stacker",
         "CFBundleDisplayName": "Astro Stacker",
-        "CFBundleShortVersionString": "3.0",
-        "CFBundleVersion": "300",
+        "CFBundleShortVersionString": "3.1",
+        "CFBundleVersion": "310",
         "NSHighResolutionCapable": True,
     },
 )

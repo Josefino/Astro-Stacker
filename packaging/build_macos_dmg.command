@@ -10,15 +10,19 @@ DIST="$ROOT/dist_installer_macos"
 WORK="$ROOT/build_installer_macos"
 RELEASE="$ROOT/release"
 STAGING="$WORK/dmg"
-DMG="$RELEASE/AstroStacker30_macOS.dmg"
+DMG="$RELEASE/AstroStacker31_macOS.dmg"
 
 echo "============================================================"
-echo "Astro Stacker 3.0 - macOS DMG build"
+echo "Astro Stacker 3.1 - macOS DMG build"
 echo "============================================================"
 echo
 
 if [ ! -f "$ROOT/astro_stacker_app.py" ]; then
   echo "ERROR: astro_stacker_app.py was not found."
+  exit 1
+fi
+if [ ! -f "$ROOT/AstroStacker_intro.png" ]; then
+  echo "ERROR: AstroStacker_intro.png was not found."
   exit 1
 fi
 for MODEL in drunet_color.onnx drunet_gray.onnx cosmic_clarity_stellar.onnx; do
@@ -36,7 +40,9 @@ for REQUIRED in \
   "$ROOT/MANUAL_CZ.html" \
   "$ROOT/AS_Stacker_PI_Plugin/AS_Stacker_PI.js" \
   "$ROOT/AS_Stacker_PI_Plugin/astro_stacker_cli.py" \
-  "$ROOT/AS_Stacker_PI_Plugin/astro_stacker_app.py"; do
+  "$ROOT/AS_Stacker_PI_Plugin/astro_stacker_app.py" \
+  "$ROOT/AS_Stacker_PI_Plugin/MANUAL_EN.html" \
+  "$ROOT/AS_Stacker_PI_Plugin/MANUAL_CZ.html"; do
   if [ ! -f "$REQUIRED" ]; then
     echo "ERROR: required release file was not found: $REQUIRED"
     exit 1
@@ -109,11 +115,20 @@ for REQUIRED_NAME in \
   drunet_gray.onnx \
   cosmic_clarity_stellar.onnx \
   COSMIC_CLARITY_STELLAR_LICENSE.txt \
+  AstroStacker_intro.png \
   MANUAL_EN.html \
   MANUAL_CZ.html \
   AS_Stacker_PI.js; do
   if ! find "$APP" -type f -name "$REQUIRED_NAME" -print -quit | grep -q .; then
     echo "ERROR: AstroStacker.app does not contain $REQUIRED_NAME"
+    exit 1
+  fi
+done
+for WRAPPER_REQUIRED in \
+  "*/AS_Stacker_PI_Plugin/MANUAL_EN.html" \
+  "*/AS_Stacker_PI_Plugin/MANUAL_CZ.html"; do
+  if ! find "$APP" -type f -path "$WRAPPER_REQUIRED" -print -quit | grep -q .; then
+    echo "ERROR: AstroStacker.app does not contain $WRAPPER_REQUIRED"
     exit 1
   fi
 done
@@ -146,7 +161,7 @@ ln -s /Applications "$STAGING/Applications"
 
 rm -f "$DMG"
 hdiutil create \
-  -volname "Astro Stacker 3.0" \
+  -volname "Astro Stacker 3.1" \
   -srcfolder "$STAGING" \
   -ov \
   -format UDZO \

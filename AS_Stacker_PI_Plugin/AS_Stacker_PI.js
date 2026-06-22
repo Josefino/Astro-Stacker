@@ -1,7 +1,7 @@
 // Astro Stacker PixInsight wrapper
 // Runs astro_stacker_cli.py and writes FITS outputs with AS_ prefix.
 
-var AS_STACKER_WRAPPER_VERSION = "3.0";
+var AS_STACKER_WRAPPER_VERSION = "3.1";
 
 #include <pjsr/StdButton.jsh>
 #include <pjsr/StdDialogCode.jsh>
@@ -13,7 +13,7 @@ var AS_STACKER_WRAPPER_VERSION = "3.0";
 #include <pjsr/SectionBar.jsh>
 
 #feature-id    Utilities > AS_Stacker
-#feature-info  Astro Stacker 3.0 wrapper for PixInsight. Calls the external Python CLI engine.
+#feature-info  Astro Stacker 3.1 wrapper for PixInsight. Calls the external Python CLI engine.
 
 var AS_STACKER_SETTINGS_ID = "AS_Stacker/settings";
 var AS_STACKER_SCRIPT_DIR = File.extractDrive( #__FILE__ ) + File.extractDirectory( #__FILE__ );

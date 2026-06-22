@@ -1,4 +1,4 @@
-AS_Stacker 3.0 PixInsight Wrapper
+AS_Stacker 3.1 PixInsight Wrapper
 =================================
 
 This folder is a self-contained PixInsight wrapper package.
